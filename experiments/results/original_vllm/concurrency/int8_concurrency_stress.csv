@@ -1,0 +1,5 @@
+kv_cache_dtype,concurrent_requests,prompt_tokens_per_request,total_input_tokens,total_output_tokens,batch_completion_time_seconds,requests_per_second,output_tokens_per_second,total_tokens_per_second
+int8_per_token_head,40,1024,40960,5120,11.4943,3.48,445.44,4008.96
+int8_per_token_head,48,1024,49152,6144,13.8556,3.464,443.43,3990.89
+int8_per_token_head,56,1024,57344,7168,16.2683,3.442,440.61,3965.5
+int8_per_token_head,64,1024,65536,8192,19.8318,3.227,413.07,3717.66

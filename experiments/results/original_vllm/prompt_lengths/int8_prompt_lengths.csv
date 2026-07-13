@@ -1,0 +1,5 @@
+kv_cache_dtype,prompt_tokens,generated_tokens,generation_time_seconds,output_tokens_per_second
+int8_per_token_head,128,128,4.2896,29.84
+int8_per_token_head,512,128,4.2898,29.84
+int8_per_token_head,1024,128,4.3522,29.41
+int8_per_token_head,1536,128,4.4619,28.69

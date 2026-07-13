@@ -1,0 +1,213 @@
+============================================================
+Model: Qwen/Qwen3-0.6B
+KV cache dtype: fp8_e4m3
+GPU: NVIDIA GeForce RTX 2080 Ti
+============================================================
+INFO 07-12 12:08:39 [api_utils.py:273] non-default args: {'dtype': 'float16', 'kv_cache_dtype': 'fp8_e4m3', 'max_model_len': 2048, 'enable_prefix_caching': False, 'gpu_memory_utilization': 0.5, 'disable_log_stats': True, 'enforce_eager': True}
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+INFO 07-12 12:08:40 [model.py:598] Resolved architecture: Qwen3ForCausalLM
+WARNING 07-12 12:08:40 [model.py:2063] Casting torch.bfloat16 to torch.float16.
+INFO 07-12 12:08:40 [model.py:1725] Using max model len 2048
+INFO 07-12 12:08:40 [cache.py:279] Using fp8_e4m3 data type to store kv cache. It reduces the GPU memory footprint and boosts the performance. Meanwhile, it may cause accuracy drop without a proper scaling factor
+INFO 07-12 12:08:40 [scheduler.py:252] Chunked prefill is enabled with max_num_batched_tokens=8192.
+INFO 07-12 12:08:40 [vllm.py:1006] Asynchronous scheduling is enabled.
+WARNING 07-12 12:08:40 [vllm.py:1062] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 07-12 12:08:40 [vllm.py:1110] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 07-12 12:08:40 [kernel.py:276] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 07-12 12:08:40 [vllm.py:1288] Cudagraph is disabled under eager mode
+INFO 07-12 12:08:40 [compilation.py:310] Enabled custom fusions: norm_quant, act_quant
+WARNING 07-12 12:08:45 [system_utils.py:157] We must use the `spawn` multiprocessing start method. Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. See https://docs.vllm.ai/en/latest/usage/troubleshooting.html#python-multiprocessing for more information. Reasons: CUDA is initialized
+(EngineCore pid=3813002) INFO 07-12 12:08:59 [core.py:114] Initializing a V1 LLM engine (v0.24.0) with config: model='Qwen/Qwen3-0.6B', speculative_config=None, tokenizer='Qwen/Qwen3-0.6B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.float16, max_seq_len=2048, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=None, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=fp8_e4m3, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_verbose=False), seed=0, served_model_name=Qwen/Qwen3-0.6B, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, moe_backend='auto', linear_backend='auto')
+(EngineCore pid=3813002) INFO 07-12 12:08:59 [parallel_state.py:1588] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://132.68.39.37:37377 backend=nccl
+(EngineCore pid=3813002) INFO 07-12 12:08:59 [parallel_state.py:1923] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+(EngineCore pid=3813002) INFO 07-12 12:08:59 [gpu_worker.py:331] Using V2 Model Runner
+(EngineCore pid=3813002) INFO 07-12 12:09:00 [model_runner.py:281] Loading model from scratch...
+(EngineCore pid=3813002) ERROR 07-12 12:09:01 [fa_utils.py:177] Cannot use FA version 2 is not supported due to FA2 is only supported on devices with compute capability >= 8
+(EngineCore pid=3813002) ERROR 07-12 12:09:01 [fa_utils.py:177] Cannot use FA version 2 is not supported due to FA2 is only supported on devices with compute capability >= 8
+(EngineCore pid=3813002) INFO 07-12 12:09:02 [cuda.py:480] Using TRITON_ATTN attention backend out of potential backends: ['TRITON_ATTN'].
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231] EngineCore failed to start.
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231] Traceback (most recent call last):
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/engine/core.py", line 1200, in run_engine_core
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     return func(*args, **kwargs)
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/engine/core.py", line 966, in __init__
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     super().__init__(
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/engine/core.py", line 123, in __init__
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     self.model_executor = executor_class(vllm_config)
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     return func(*args, **kwargs)
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/executor/abstract.py", line 109, in __init__
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     self._init_executor()
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/executor/uniproc_executor.py", line 68, in _init_executor
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     self.driver_worker.load_model()
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/worker/gpu_worker.py", line 384, in load_model
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/worker/gpu/model_runner.py", line 283, in load_model
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     self.model = model_loader.load_model(
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]                  ^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     return func(*args, **kwargs)
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/model_loader/base_loader.py", line 55, in load_model
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     model = initialize_model(
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]             ^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     return func(*args, **kwargs)
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/model_loader/utils.py", line 62, in initialize_model
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     model = model_class(vllm_config=vllm_config, prefix=prefix)
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/qwen3.py", line 296, in __init__
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     self.model = Qwen3Model(
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]                  ^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/compilation/decorators.py", line 383, in __init__
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     old_init(self, *args, **kwargs)
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/qwen3.py", line 262, in __init__
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     super().__init__(
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/compilation/decorators.py", line 383, in __init__
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     old_init(self, *args, **kwargs)
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/qwen2.py", line 367, in __init__
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     self.start_layer, self.end_layer, self.layers = make_layers(
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]                                                     ^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/utils.py", line 666, in make_layers
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     + get_offloader().wrap_modules(
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/offloader/base.py", line 104, in wrap_modules
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     return list(modules_generator)
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]            ^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/utils.py", line 667, in <genexpr>
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     layer_fn(prefix=f"{prefix}.{idx}") for idx in range(start_layer, end_layer)
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/qwen2.py", line 369, in <lambda>
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     lambda prefix: decoder_layer_type(
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]                    ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/qwen3.py", line 195, in __init__
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     self.self_attn = Qwen3Attention(
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]                      ^^^^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/qwen3.py", line 132, in __init__
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     self.attn = attn_cls(
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]                 ^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/layers/attention/attention.py", line 388, in __init__
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     self.impl = impl_cls(  # type: ignore[assignment]  # impl_cls always returns an AttentionImpl subclass
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/attention/backends/triton_attn.py", line 477, in __init__
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231]     raise ValueError(
+(EngineCore pid=3813002) ERROR 07-12 12:09:02 [core.py:1231] ValueError: FP8 KV cache is not supported by the Triton attention backend on NVIDIA GeForce RTX 2080 Ti (compute capability 7.5); native FP8 (fp8e4nv) requires SM89+. Re-run with --kv-cache-dtype float16.
+(EngineCore pid=3813002) Process EngineCore:
+(EngineCore pid=3813002) Traceback (most recent call last):
+(EngineCore pid=3813002)   File "/home/shani.dayan/miniforge3/envs/vllm024/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+(EngineCore pid=3813002)     self.run()
+(EngineCore pid=3813002)   File "/home/shani.dayan/miniforge3/envs/vllm024/lib/python3.12/multiprocessing/process.py", line 108, in run
+(EngineCore pid=3813002)     self._target(*self._args, **self._kwargs)
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/engine/core.py", line 1235, in run_engine_core
+(EngineCore pid=3813002)     raise e
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/engine/core.py", line 1200, in run_engine_core
+(EngineCore pid=3813002)     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=3813002)                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=3813002)     return func(*args, **kwargs)
+(EngineCore pid=3813002)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/engine/core.py", line 966, in __init__
+(EngineCore pid=3813002)     super().__init__(
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/engine/core.py", line 123, in __init__
+(EngineCore pid=3813002)     self.model_executor = executor_class(vllm_config)
+(EngineCore pid=3813002)                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=3813002)     return func(*args, **kwargs)
+(EngineCore pid=3813002)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/executor/abstract.py", line 109, in __init__
+(EngineCore pid=3813002)     self._init_executor()
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/executor/uniproc_executor.py", line 68, in _init_executor
+(EngineCore pid=3813002)     self.driver_worker.load_model()
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/worker/gpu_worker.py", line 384, in load_model
+(EngineCore pid=3813002)     self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/worker/gpu/model_runner.py", line 283, in load_model
+(EngineCore pid=3813002)     self.model = model_loader.load_model(
+(EngineCore pid=3813002)                  ^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=3813002)     return func(*args, **kwargs)
+(EngineCore pid=3813002)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/model_loader/base_loader.py", line 55, in load_model
+(EngineCore pid=3813002)     model = initialize_model(
+(EngineCore pid=3813002)             ^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=3813002)     return func(*args, **kwargs)
+(EngineCore pid=3813002)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/model_loader/utils.py", line 62, in initialize_model
+(EngineCore pid=3813002)     model = model_class(vllm_config=vllm_config, prefix=prefix)
+(EngineCore pid=3813002)             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/qwen3.py", line 296, in __init__
+(EngineCore pid=3813002)     self.model = Qwen3Model(
+(EngineCore pid=3813002)                  ^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/compilation/decorators.py", line 383, in __init__
+(EngineCore pid=3813002)     old_init(self, *args, **kwargs)
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/qwen3.py", line 262, in __init__
+(EngineCore pid=3813002)     super().__init__(
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/compilation/decorators.py", line 383, in __init__
+(EngineCore pid=3813002)     old_init(self, *args, **kwargs)
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/qwen2.py", line 367, in __init__
+(EngineCore pid=3813002)     self.start_layer, self.end_layer, self.layers = make_layers(
+(EngineCore pid=3813002)                                                     ^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/utils.py", line 666, in make_layers
+(EngineCore pid=3813002)     + get_offloader().wrap_modules(
+(EngineCore pid=3813002)       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/offloader/base.py", line 104, in wrap_modules
+(EngineCore pid=3813002)     return list(modules_generator)
+(EngineCore pid=3813002)            ^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/utils.py", line 667, in <genexpr>
+(EngineCore pid=3813002)     layer_fn(prefix=f"{prefix}.{idx}") for idx in range(start_layer, end_layer)
+(EngineCore pid=3813002)     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/qwen2.py", line 369, in <lambda>
+(EngineCore pid=3813002)     lambda prefix: decoder_layer_type(
+(EngineCore pid=3813002)                    ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/qwen3.py", line 195, in __init__
+(EngineCore pid=3813002)     self.self_attn = Qwen3Attention(
+(EngineCore pid=3813002)                      ^^^^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/models/qwen3.py", line 132, in __init__
+(EngineCore pid=3813002)     self.attn = attn_cls(
+(EngineCore pid=3813002)                 ^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/model_executor/layers/attention/attention.py", line 388, in __init__
+(EngineCore pid=3813002)     self.impl = impl_cls(  # type: ignore[assignment]  # impl_cls always returns an AttentionImpl subclass
+(EngineCore pid=3813002)                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=3813002)   File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/attention/backends/triton_attn.py", line 477, in __init__
+(EngineCore pid=3813002)     raise ValueError(
+(EngineCore pid=3813002) ValueError: FP8 KV cache is not supported by the Triton attention backend on NVIDIA GeForce RTX 2080 Ti (compute capability 7.5); native FP8 (fp8e4nv) requires SM89+. Re-run with --kv-cache-dtype float16.
+[rank0]:[W712 12:09:03.347578799 ProcessGroupNCCL.cpp:1575] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+Traceback (most recent call last):
+  File "/home/shani.dayan/kv_cache_project/experiments/scripts/run_kv_experiment.py", line 72, in <module>
+    main()
+  File "/home/shani.dayan/kv_cache_project/experiments/scripts/run_kv_experiment.py", line 25, in main
+    llm = LLM(
+          ^^^^
+  File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/entrypoints/llm.py", line 349, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/engine/llm_engine.py", line 179, in from_engine_args
+    return cls(
+           ^^^^
+  File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/engine/llm_engine.py", line 105, in __init__
+    self.engine_core = EngineCoreClient.make_client(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/engine/core_client.py", line 103, in make_client
+    return SyncMPClient(vllm_config, executor_class, log_stats)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/engine/core_client.py", line 786, in __init__
+    super().__init__(
+  File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/engine/core_client.py", line 573, in __init__
+    with launch_core_engines(
+         ^^^^^^^^^^^^^^^^^^^^
+  File "/home/shani.dayan/miniforge3/envs/vllm024/lib/python3.12/contextlib.py", line 144, in __exit__
+    next(self.gen)
+  File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/engine/utils.py", line 1213, in launch_core_engines
+    wait_for_engine_startup(
+  File "/home/shani.dayan/kv_cache_project/external/vllm/vllm/v1/engine/utils.py", line 1272, in wait_for_engine_startup
+    raise RuntimeError(
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}

@@ -1,0 +1,63 @@
+# KVQuant is only a local reference
+external/KVQuant/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Compiled vLLM files
+*.so
+*.o
+*.a
+build/
+dist/
+CMakeFiles/
+cmake-build-*/
+
+# Logs and temporary files
+*.log
+logs/
+.cache/
+tmp/
+temp/
+
+# Model files
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+*.bin
+
+# Datasets and experiment outputs
+data/
+datasets/
+outputs/
+results/raw/
+wandb/
+tensorboard/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+credentials*
+token*
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

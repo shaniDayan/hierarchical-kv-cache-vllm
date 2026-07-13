@@ -1,0 +1,9 @@
+Date: Sun Jul 12 11:36:36 AM IDT 2026
+Host: lambda1
+Python: /home/shani.dayan/miniforge3/envs/vllm024/bin/python
+vLLM version: 0.24.0
+vLLM path: /home/shani.dayan/kv_cache_project/external/vllm/vllm/__init__.py
+Git branch: shani/paged-kv-quant
+Git commit: ee0da84ab9e04ac7610e28580af62c365e898389
+GPU:
+NVIDIA GeForce RTX 2080 Ti, 11264 MiB, 535.309.01
