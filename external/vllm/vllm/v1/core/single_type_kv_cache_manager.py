@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -28,6 +30,8 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 DEFAULT_HOT_WINDOW_BLOCKS = 4
 DEFAULT_WARM_WINDOW_BLOCKS = 4
@@ -82,10 +86,28 @@ class SingleTypeKVCacheManager(ABC):
         # for each request, so that we can free the blocks when the request
         # is finished.
         self.req_to_blocks: defaultdict[str, list[KVCacheBlock]] = defaultdict(list)
-        self.hot_window_blocks = DEFAULT_HOT_WINDOW_BLOCKS
-        assert self.hot_window_blocks > 0
-        self.warm_window_blocks = DEFAULT_WARM_WINDOW_BLOCKS
-        assert self.warm_window_blocks >= 0
+        self.hot_window_blocks = int(
+            os.getenv(
+                "HKV_HOT_WINDOW_BLOCKS",
+                str(DEFAULT_HOT_WINDOW_BLOCKS),
+            )
+        )
+        self.warm_window_blocks = int(
+            os.getenv(
+                "HKV_WARM_WINDOW_BLOCKS",
+                str(DEFAULT_WARM_WINDOW_BLOCKS),
+            )
+        )
+
+        if self.hot_window_blocks <= 0:
+            raise ValueError(
+                "HKV_HOT_WINDOW_BLOCKS must be greater than zero"
+            )
+
+        if self.warm_window_blocks < 0:
+            raise ValueError(
+                "HKV_WARM_WINDOW_BLOCKS must be non-negative"
+            )
 
         # {req_id: The number of cached blocks for this given request}
         # This is used to track the number of cached blocks for each request.
@@ -310,6 +332,33 @@ class SingleTypeKVCacheManager(ABC):
                 block.hierarchy_state = KVBlockState.WARM
             else:
                 block.hierarchy_state = KVBlockState.COLD
+
+        if os.getenv("HKV_DEBUG") == "1":
+            hot_count = sum(
+                block.hierarchy_state is KVBlockState.HOT
+                for block in req_blocks
+                if not block.is_null
+            )
+            warm_count = sum(
+                block.hierarchy_state is KVBlockState.WARM
+                for block in req_blocks
+                if not block.is_null
+            )
+            cold_count = sum(
+                block.hierarchy_state is KVBlockState.COLD
+                for block in req_blocks
+                if not block.is_null
+            )
+
+            logger.info(
+                "Hierarchical KV state update: "
+                "request_id=%s total=%d hot=%d warm=%d cold=%d",
+                request_id,
+                hot_count + warm_count + cold_count,
+                hot_count,
+                warm_count,
+                cold_count,
+            )
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
