@@ -11,6 +11,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     BlockHashWithGroupId,
     KVCacheBlock,
+    KVBlockState,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
@@ -27,6 +28,8 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+DEFAULT_HOT_WINDOW_BLOCKS = 4
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -78,6 +81,8 @@ class SingleTypeKVCacheManager(ABC):
         # for each request, so that we can free the blocks when the request
         # is finished.
         self.req_to_blocks: defaultdict[str, list[KVCacheBlock]] = defaultdict(list)
+        self.hot_window_blocks = DEFAULT_HOT_WINDOW_BLOCKS
+        assert self.hot_window_blocks > 0
 
         # {req_id: The number of cached blocks for this given request}
         # This is used to track the number of cached blocks for each request.
@@ -275,6 +280,28 @@ class SingleTypeKVCacheManager(ABC):
         ):
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
+    def _update_hierarchy_states(self, request_id: str) -> None:
+        """Mark recent request blocks as HOT and older blocks as WARM."""
+        req_blocks = self.req_to_blocks.get(request_id, [])
+
+        hot_start = max(
+            0,
+            len(req_blocks) - self.hot_window_blocks,
+        )
+
+        for block_index, block in enumerate(req_blocks):
+            if block.is_null:
+                continue
+
+            # A physical block shared by multiple requests may appear at
+            # different logical positions. Keep shared blocks HOT for now.
+            if block.ref_cnt > 1:
+                block.hierarchy_state = KVBlockState.HOT
+            elif block_index >= hot_start:
+                block.hierarchy_state = KVBlockState.HOT
+            else:
+                block.hierarchy_state = KVBlockState.WARM
+
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
@@ -300,6 +327,7 @@ class SingleTypeKVCacheManager(ABC):
         else:
             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
             req_blocks.extend(new_blocks)
+            self._update_hierarchy_states(request_id)
             if type(self.kv_cache_spec) in (
                 FullAttentionSpec,
                 TQFullAttentionSpec,
