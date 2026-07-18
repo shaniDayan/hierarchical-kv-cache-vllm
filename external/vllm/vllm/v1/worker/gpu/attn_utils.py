@@ -187,6 +187,99 @@ def initialize_hkv_warm_kv_caches(
     return warm_kv_caches
 
 
+def initialize_hkv_hot_to_warm_maps(
+    hot_kv_caches: dict[str, torch.Tensor],
+    warm_kv_caches: dict[str, torch.Tensor],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Create per-layer HOT-to-WARM block maps for experimental HKV state."""
+    if not warm_kv_caches:
+        return {}
+
+    hot_to_warm_maps: dict[str, torch.Tensor] = {}
+    maps_by_cache_pair: dict[tuple[int, int], torch.Tensor] = {}
+    for layer_name in hot_kv_caches.keys() & warm_kv_caches.keys():
+        hot_cache = hot_kv_caches[layer_name]
+        warm_cache = warm_kv_caches[layer_name]
+        if not isinstance(hot_cache, torch.Tensor) or not isinstance(
+            warm_cache, torch.Tensor
+        ):
+            raise ValueError(
+                f"HOT and WARM KV caches for {layer_name!r} must be tensors"
+            )
+        if hot_cache.ndim != 5 or warm_cache.ndim != 5:
+            raise ValueError(
+                f"HOT and WARM KV caches for {layer_name!r} must be "
+                "five-dimensional"
+            )
+        if hot_cache.shape[2] != warm_cache.shape[2]:
+            raise ValueError(
+                f"HOT and WARM KV caches for {layer_name!r} must use the "
+                "same block size"
+            )
+        if hot_cache.device != device or warm_cache.device != device:
+            raise ValueError(
+                f"HOT and WARM KV caches for {layer_name!r} must be on {device}"
+            )
+        if hot_cache.shape[0] < 1 or warm_cache.shape[0] < 1:
+            raise ValueError(
+                f"HOT and WARM KV caches for {layer_name!r} must have at "
+                "least one physical block"
+            )
+
+        cache_pair = (
+            hot_cache.untyped_storage().data_ptr(),
+            warm_cache.untyped_storage().data_ptr(),
+        )
+        hot_to_warm_map = maps_by_cache_pair.get(cache_pair)
+        if hot_to_warm_map is None:
+            hot_to_warm_map = torch.full(
+                (hot_cache.shape[0],),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            maps_by_cache_pair[cache_pair] = hot_to_warm_map
+        elif hot_to_warm_map.shape[0] != hot_cache.shape[0]:
+            raise ValueError(
+                f"Aliased HOT KV caches for {layer_name!r} have "
+                "incompatible block counts"
+            )
+        hot_to_warm_maps[layer_name] = hot_to_warm_map
+
+    example_shape = (
+        tuple(next(iter(maps_by_cache_pair.values())).shape)
+        if maps_by_cache_pair
+        else None
+    )
+    logger.info(
+        "Initialized experimental HOT-to-WARM maps: %d layer entries, "
+        "%d unique tensors, dtype=%s, example shape=%s",
+        len(hot_to_warm_maps),
+        len(maps_by_cache_pair),
+        torch.int32,
+        example_shape,
+    )
+    return hot_to_warm_maps
+
+
+def bind_hkv_attention_state(
+    warm_kv_caches: dict[str, torch.Tensor],
+    hot_to_warm_maps: dict[str, torch.Tensor],
+    forward_context: dict[str, Attention],
+) -> None:
+    """Bind experimental HKV state without changing the active HOT cache."""
+    for layer_name in warm_kv_caches.keys() & hot_to_warm_maps.keys():
+        if layer_name not in forward_context:
+            raise ValueError(
+                f"Cannot bind experimental HKV state: layer "
+                f"{layer_name!r} is missing from the forward context"
+            )
+        layer = forward_context[layer_name]
+        layer._hkv_warm_kv_cache = warm_kv_caches[layer_name]
+        layer._hkv_hot_to_warm_map = hot_to_warm_maps[layer_name]
+
+
 def _get_hkv_per_token_head_scale_views(
     kv_cache: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
@@ -246,6 +339,7 @@ def _get_hkv_per_token_head_scale_views(
 def debug_demote_one_hkv_block(
     hot_kv_caches: dict[str, torch.Tensor],
     warm_kv_caches: dict[str, torch.Tensor],
+    hot_to_warm_maps: dict[str, torch.Tensor],
     slot_mappings_by_layer: dict[str, torch.Tensor] | None,
     device: torch.device,
 ) -> bool:
@@ -253,7 +347,12 @@ def debug_demote_one_hkv_block(
     enabled = os.getenv("HKV_DEBUG_DEMOTE_ONE_BLOCK", "").strip().lower()
     if enabled not in {"1", "true", "yes", "on"}:
         return False
-    if not hot_kv_caches or not warm_kv_caches or not slot_mappings_by_layer:
+    if (
+        not hot_kv_caches
+        or not warm_kv_caches
+        or not hot_to_warm_maps
+        or not slot_mappings_by_layer
+    ):
         return False
 
     candidate_layers = (
@@ -436,14 +535,73 @@ def debug_demote_one_hkv_block(
     if processed_layers == 0:
         return False
 
+    relevant_map_entries: list[torch.Tensor] = []
+    unique_maps_to_update: dict[int, torch.Tensor] = {}
+    for layer_name in (
+        hot_kv_caches.keys()
+        & warm_kv_caches.keys()
+        & hot_to_warm_maps.keys()
+    ):
+        hot_cache = hot_kv_caches[layer_name]
+        warm_cache = warm_kv_caches[layer_name]
+        hot_to_warm_map = hot_to_warm_maps[layer_name]
+        if not isinstance(hot_cache, torch.Tensor) or not isinstance(
+            warm_cache, torch.Tensor
+        ):
+            continue
+        cache_pair = (
+            hot_cache.untyped_storage().data_ptr(),
+            warm_cache.untyped_storage().data_ptr(),
+        )
+        if cache_pair not in processed_cache_pairs:
+            continue
+        if not isinstance(hot_to_warm_map, torch.Tensor):
+            raise ValueError(
+                f"HOT-to-WARM map for {layer_name!r} must be a tensor"
+            )
+        if (
+            not hot_to_warm_map.is_cuda
+            or hot_to_warm_map.device != device
+            or hot_to_warm_map.dtype != torch.int32
+            or hot_to_warm_map.ndim != 1
+        ):
+            raise ValueError(
+                f"Invalid HOT-to-WARM map layout for {layer_name!r}"
+            )
+        if source_block_id >= hot_to_warm_map.shape[0]:
+            raise ValueError(
+                f"HOT block {source_block_id} is outside the map for "
+                f"{layer_name!r}"
+            )
+        previous_warm_block = hot_to_warm_map[source_block_id].item()
+        if previous_warm_block not in (-1, warm_block_id):
+            raise ValueError(
+                f"HOT block {source_block_id} for {layer_name!r} is already "
+                f"mapped to WARM block {previous_warm_block}"
+            )
+
+        relevant_map_entries.append(hot_to_warm_map)
+        map_storage_ptr = hot_to_warm_map.untyped_storage().data_ptr()
+        unique_maps_to_update[map_storage_ptr] = hot_to_warm_map
+
+    if not relevant_map_entries:
+        return False
+
+    # Commit map state only after every cache and map has been validated.
+    for hot_to_warm_map in unique_maps_to_update.values():
+        hot_to_warm_map[source_block_id] = warm_block_id
+
     logger.info(
-        "HKV debug demotion completed: HOT block=%d, WARM block=%d, "
-        "layers=%d, K max error=%.6g, K mean error=%.6g, "
+        "HKV debug demotion completed: HOT block %d -> WARM block %d, "
+        "layers=%d, map entries=%d, unique maps=%d, "
+        "K max error=%.6g, K mean error=%.6g, "
         "V max error=%.6g, V mean error=%.6g, "
         "nonzero int8 values=%d, scale range=[%.6g, %.6g]",
         source_block_id,
         warm_block_id,
         processed_layers,
+        len(relevant_map_entries),
+        len(unique_maps_to_update),
         k_max_error,
         k_total_absolute_error / k_total_element_count,
         v_max_error,
