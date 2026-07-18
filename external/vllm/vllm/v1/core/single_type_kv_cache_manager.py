@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
 
 DEFAULT_HOT_WINDOW_BLOCKS = 4
+DEFAULT_WARM_WINDOW_BLOCKS = 4
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -83,6 +84,8 @@ class SingleTypeKVCacheManager(ABC):
         self.req_to_blocks: defaultdict[str, list[KVCacheBlock]] = defaultdict(list)
         self.hot_window_blocks = DEFAULT_HOT_WINDOW_BLOCKS
         assert self.hot_window_blocks > 0
+        self.warm_window_blocks = DEFAULT_WARM_WINDOW_BLOCKS
+        assert self.warm_window_blocks >= 0
 
         # {req_id: The number of cached blocks for this given request}
         # This is used to track the number of cached blocks for each request.
@@ -281,12 +284,16 @@ class SingleTypeKVCacheManager(ABC):
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
     def _update_hierarchy_states(self, request_id: str) -> None:
-        """Mark recent request blocks as HOT and older blocks as WARM."""
+        """Assign HOT, WARM, and COLD states to request blocks."""
         req_blocks = self.req_to_blocks.get(request_id, [])
 
         hot_start = max(
             0,
             len(req_blocks) - self.hot_window_blocks,
+        )
+        warm_start = max(
+            0,
+            hot_start - self.warm_window_blocks,
         )
 
         for block_index, block in enumerate(req_blocks):
@@ -299,8 +306,10 @@ class SingleTypeKVCacheManager(ABC):
                 block.hierarchy_state = KVBlockState.HOT
             elif block_index >= hot_start:
                 block.hierarchy_state = KVBlockState.HOT
-            else:
+            elif block_index >= warm_start:
                 block.hierarchy_state = KVBlockState.WARM
+            else:
+                block.hierarchy_state = KVBlockState.COLD
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
