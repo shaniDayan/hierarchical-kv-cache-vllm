@@ -54,9 +54,11 @@ from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
+    debug_demote_one_hkv_block,
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
+    initialize_hkv_warm_kv_caches,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import (
@@ -141,6 +143,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Lazily initialized in _init_kv_zero_meta() when the KV cache needs
         # zeroing (e.g. hybrid models with fp8 KV cache).
         self.kv_block_zeroer: KVBlockZeroer | None = None
+        # Experimental allocation-only storage for physical WARM KV tiers.
+        self.hkv_hot_kv_caches: dict[str, torch.Tensor] = {}
+        self.hkv_warm_kv_caches: dict[str, torch.Tensor] = {}
+        self._hkv_debug_demote_done = False
 
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
@@ -490,6 +496,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.cache_config.cache_dtype,
             self.kernel_block_sizes,
             self.vllm_config,
+        )
+        self.hkv_hot_kv_caches = kv_caches_dict
+        self.hkv_warm_kv_caches = initialize_hkv_warm_kv_caches(
+            kv_cache_config=self.kv_cache_config,
+            attn_groups=self.attn_groups,
+            kernel_block_sizes=self.kernel_block_sizes,
+            device=self.device,
+            vllm_config=self.vllm_config,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
@@ -1290,6 +1304,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+
+        if not dummy_run and not self._hkv_debug_demote_done:
+            self._hkv_debug_demote_done = debug_demote_one_hkv_block(
+                hot_kv_caches=self.hkv_hot_kv_caches,
+                warm_kv_caches=self.hkv_warm_kv_caches,
+                slot_mappings_by_layer=slot_mappings_by_layer,
+                device=self.device,
+            )
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

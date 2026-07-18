@@ -202,7 +202,10 @@ from vllm.v1.worker.cp_utils import (
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
-from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
+from vllm.v1.worker.gpu.attn_utils import (
+    _reshape_attention_kv_cache,
+    initialize_hkv_warm_kv_caches,
+)
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
@@ -525,6 +528,8 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        # Experimental allocation-only storage for physical WARM KV tiers.
+        self.hkv_warm_kv_caches: dict[str, torch.Tensor] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -7266,6 +7271,16 @@ class GPUModelRunner(
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
+
+        # Keep this allocation-only WARM tier separate from the bound HOT cache.
+        self.hkv_warm_kv_caches = initialize_hkv_warm_kv_caches(
+            kv_cache_config=kv_cache_config,
+            attn_groups=self.attn_groups,
+            kernel_block_sizes=kernel_block_sizes,
+            device=self.device,
+            vllm_config=self.vllm_config,
+            runner_only_attn_layers=self.runner_only_attn_layers,
+        )
 
         num_attn_module = (
             2 if self.model_config.hf_config.model_type == "longcat_flash" else 1

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from math import prod
@@ -12,12 +13,16 @@ from vllm.config import (
     get_layers_from_vllm_config,
     set_current_vllm_config,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
+)
+from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+    triton_reshape_and_cache_flash_per_token_head_quant,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -33,6 +38,8 @@ from vllm.v1.worker.utils import (
     bind_kv_cache,
     prepare_kernel_block_sizes,
 )
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -69,6 +76,383 @@ def get_shared_kv_cache_layers(vllm_config: VllmConfig):
         for layer_name, attn_module in attn_layers.items()
         if (kv_tgt_layer := attn_module.kv_sharing_target_layer_name)
     }
+
+
+def initialize_hkv_warm_kv_caches(
+    kv_cache_config: KVCacheConfig,
+    attn_groups: list[list[AttentionGroup]],
+    kernel_block_sizes: list[int],
+    device: torch.device,
+    vllm_config: VllmConfig,
+    runner_only_attn_layers: set[str] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Allocate the experimental, allocation-only physical WARM KV tier."""
+    enabled = os.getenv("HKV_ENABLE_PHYSICAL_TIERS", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return {}
+
+    warm_pool_blocks_str = os.getenv("HKV_WARM_POOL_BLOCKS", "0")
+    try:
+        warm_pool_blocks = int(warm_pool_blocks_str)
+    except ValueError as exc:
+        raise ValueError(
+            "HKV_WARM_POOL_BLOCKS must be an integer greater than zero "
+            "when HKV_ENABLE_PHYSICAL_TIERS is enabled; got "
+            f"{warm_pool_blocks_str!r}"
+        ) from exc
+    if warm_pool_blocks <= 0:
+        raise ValueError(
+            "HKV_WARM_POOL_BLOCKS must be greater than zero when "
+            "HKV_ENABLE_PHYSICAL_TIERS is enabled; got "
+            f"{warm_pool_blocks}"
+        )
+
+    runner_only_attn_layers = runner_only_attn_layers or set()
+    shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
+    flattened_attn_groups = (
+        group for groups in attn_groups for group in groups
+    )
+    warm_kv_caches: dict[str, torch.Tensor] = {}
+    allocated_tensors: list[torch.Tensor] = []
+    for group in flattened_attn_groups:
+        kv_cache_spec = group.kv_cache_spec
+        if not isinstance(kv_cache_spec, AttentionSpec):
+            continue
+        if group.kv_cache_group_id >= len(kernel_block_sizes):
+            # Some models may have a final group for layers without KV cache.
+            continue
+        if group.kv_cache_group_id >= len(kv_cache_config.kv_cache_groups):
+            raise ValueError(
+                "Missing KV-cache configuration for physical WARM "
+                f"KV-cache group {group.kv_cache_group_id}"
+            )
+        layer_names = [
+            layer_name
+            for layer_name in group.layer_names
+            if layer_name not in runner_only_attn_layers
+        ]
+        if not layer_names:
+            continue
+
+        kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
+        warm_shape = group.backend.get_kv_cache_shape(
+            warm_pool_blocks,
+            kernel_block_size,
+            kv_cache_spec.num_kv_heads,
+            kv_cache_spec.head_size,
+            cache_dtype_str="int8_per_token_head",
+        )
+        for layer_name in layer_names:
+            if (
+                layer_name in shared_kv_cache_layers
+                or layer_name in warm_kv_caches
+            ):
+                continue
+            warm_tensor = torch.zeros(
+                warm_shape,
+                dtype=torch.int8,
+                device=device,
+            )
+            warm_kv_caches[layer_name] = warm_tensor
+            allocated_tensors.append(warm_tensor)
+
+    # Shared attention layers alias their target instead of allocating.
+    for layer_name, target_layer_name in shared_kv_cache_layers.items():
+        seen = {layer_name}
+        while target_layer_name in shared_kv_cache_layers:
+            if target_layer_name in seen:
+                raise ValueError("Cycle detected in shared KV-cache layer mappings")
+            seen.add(target_layer_name)
+            target_layer_name = shared_kv_cache_layers[target_layer_name]
+        if target_layer_name not in warm_kv_caches:
+            raise ValueError(
+                f"Shared KV-cache target {target_layer_name!r} has no "
+                "physical WARM cache"
+            )
+        warm_kv_caches[layer_name] = warm_kv_caches[target_layer_name]
+
+    total_bytes = sum(
+        tensor.numel() * tensor.element_size() for tensor in allocated_tensors
+    )
+    example_shape = tuple(allocated_tensors[0].shape) if allocated_tensors else None
+    logger.info(
+        "Allocated experimental WARM KV pool: %d blocks per layer, "
+        "%d unique tensors, %d bytes, dtype=%s, example shape=%s",
+        warm_pool_blocks,
+        len(allocated_tensors),
+        total_bytes,
+        torch.int8,
+        example_shape,
+    )
+    return warm_kv_caches
+
+
+def _get_hkv_per_token_head_scale_views(
+    kv_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Create FP32 scale views over inline INT8 per-token-head padding."""
+    if kv_cache.ndim != 5 or kv_cache.shape[1] != 2:
+        raise ValueError(
+            "WARM KV cache must have shape "
+            "(num_blocks, 2, block_size, num_kv_heads, padded_head_size)"
+        )
+    if kv_cache.dtype != torch.int8:
+        raise ValueError(f"WARM KV cache must use torch.int8; got {kv_cache.dtype}")
+    if not kv_cache.is_contiguous() or kv_cache.storage_offset() != 0:
+        raise ValueError("WARM KV cache must be a contiguous base tensor")
+
+    num_blocks, _, block_size, num_kv_heads, padded_head_size = kv_cache.shape
+    int8_size = get_dtype_size(torch.int8)
+    float32_size = get_dtype_size(torch.float32)
+    scale_pad = float32_size // int8_size
+    head_size = padded_head_size - scale_pad
+    if min(num_blocks, block_size, num_kv_heads, head_size) <= 0:
+        raise ValueError(f"Invalid WARM KV-cache shape: {tuple(kv_cache.shape)}")
+    if head_size * int8_size % float32_size != 0:
+        raise ValueError("WARM KV-cache scale storage is not FP32-aligned")
+
+    raw_storage = kv_cache.untyped_storage()
+    base_f32 = torch.tensor(
+        [], dtype=torch.float32, device=kv_cache.device
+    ).set_(raw_storage)
+
+    kv_half_bytes = (
+        block_size * num_kv_heads * padded_head_size * int8_size
+    )
+    full_block_f32 = 2 * kv_half_bytes // float32_size
+    slot_f32 = (
+        num_kv_heads * padded_head_size * int8_size // float32_size
+    )
+    head_f32 = padded_head_size * int8_size // float32_size
+    scale_offset_f32 = head_size * int8_size // float32_size
+    scale_shape = (num_blocks, block_size, num_kv_heads)
+    scale_stride = (full_block_f32, slot_f32, head_f32)
+
+    k_scale_cache = torch.as_strided(
+        base_f32,
+        size=scale_shape,
+        stride=scale_stride,
+        storage_offset=scale_offset_f32,
+    )
+    v_scale_cache = torch.as_strided(
+        base_f32,
+        size=scale_shape,
+        stride=scale_stride,
+        storage_offset=kv_half_bytes // float32_size + scale_offset_f32,
+    )
+    return k_scale_cache, v_scale_cache, head_size
+
+
+def debug_demote_one_hkv_block(
+    hot_kv_caches: dict[str, torch.Tensor],
+    warm_kv_caches: dict[str, torch.Tensor],
+    slot_mappings_by_layer: dict[str, torch.Tensor] | None,
+    device: torch.device,
+) -> bool:
+    """Quantize and validate one complete HOT block without changing HOT state."""
+    enabled = os.getenv("HKV_DEBUG_DEMOTE_ONE_BLOCK", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return False
+    if not hot_kv_caches or not warm_kv_caches or not slot_mappings_by_layer:
+        return False
+
+    candidate_layers = (
+        hot_kv_caches.keys()
+        & warm_kv_caches.keys()
+        & slot_mappings_by_layer.keys()
+    )
+    if not candidate_layers:
+        return False
+
+    representative_layer = next(iter(candidate_layers))
+    representative_hot = hot_kv_caches[representative_layer]
+    representative_warm = warm_kv_caches[representative_layer]
+    if not isinstance(representative_hot, torch.Tensor) or not isinstance(
+        representative_warm, torch.Tensor
+    ):
+        raise ValueError("HKV debug demotion requires tensor KV caches")
+    if (
+        representative_hot.ndim != 5
+        or representative_hot.shape[1] != 2
+        or representative_warm.ndim != 5
+        or representative_warm.shape[1] != 2
+    ):
+        raise ValueError("HKV debug demotion requires five-dimensional KV caches")
+
+    block_size = representative_warm.shape[2]
+    if block_size <= 0:
+        raise ValueError("WARM KV-cache block size must be greater than zero")
+    if representative_hot.shape[2] != block_size:
+        raise ValueError("HOT and WARM KV-cache block sizes must match")
+
+    slot_mapping = slot_mappings_by_layer[representative_layer].reshape(-1)
+    valid_slots = slot_mapping[slot_mapping >= 0]
+    if valid_slots.numel() == 0:
+        return False
+
+    offsets_by_block: dict[int, set[int]] = {}
+    for slot in valid_slots.tolist():
+        block_id, offset = divmod(int(slot), block_size)
+        if block_id < representative_hot.shape[0]:
+            offsets_by_block.setdefault(block_id, set()).add(offset)
+    expected_offsets = set(range(block_size))
+    source_block_id = next(
+        (
+            block_id
+            for block_id, offsets in offsets_by_block.items()
+            if offsets == expected_offsets
+        ),
+        None,
+    )
+    if source_block_id is None:
+        return False
+
+    warm_block_id = 0
+    destination_slots = warm_block_id * block_size + torch.arange(
+        block_size, dtype=torch.int64, device=device
+    )
+    processed_cache_pairs: set[tuple[int, int]] = set()
+    processed_layers = 0
+    k_max_error = 0.0
+    v_max_error = 0.0
+    k_total_absolute_error = 0.0
+    v_total_absolute_error = 0.0
+    k_total_element_count = 0
+    v_total_element_count = 0
+    nonzero_int8_values = 0
+    min_scale = float("inf")
+    max_scale = float("-inf")
+
+    for layer_name in hot_kv_caches.keys() & warm_kv_caches.keys():
+        hot_cache = hot_kv_caches[layer_name]
+        warm_cache = warm_kv_caches[layer_name]
+        if not isinstance(hot_cache, torch.Tensor) or not isinstance(
+            warm_cache, torch.Tensor
+        ):
+            continue
+
+        cache_pair = (
+            hot_cache.untyped_storage().data_ptr(),
+            warm_cache.untyped_storage().data_ptr(),
+        )
+        if cache_pair in processed_cache_pairs:
+            continue
+        processed_cache_pairs.add(cache_pair)
+
+        if hot_cache.ndim != 5 or hot_cache.shape[1] != 2:
+            raise ValueError(
+                f"HOT KV cache for {layer_name!r} must be five-dimensional"
+            )
+        if warm_cache.ndim != 5 or warm_cache.shape[1] != 2:
+            raise ValueError(
+                f"WARM KV cache for {layer_name!r} must be five-dimensional"
+            )
+        if not hot_cache.is_floating_point():
+            raise ValueError(
+                f"HOT KV cache for {layer_name!r} must be floating point"
+            )
+        if hot_cache.stride(-1) != 1:
+            raise ValueError(
+                f"HOT KV cache for {layer_name!r} must have contiguous heads"
+            )
+        if source_block_id >= hot_cache.shape[0]:
+            raise ValueError(
+                f"HOT block {source_block_id} is unavailable for {layer_name!r}"
+            )
+        if warm_cache.shape[0] <= warm_block_id:
+            raise ValueError(f"WARM KV cache for {layer_name!r} has no block zero")
+
+        warm_k_scale_cache, warm_v_scale_cache, head_size = (
+            _get_hkv_per_token_head_scale_views(warm_cache)
+        )
+        if (
+            hot_cache.shape[2] != block_size
+            or warm_cache.shape[2] != block_size
+            or hot_cache.shape[3] != warm_cache.shape[3]
+            or hot_cache.shape[4] != head_size
+        ):
+            raise ValueError(
+                f"Incompatible HOT/WARM KV-cache layouts for {layer_name!r}"
+            )
+        if hot_cache.device != device or warm_cache.device != device:
+            raise ValueError(
+                f"HOT/WARM KV caches for {layer_name!r} must be on {device}"
+            )
+        if cache_pair[0] == cache_pair[1]:
+            raise ValueError("HOT and WARM KV caches must not share storage")
+
+        hot_key = hot_cache[source_block_id, 0]
+        hot_value = hot_cache[source_block_id, 1]
+        warm_key_cache, warm_value_cache = warm_cache.unbind(1)
+        triton_reshape_and_cache_flash_per_token_head_quant(
+            hot_key,
+            hot_value,
+            warm_key_cache,
+            warm_value_cache,
+            warm_k_scale_cache,
+            warm_v_scale_cache,
+            destination_slots,
+        )
+
+        reconstructed_key = (
+            warm_key_cache[warm_block_id, :, :, :head_size].float()
+            * warm_k_scale_cache[warm_block_id].unsqueeze(-1)
+        )
+        reconstructed_value = (
+            warm_value_cache[warm_block_id, :, :, :head_size].float()
+            * warm_v_scale_cache[warm_block_id].unsqueeze(-1)
+        )
+        k_absolute_error = (reconstructed_key - hot_key.float()).abs()
+        v_absolute_error = (reconstructed_value - hot_value.float()).abs()
+
+        k_max_error = max(k_max_error, k_absolute_error.max().item())
+        v_max_error = max(v_max_error, v_absolute_error.max().item())
+        k_total_absolute_error += k_absolute_error.sum(dtype=torch.float64).item()
+        v_total_absolute_error += v_absolute_error.sum(dtype=torch.float64).item()
+        k_total_element_count += k_absolute_error.numel()
+        v_total_element_count += v_absolute_error.numel()
+        nonzero_int8_values += int(
+            torch.count_nonzero(
+                warm_key_cache[warm_block_id, :, :, :head_size]
+            ).item()
+        )
+        nonzero_int8_values += int(
+            torch.count_nonzero(
+                warm_value_cache[warm_block_id, :, :, :head_size]
+            ).item()
+        )
+        min_scale = min(
+            min_scale,
+            warm_k_scale_cache[warm_block_id].min().item(),
+            warm_v_scale_cache[warm_block_id].min().item(),
+        )
+        max_scale = max(
+            max_scale,
+            warm_k_scale_cache[warm_block_id].max().item(),
+            warm_v_scale_cache[warm_block_id].max().item(),
+        )
+        processed_layers += 1
+
+    if processed_layers == 0:
+        return False
+
+    logger.info(
+        "HKV debug demotion completed: HOT block=%d, WARM block=%d, "
+        "layers=%d, K max error=%.6g, K mean error=%.6g, "
+        "V max error=%.6g, V mean error=%.6g, "
+        "nonzero int8 values=%d, scale range=[%.6g, %.6g]",
+        source_block_id,
+        warm_block_id,
+        processed_layers,
+        k_max_error,
+        k_total_absolute_error / k_total_element_count,
+        v_max_error,
+        v_total_absolute_error / v_total_element_count,
+        nonzero_int8_values,
+        min_scale,
+        max_scale,
+    )
+    return True
 
 
 def init_attn_backend(
