@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV-Cache Utilities."""
-
+from enum import Enum 
 import copy
 import hashlib
 import math
@@ -113,6 +113,12 @@ def init_none_hash(hash_fn: Callable[[Any], bytes]):
     else:
         NONE_HASH = BlockHash(hash_fn(hash_seed))
 
+class KVBlockState(str, Enum):
+    """Hierarchical state of a physical KV-cache block."""
+
+    HOT = "hot"
+    WARM = "warm"
+
 
 @dataclass(slots=True)
 class KVCacheBlock:
@@ -120,6 +126,8 @@ class KVCacheBlock:
 
     # Block ID, ranging from 0 to num_gpu_blocks - 1.
     block_id: int
+    # Hierarchical state of the physical KV-cache block.
+    hierarchy_state: KVBlockState = KVBlockState.HOT
     # Reference count.
     ref_cnt: int = 0
     # The hash key (block hash + group id) of the block, only available
@@ -136,6 +144,10 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+
+    def reset_hierarchy_state(self) -> None:
+        """Reset a reused physical block to the default HOT state."""
+        self.hierarchy_state = KVBlockState.HOT
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -168,6 +180,7 @@ class KVCacheBlock:
         next_block_id = self.next_free_block.block_id if self.next_free_block else None
         return (
             f"KVCacheBlock(block_id={self.block_id}, "
+            f"hierarchy_state={self.hierarchy_state.value}, "
             f"ref_cnt={self.ref_cnt}, "
             f"_block_hash={self._block_hash!r}, "
             f"_block_hash_num_tokens={self._block_hash_num_tokens}, "

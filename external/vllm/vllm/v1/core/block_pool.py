@@ -559,12 +559,14 @@ class BlockPool:
         if self.enable_caching:
             for block in ret:
                 self._maybe_evict_cached_block(block)
+                block.reset_hierarchy_state()
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
+                block.reset_hierarchy_state()
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
