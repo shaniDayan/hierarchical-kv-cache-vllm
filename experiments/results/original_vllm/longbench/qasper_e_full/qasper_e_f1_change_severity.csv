@@ -1,0 +1,5 @@
+Threshold (absolute F1 points),INT8 drops at least threshold,Drop percentage,INT8 improves at least threshold,Improvement percentage
+5,50,22.321428571428573,25,11.160714285714286
+10,28,12.5,19,8.482142857142858
+20,19,8.482142857142858,7,3.125
+40,7,3.125,2,0.8928571428571429

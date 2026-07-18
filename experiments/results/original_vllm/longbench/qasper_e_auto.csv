@@ -1,0 +1,5 @@
+kv_cache_dtype,dataset,dataset_index,example_id,target_prompt_tokens,prompt_tokens,output_tokens,generation_time_seconds,output_tokens_per_second,total_tokens_per_second
+auto,qasper_e,39,ca6ab28a7624b35d6e14bdd51a24f6cba93df17b033a0945,2048,2034,46,2.117949,21.7191,982.082
+auto,qasper_e,8,d3944ab2d7e6cb9d6f722987f0406aa0aa01c8ace8608a89,4096,4098,29,2.427113,11.9484,1700.3741
+auto,qasper_e,105,585cb871b289390d1702cbbe783eaf7874fe78b61efc8667,8192,8110,21,5.709389,3.6782,1424.1453
+auto,qasper_e,202,0da153430cc4d3999a6c67e8299d79be643e6248512ca37a,16384,15762,18,19.057655,0.9445,828.0137

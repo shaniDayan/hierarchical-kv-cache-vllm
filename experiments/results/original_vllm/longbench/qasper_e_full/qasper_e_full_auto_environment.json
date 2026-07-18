@@ -1,0 +1,20 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "dataset": "qasper_e",
+  "dataset_path": "/home/shani.dayan/kv_cache_project/datasets/longbench/data/qasper_e.jsonl",
+  "kv_cache_dtype": "auto",
+  "model_dtype": "float16",
+  "max_model_len": 32768,
+  "max_output_tokens": 128,
+  "gpu_memory_utilization": 0.5,
+  "enforce_eager": true,
+  "enable_prefix_caching": false,
+  "enable_chunked_prefill": true,
+  "seed": 0,
+  "python_executable": "/home/shani.dayan/miniforge3/envs/vllm024/bin/python",
+  "python_version": "3.12.13",
+  "pytorch_version": "2.11.0+cu129",
+  "vllm_version": "0.24.0",
+  "cuda_available": true,
+  "gpu": "NVIDIA GeForce RTX 2080 Ti"
+}

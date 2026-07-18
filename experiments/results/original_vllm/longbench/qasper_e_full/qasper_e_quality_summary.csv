@@ -1,0 +1,13 @@
+Metric,Value
+Number of examples,224.0
+Mean FP16 F1,29.136102374069253
+Mean INT8 F1,26.283920750833015
+Mean paired F1 change,-2.8521816232362376
+Median paired F1 change,0.0
+INT8 improved examples,43.0
+INT8 degraded examples,80.0
+Unchanged-F1 examples,101.0
+Exactly identical outputs,62.0
+Normalized-identical outputs,66.0
+Changed outputs,162.0
+Changed outputs (%),72.32142857142857

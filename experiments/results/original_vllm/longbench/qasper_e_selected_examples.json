@@ -1,0 +1,38 @@
+[
+  {
+    "target_tokens": 2048,
+    "index": 39,
+    "id": "ca6ab28a7624b35d6e14bdd51a24f6cba93df17b033a0945",
+    "reported_length": 1561,
+    "prompt_tokens": 2034,
+    "bucket": "0-2K",
+    "answer_count": 1
+  },
+  {
+    "target_tokens": 4096,
+    "index": 8,
+    "id": "d3944ab2d7e6cb9d6f722987f0406aa0aa01c8ace8608a89",
+    "reported_length": 2890,
+    "prompt_tokens": 4098,
+    "bucket": "4K-8K",
+    "answer_count": 2
+  },
+  {
+    "target_tokens": 8192,
+    "index": 105,
+    "id": "585cb871b289390d1702cbbe783eaf7874fe78b61efc8667",
+    "reported_length": 6182,
+    "prompt_tokens": 8110,
+    "bucket": "4K-8K",
+    "answer_count": 1
+  },
+  {
+    "target_tokens": 16384,
+    "index": 202,
+    "id": "0da153430cc4d3999a6c67e8299d79be643e6248512ca37a",
+    "reported_length": 10349,
+    "prompt_tokens": 15762,
+    "bucket": "8K-16K",
+    "answer_count": 2
+  }
+]

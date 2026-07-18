@@ -1,0 +1,25 @@
+{
+  "dataset": "Qasper-E",
+  "examples": 224,
+  "model": "Qwen/Qwen3-0.6B",
+  "fp16_mean_f1": 29.136102374069253,
+  "int8_mean_f1": 26.283920750833015,
+  "mean_f1_change": -2.8521816232362376,
+  "median_f1_change": 0.0,
+  "f1_change_bootstrap_95_ci": [
+    -5.134074836412775,
+    -0.6938029063880247
+  ],
+  "improved_examples": 43,
+  "degraded_examples": 80,
+  "unchanged_f1_examples": 101,
+  "exactly_identical_outputs": 62,
+  "changed_outputs": 162,
+  "changed_outputs_percent": 72.32142857142857,
+  "f1_drop_at_least_5": 50,
+  "f1_drop_at_least_20": 19,
+  "mean_int8_time_change_percent": -0.6916236386170801,
+  "median_int8_time_change_percent": -2.7738648975058817,
+  "prompt_length_f1_change_pearson": -0.0022716457768001876,
+  "prompt_length_f1_change_spearman": -0.015238232604065835
+}

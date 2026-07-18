@@ -1,0 +1,11 @@
+Metric,FP16,INT8
+Mean end-to-end time (seconds),5.406975263392858,5.34198215625
+Median end-to-end time (seconds),3.398795,3.346149
+Mean total tokens/second,1585.0248495535711,1614.4378674107143
+Median total tokens/second,1598.781,1620.91375
+Mean output tokens,28.651785714285715,30.8125
+Median output tokens,23.0,24.0
+Mean INT8 time change (%),,-0.6916236386170801
+Median INT8 time change (%),,-2.7738648975058817
+Mean INT8 throughput change (%),,3.404620041323225
+Median INT8 throughput change (%),,2.8530059157114045

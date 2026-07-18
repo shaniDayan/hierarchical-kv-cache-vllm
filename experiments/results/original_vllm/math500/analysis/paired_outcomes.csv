@@ -1,0 +1,5 @@
+outcome,count
+Correct in both,167
+Correct only in FP16,57
+Correct only in INT8,51
+Wrong in both,225

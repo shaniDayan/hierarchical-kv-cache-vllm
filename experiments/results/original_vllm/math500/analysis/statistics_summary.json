@@ -1,0 +1,17 @@
+{
+  "num_examples": 500,
+  "fp16_accuracy": 0.448,
+  "int8_accuracy": 0.436,
+  "accuracy_difference_int8_minus_fp16": -0.01200000000000001,
+  "bootstrap_ci_95": {
+    "low": -0.05399999999999999,
+    "high": 0.028000000000000025
+  },
+  "paired_outcomes": {
+    "both_correct": 167,
+    "fp16_only": 57,
+    "int8_only": 51,
+    "both_wrong": 225
+  },
+  "exact_mcnemar_pvalue": 0.6306338345308315
+}
