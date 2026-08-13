@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
 )
+from vllm.v1.kv_cache_state import KVBlockState
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.structured_output import StructuredOutputManager
@@ -105,6 +106,82 @@ class TestStreamingScheduler(unittest.TestCase):
 
         assert next_request.status == RequestStatus.WAITING
         assert len(scheduler.requests["test_request"].streaming_queue) == 1
+
+    def test_queued_streaming_update_does_not_promote_session(self):
+        scheduler = create_scheduler()
+        session = DummyRequest(
+            request_id="session",
+            prompt_token_ids=[1],
+        )
+        scheduler.add_request(session)
+        allocated = scheduler.kv_cache_manager.allocate_slots(session, 1)
+        assert allocated is not None
+        session.kv_cache_state = KVBlockState.WARM
+        scheduler.kv_cache_manager.apply_request_kv_state(
+            session.request_id, KVBlockState.WARM
+        )
+        scheduler.kv_cache_manager.apply_request_kv_state = MagicMock(
+            wraps=scheduler.kv_cache_manager.apply_request_kv_state
+        )
+
+        scheduler.add_request(DummyRequest(request_id="session", prompt_token_ids=[2]))
+
+        assert len(session.streaming_queue) == 1
+        assert session.kv_cache_state is KVBlockState.WARM
+        assert all(
+            block.hierarchy_state is KVBlockState.WARM
+            for group in scheduler.kv_cache_manager.get_blocks(
+                session.request_id
+            ).blocks
+            for block in group
+            if not block.is_null and block.ref_cnt == 1
+        )
+        scheduler.kv_cache_manager.apply_request_kv_state.assert_not_called()
+
+    def _assert_streaming_update_promotes_session(
+        self, initial_state: KVBlockState
+    ) -> None:
+        scheduler = create_scheduler()
+        session = DummyRequest(
+            request_id="session",
+            prompt_token_ids=[1, 2, 3],
+        )
+        session.num_computed_tokens = len(session.prompt_token_ids)
+        allocated = scheduler.kv_cache_manager.allocate_slots(
+            session, len(session.prompt_token_ids)
+        )
+        assert allocated is not None
+        session.kv_cache_state = initial_state
+        scheduler.kv_cache_manager.apply_request_kv_state(
+            session.request_id, initial_state
+        )
+        scheduler.kv_cache_manager.apply_request_kv_state = MagicMock(
+            wraps=scheduler.kv_cache_manager.apply_request_kv_state
+        )
+        update = StreamingUpdate.from_request(
+            DummyRequest(request_id="session", prompt_token_ids=[4, 5])
+        )
+
+        scheduler._update_request_as_session(session, update)
+
+        assert session.kv_cache_state is KVBlockState.HOT
+        scheduler.kv_cache_manager.apply_request_kv_state.assert_called_once_with(
+            session.request_id, KVBlockState.HOT
+        )
+        assert all(
+            block.hierarchy_state is KVBlockState.HOT
+            for group in scheduler.kv_cache_manager.get_blocks(
+                session.request_id
+            ).blocks
+            for block in group
+            if not block.is_null and block.ref_cnt > 0
+        )
+
+    def test_streaming_update_promotes_warm_session(self):
+        self._assert_streaming_update_promotes_session(KVBlockState.WARM)
+
+    def test_streaming_update_promotes_cold_session(self):
+        self._assert_streaming_update_promotes_session(KVBlockState.COLD)
 
     def test_update_request_as_session_max_token(self):
         scheduler = create_scheduler()

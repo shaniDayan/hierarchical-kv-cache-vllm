@@ -439,6 +439,10 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        self.apply_request_kv_state(
+            request.request_id,
+            request.kv_cache_state,
+        )
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
