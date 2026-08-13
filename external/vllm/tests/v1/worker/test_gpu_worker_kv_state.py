@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -8,6 +9,11 @@ import pytest
 
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_state import KVBlockState, KVCacheStateTransition
+from vllm.v1.worker.gpu.hkv_migration import (
+    HKVWarmCapacityError,
+    HKVWarmMigrationManager,
+)
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
 
 
@@ -17,7 +23,7 @@ def make_transition(
     changed_block_ids: tuple[list[int], ...] | None = None,
 ) -> KVCacheStateTransition:
     if changed_block_ids is None:
-        changed_block_ids = ([1], [], [2])
+        changed_block_ids = ([1],)
     return KVCacheStateTransition(
         request_id="request",
         previous_state=previous_state,
@@ -26,7 +32,7 @@ def make_transition(
     )
 
 
-def make_bare_worker(use_v2_model_runner: bool, events: list[str]) -> Worker:
+def make_worker(use_v2_model_runner: bool, events: list[object]) -> Worker:
     worker = Worker.__new__(Worker)
     worker._pp_send_work = []
     worker.profiler = None
@@ -36,7 +42,7 @@ def make_bare_worker(use_v2_model_runner: bool, events: list[str]) -> Worker:
         parallel_config=SimpleNamespace(pipeline_parallel_size=1),
     )
 
-    def execute_model(scheduler_output, intermediate_tensors):
+    def execute_model(_scheduler_output, _intermediate_tensors):
         events.append("runner")
         return None
 
@@ -47,64 +53,97 @@ def make_bare_worker(use_v2_model_runner: bool, events: list[str]) -> Worker:
     return worker
 
 
-@pytest.mark.parametrize("use_v2_model_runner", [False, True])
-def test_worker_handles_transitions_before_zero_token_runner(use_v2_model_runner):
-    events = []
-    worker = make_bare_worker(use_v2_model_runner, events)
-    worker._handle_kv_cache_state_transitions = MagicMock(
-        side_effect=lambda transitions: events.append("handler")
+def test_disabled_migration_keeps_validation_only_behavior(monkeypatch):
+    monkeypatch.delenv("HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION", raising=False)
+    worker = Worker.__new__(Worker)
+    worker.use_v2_model_runner = True
+    worker.model_runner = SimpleNamespace(
+        handle_kv_cache_state_transitions=MagicMock()
     )
+    worker._handle_kv_cache_state_transitions([make_transition()])
+
+    worker.model_runner.handle_kv_cache_state_transitions.assert_not_called()
+
+
+def test_enabled_v2_receives_transitions_before_zero_token_runner(monkeypatch):
+    monkeypatch.setenv("HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION", "1")
+    events = []
+    worker = make_worker(True, events)
+
+    def handle_transitions(transitions):
+        events.append(("migration", transitions))
+
+    worker.model_runner.handle_kv_cache_state_transitions = handle_transitions
     output = SchedulerOutput.make_empty()
     output.kv_cache_state_transitions = [make_transition()]
 
     Worker.execute_model(worker, output)
 
-    assert events == ["handler", "runner"]
-    worker._handle_kv_cache_state_transitions.assert_called_once_with(
-        output.kv_cache_state_transitions
-    )
-
-
-def test_worker_skips_handler_for_empty_transition_list():
-    events = []
-    worker = make_bare_worker(False, events)
-    worker._handle_kv_cache_state_transitions = MagicMock()
-
-    Worker.execute_model(worker, SchedulerOutput.make_empty())
-
-    worker._handle_kv_cache_state_transitions.assert_not_called()
-    assert events == ["runner"]
-
-
-def test_worker_rejects_negative_transition_block_id():
-    worker = Worker.__new__(Worker)
-
-    with pytest.raises(ValueError, match="non-negative integers"):
-        worker._handle_kv_cache_state_transitions(
-            [make_transition(changed_block_ids=([1], [], [-1]))]
-        )
+    assert events == [
+        ("migration", output.kv_cache_state_transitions),
+        "runner",
+    ]
 
 
 @pytest.mark.parametrize(
-    ("previous_state", "new_state"),
+    ("case", "message"),
     [
-        (KVBlockState.HOT, KVBlockState.WARM),
-        (KVBlockState.WARM, KVBlockState.COLD),
-        (KVBlockState.HOT, KVBlockState.COLD),
+        ("legacy", "legacy/MRV1"),
+        ("multiple_groups", "exactly one"),
+        ("block_expansion", "blocks_per_kv_block"),
+        ("hot_to_cold", "only HOT->WARM"),
+        ("warm_to_cold", "only HOT->WARM"),
     ],
 )
-def test_worker_accepts_supported_transition(previous_state, new_state):
-    worker = Worker.__new__(Worker)
+def test_enabled_migration_rejects_unsupported_configurations(
+    monkeypatch,
+    case: str,
+    message: str,
+):
+    monkeypatch.setenv("HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION", "1")
+    transition = make_transition()
+    if case == "legacy":
+        target = Worker.__new__(Worker)
+        target.use_v2_model_runner = False
+        call = partial(target._handle_kv_cache_state_transitions, [transition])
+    else:
+        target = SimpleNamespace(
+            hkv_warm_migration_manager=SimpleNamespace(migrate=MagicMock()),
+            block_tables=SimpleNamespace(blocks_per_kv_block=[1]),
+        )
+        if case == "multiple_groups":
+            transition = make_transition(changed_block_ids=([1], [2]))
+        elif case == "block_expansion":
+            target.block_tables.blocks_per_kv_block = [2]
+        elif case == "hot_to_cold":
+            transition = make_transition(new_state=KVBlockState.COLD)
+        else:
+            transition = make_transition(
+                previous_state=KVBlockState.WARM,
+                new_state=KVBlockState.COLD,
+            )
+        call = partial(
+            GPUModelRunner.handle_kv_cache_state_transitions,
+            target,
+            [transition],
+        )
 
-    worker._handle_kv_cache_state_transitions(
-        [make_transition(previous_state, new_state, ([1], [], [2]))]
+    with pytest.raises(ValueError, match=message):
+        call()
+
+
+def test_insufficient_warm_capacity_leaves_state_unchanged():
+    hot_to_warm_maps = {}
+    manager = HKVWarmMigrationManager(
+        warm_capacity=1,
+        hot_kv_caches={},
+        warm_kv_caches={},
+        hot_to_warm_maps=hot_to_warm_maps,
+        device="cpu",
     )
 
+    with pytest.raises(HKVWarmCapacityError):
+        manager.migrate("request", [2, 7])
 
-def test_worker_rejects_unsupported_hotter_transition():
-    worker = Worker.__new__(Worker)
-
-    with pytest.raises(ValueError, match="Unsupported KV-cache state transition"):
-        worker._handle_kv_cache_state_transitions(
-            [make_transition(KVBlockState.COLD, KVBlockState.HOT)]
-        )
+    assert hot_to_warm_maps == {}
+    assert manager.allocator.num_owned_slots == 0

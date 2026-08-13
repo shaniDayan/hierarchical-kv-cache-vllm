@@ -68,6 +68,9 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.gpu.hkv_migration import (
+    is_hkv_multi_block_warm_migration_enabled,
+)
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -863,7 +866,15 @@ class Worker(WorkerBase):
                             f"non-negative integers; got {block_id!r}"
                         )
 
-        logger.debug("Received %d KV-cache state transitions", len(transitions))
+        if not is_hkv_multi_block_warm_migration_enabled():
+            logger.debug("Validated %d KV-cache state transitions", len(transitions))
+            return
+        if not self.use_v2_model_runner:
+            raise ValueError(
+                "Experimental multi-block WARM migration supports only "
+                "the V2 model runner; legacy/MRV1 is not supported"
+            )
+        self.model_runner.handle_kv_cache_state_transitions(transitions)
 
     @torch.inference_mode()
     def execute_model(

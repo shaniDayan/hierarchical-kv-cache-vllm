@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import heapq
-from collections.abc import Hashable, Iterable
+import os
+from collections.abc import Hashable, Iterable, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 
 class HKVWarmAllocatorError(RuntimeError):
@@ -20,6 +22,10 @@ class HKVWarmOwnershipError(HKVWarmAllocatorError):
 
 class HKVWarmReservationError(HKVWarmAllocatorError):
     """Raised for invalid reservation lifecycle operations."""
+
+
+def is_hkv_multi_block_warm_migration_enabled() -> bool:
+    return os.getenv("HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION") == "1"
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -302,3 +308,58 @@ class HKVWarmSlotAllocator:
             hash(owner_token)
         except TypeError as exc:
             raise TypeError("owner_token must be hashable") from exc
+
+
+class HKVWarmMigrationManager:
+    def __init__(
+        self,
+        *,
+        warm_capacity: int,
+        hot_kv_caches: dict[str, Any],
+        warm_kv_caches: dict[str, Any],
+        hot_to_warm_maps: dict[str, Any],
+        device: Any,
+    ) -> None:
+        self.allocator = HKVWarmSlotAllocator(warm_capacity)
+        self.hot_kv_caches = hot_kv_caches
+        self.warm_kv_caches = warm_kv_caches
+        self.hot_to_warm_maps = hot_to_warm_maps
+        self.device = device
+
+    def migrate(self, request_id: str, hot_block_ids: Sequence[int]) -> None:
+        """Shadow-migrate previously unmapped HOT blocks into WARM slots."""
+        sources = tuple(
+            dict.fromkeys(HKVBlockSource(0, block_id) for block_id in hot_block_ids)
+        )
+        if not sources:
+            return
+
+        reservation = self.allocator.reserve_many(sources, owner_token=request_id)
+        if not reservation.newly_allocated:
+            self.allocator.commit(reservation)
+            return
+
+        mappings = dict(reservation.mappings)
+        new_hot_block_ids = tuple(
+            source.kernel_hot_block_id for source in reservation.newly_allocated
+        )
+        new_warm_slot_ids = tuple(
+            mappings[source] for source in reservation.newly_allocated
+        )
+        try:
+            from vllm.v1.worker.gpu.attn_utils import (
+                quantize_hkv_blocks_to_warm,
+            )
+
+            quantize_hkv_blocks_to_warm(
+                hot_kv_caches=self.hot_kv_caches,
+                warm_kv_caches=self.warm_kv_caches,
+                hot_to_warm_maps=self.hot_to_warm_maps,
+                hot_block_ids=new_hot_block_ids,
+                warm_slot_ids=new_warm_slot_ids,
+                device=self.device,
+            )
+        except Exception:
+            self.allocator.rollback(reservation)
+            raise
+        self.allocator.commit(reservation)

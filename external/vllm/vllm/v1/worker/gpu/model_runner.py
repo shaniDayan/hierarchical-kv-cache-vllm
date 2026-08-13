@@ -49,6 +49,7 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_state import KVBlockState, KVCacheStateTransition
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
@@ -75,6 +76,10 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
+from vllm.v1.worker.gpu.hkv_migration import (
+    HKVWarmMigrationManager,
+    is_hkv_multi_block_warm_migration_enabled,
+)
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
@@ -149,6 +154,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.hkv_hot_kv_caches: dict[str, torch.Tensor] = {}
         self.hkv_warm_kv_caches: dict[str, torch.Tensor] = {}
         self.hkv_hot_to_warm_maps: dict[str, torch.Tensor] = {}
+        self.hkv_warm_migration_manager: HKVWarmMigrationManager | None = None
         self._hkv_debug_demote_done = False
 
         self.vocab_size = self.model_config.get_vocab_size()
@@ -520,7 +526,62 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.vllm_config.compilation_config.static_forward_context
             ),
         )
+        if is_hkv_multi_block_warm_migration_enabled():
+            if not self.hkv_warm_kv_caches:
+                raise ValueError(
+                    "Multi-block WARM migration requires an allocated physical "
+                    "WARM pool"
+                )
+            if len(self.kv_cache_config.kv_cache_groups) != 1:
+                raise ValueError(
+                    "Experimental multi-block WARM migration currently supports "
+                    "exactly one KV-cache group"
+                )
+            if self.block_tables.blocks_per_kv_block != [1]:
+                raise ValueError(
+                    "Experimental multi-block WARM migration requires "
+                    "blocks_per_kv_block == 1"
+                )
+            warm_capacity = next(iter(self.hkv_warm_kv_caches.values())).shape[0]
+            self.hkv_warm_migration_manager = HKVWarmMigrationManager(
+                warm_capacity=warm_capacity,
+                hot_kv_caches=self.hkv_hot_kv_caches,
+                warm_kv_caches=self.hkv_warm_kv_caches,
+                hot_to_warm_maps=self.hkv_hot_to_warm_maps,
+                device=self.device,
+            )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+
+    def handle_kv_cache_state_transitions(
+        self, transitions: list[KVCacheStateTransition]
+    ) -> None:
+        """Physically shadow-migrate logical transitions into WARM storage."""
+        if self.hkv_warm_migration_manager is None:
+            raise ValueError(
+                "Multi-block WARM migration manager is not initialized"
+            )
+        if self.block_tables.blocks_per_kv_block != [1]:
+            raise ValueError(
+                "Physical migration requires blocks_per_kv_block == 1"
+            )
+        for transition in transitions:
+            if (
+                transition.previous_state is not KVBlockState.HOT
+                or transition.new_state is not KVBlockState.WARM
+            ):
+                raise ValueError(
+                    "Physical migration currently supports only HOT->WARM; "
+                    f"got {transition.previous_state.value}->"
+                    f"{transition.new_state.value}"
+                )
+            if len(transition.changed_block_ids) != 1:
+                raise ValueError(
+                    "Physical migration currently supports exactly one "
+                    "KV-cache group"
+                )
+            self.hkv_warm_migration_manager.migrate(
+                transition.request_id, transition.changed_block_ids[0]
+            )
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -1320,7 +1381,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
-        if not dummy_run and not self._hkv_debug_demote_done:
+        if (
+            not dummy_run
+            and not is_hkv_multi_block_warm_migration_enabled()
+            and not self._hkv_debug_demote_done
+        ):
             self._hkv_debug_demote_done = debug_demote_one_hkv_block(
                 hot_kv_caches=self.hkv_hot_kv_caches,
                 warm_kv_caches=self.hkv_warm_kv_caches,

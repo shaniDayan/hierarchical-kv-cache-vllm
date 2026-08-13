@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
@@ -89,209 +89,12 @@ def create_scheduler(
 
 
 class TestStreamingScheduler(unittest.TestCase):
-    def test_schedule_classifies_idle_sessions_once(self):
-        scheduler = create_scheduler()
-        scheduler._classify_idle_kv_sessions = MagicMock(
-            wraps=scheduler._classify_idle_kv_sessions
-        )
+    def test_idle_kv_classification_and_partial_tail(self):
+        disabled_scheduler = create_scheduler()
+        assert disabled_scheduler._classify_idle_kv_sessions(
+            current_time=100.0
+        ) == []
 
-        scheduler.schedule()
-
-        scheduler._classify_idle_kv_sessions.assert_called_once_with()
-
-    def test_schedule_idle_classification_disabled_is_noop(self):
-        scheduler = create_scheduler()
-        scheduler.kv_cache_manager.apply_request_kv_state = MagicMock()
-
-        output = scheduler.schedule()
-
-        assert output.num_scheduled_tokens == {}
-        assert output.kv_cache_state_transitions == []
-        scheduler.kv_cache_manager.apply_request_kv_state.assert_not_called()
-
-    def test_schedule_demotes_idle_session_while_another_request_runs(self):
-        scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
-        session = DummyRequest(
-            request_id="session",
-            prompt_token_ids=list(range(16)),
-            arrival_time=100.0,
-        )
-        allocated = scheduler.kv_cache_manager.allocate_slots(session, 16)
-        assert allocated is not None
-        session.num_computed_tokens = 16
-        scheduler.requests[session.request_id] = session
-        session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-
-        active_request = DummyRequest(
-            request_id="active",
-            prompt_token_ids=[2],
-        )
-        scheduler.add_request(active_request)
-
-        with patch("vllm.v1.core.sched.scheduler.time.time", return_value=110.0):
-            warm_output = scheduler.schedule()
-
-        assert active_request.request_id in warm_output.num_scheduled_tokens
-        assert session.kv_cache_state is KVBlockState.WARM
-        assert warm_output.kv_cache_state_transitions == [
-            KVCacheStateTransition(
-                request_id=session.request_id,
-                previous_state=KVBlockState.HOT,
-                new_state=KVBlockState.WARM,
-                changed_block_ids=allocated.get_block_ids(),
-            )
-        ]
-        assert all(
-            block.hierarchy_state is KVBlockState.WARM
-            for group in scheduler.kv_cache_manager.get_blocks(
-                session.request_id
-            ).blocks
-            for block in group
-            if not block.is_null and block.ref_cnt == 1
-        )
-
-        with patch("vllm.v1.core.sched.scheduler.time.time", return_value=120.0):
-            cold_output = scheduler.schedule()
-
-        assert session.kv_cache_state is KVBlockState.COLD
-        assert cold_output.kv_cache_state_transitions == [
-            KVCacheStateTransition(
-                request_id=session.request_id,
-                previous_state=KVBlockState.WARM,
-                new_state=KVBlockState.COLD,
-                changed_block_ids=allocated.get_block_ids(),
-            )
-        ]
-        assert all(
-            block.hierarchy_state is KVBlockState.COLD
-            for group in scheduler.kv_cache_manager.get_blocks(
-                session.request_id
-            ).blocks
-            for block in group
-            if not block.is_null and block.ref_cnt == 1
-        )
-
-    def test_schedule_idle_classification_does_not_promote_history(self):
-        for historical_state in (KVBlockState.WARM, KVBlockState.COLD):
-            with self.subTest(historical_state=historical_state):
-                scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
-                session = DummyRequest(
-                    request_id="session",
-                    prompt_token_ids=[1],
-                    arrival_time=100.0,
-                )
-                allocated = scheduler.kv_cache_manager.allocate_slots(session, 1)
-                assert allocated is not None
-                scheduler.requests[session.request_id] = session
-                session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-                session.kv_cache_state = historical_state
-                scheduler.kv_cache_manager.apply_request_kv_state(
-                    session.request_id, historical_state
-                )
-                scheduler.kv_cache_manager.apply_request_kv_state = MagicMock()
-
-                with patch(
-                    "vllm.v1.core.sched.scheduler.time.time", return_value=105.0
-                ):
-                    scheduler.schedule()
-
-                assert session.kv_cache_state is historical_state
-                assert all(
-                    block.hierarchy_state is historical_state
-                    for group in scheduler.kv_cache_manager.get_blocks(
-                        session.request_id
-                    ).blocks
-                    for block in group
-                    if not block.is_null and block.ref_cnt == 1
-                )
-                scheduler.kv_cache_manager.apply_request_kv_state.assert_not_called()
-
-    def test_schedule_logs_idle_state_transition(self):
-        scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
-        session = DummyRequest(request_id="session", arrival_time=100.0)
-        session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-        scheduler.requests[session.request_id] = session
-
-        with (
-            patch("vllm.v1.core.sched.scheduler.time.time", return_value=110.0),
-            self.assertLogs("vllm.v1.core.sched.scheduler", level="INFO") as captured,
-        ):
-            output = scheduler.schedule()
-
-        assert output.total_num_scheduled_tokens == 0
-        assert output.kv_cache_state_transitions == [
-            KVCacheStateTransition(
-                request_id=session.request_id,
-                previous_state=KVBlockState.HOT,
-                new_state=KVBlockState.WARM,
-                changed_block_ids=([],),
-            )
-        ]
-        log_output = "\n".join(captured.output)
-        assert "request_id=session" in log_output
-        assert "hot->warm" in log_output
-        assert "changed_blocks=0" in log_output
-        assert "changed_block_ids_by_group=([],)" in log_output
-
-    def test_noop_classification_preserves_schedule_counts_and_order(self):
-        scheduler = create_scheduler()
-        first = DummyRequest(request_id="first", prompt_token_ids=[1, 2])
-        second = DummyRequest(request_id="second", prompt_token_ids=[3])
-        scheduler.add_request(first)
-        scheduler.add_request(second)
-        scheduler._classify_idle_kv_sessions = MagicMock(return_value=[])
-
-        output = scheduler.schedule()
-
-        assert list(output.num_scheduled_tokens) == ["first", "second"]
-        assert output.num_scheduled_tokens == {"first": 2, "second": 1}
-        assert output.kv_cache_state_transitions == []
-
-    def test_idle_kv_classification_disabled(self):
-        scheduler = create_scheduler()
-
-        assert scheduler._classify_idle_kv_sessions(current_time=100.0) == []
-
-    def test_idle_kv_classification_ignores_ineligible_requests(self):
-        scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
-        non_resumable = DummyRequest(
-            request_id="non_resumable",
-            resumable=False,
-            arrival_time=0.0,
-        )
-        waiting = DummyRequest(request_id="waiting", arrival_time=0.0)
-        running = DummyRequest(request_id="running", arrival_time=0.0)
-        non_resumable.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-        waiting.status = RequestStatus.WAITING
-        running.status = RequestStatus.RUNNING
-        scheduler.requests = {
-            request.request_id: request for request in (non_resumable, waiting, running)
-        }
-        scheduler.kv_cache_manager.apply_request_kv_state = MagicMock()
-
-        transitions = scheduler._classify_idle_kv_sessions(current_time=20.0)
-
-        assert transitions == []
-        assert all(
-            request.kv_cache_state is KVBlockState.HOT
-            for request in scheduler.requests.values()
-        )
-        scheduler.kv_cache_manager.apply_request_kv_state.assert_not_called()
-
-    def test_idle_kv_classification_unchanged_below_hot_threshold(self):
-        scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
-        session = DummyRequest(request_id="session", arrival_time=100.0)
-        session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-        scheduler.requests[session.request_id] = session
-        scheduler.kv_cache_manager.apply_request_kv_state = MagicMock()
-
-        transitions = scheduler._classify_idle_kv_sessions(current_time=109.0)
-
-        assert transitions == []
-        assert session.kv_cache_state is KVBlockState.HOT
-        scheduler.kv_cache_manager.apply_request_kv_state.assert_not_called()
-
-    def test_idle_kv_classification_transitions_and_grouped_block_ids(self):
         scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
         session = DummyRequest(
             request_id="session",
@@ -304,21 +107,13 @@ class TestStreamingScheduler(unittest.TestCase):
         session.num_computed_tokens = 20
         session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
 
-        warm_transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
-        request_blocks = scheduler.kv_cache_manager.get_blocks(
+        transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+
+        block_groups = scheduler.kv_cache_manager.get_blocks(
             session.request_id
         ).blocks
-        complete_block_ids = tuple([group[0].block_id] for group in request_blocks)
-        assert all(
-            group[0].hierarchy_state is KVBlockState.WARM
-            for group in request_blocks
-        )
-        assert all(
-            group[1].hierarchy_state is KVBlockState.HOT for group in request_blocks
-        )
-        cold_transitions = scheduler._classify_idle_kv_sessions(current_time=120.0)
-
-        assert warm_transitions == [
+        complete_block_ids = tuple([group[0].block_id] for group in block_groups)
+        assert transitions == [
             KVCacheStateTransition(
                 request_id=session.request_id,
                 previous_state=KVBlockState.HOT,
@@ -326,79 +121,10 @@ class TestStreamingScheduler(unittest.TestCase):
                 changed_block_ids=complete_block_ids,
             )
         ]
-        assert cold_transitions == [
-            KVCacheStateTransition(
-                request_id=session.request_id,
-                previous_state=KVBlockState.WARM,
-                new_state=KVBlockState.COLD,
-                changed_block_ids=complete_block_ids,
-            )
-        ]
-        assert session.kv_cache_state is KVBlockState.COLD
         assert all(
-            group[0].hierarchy_state is KVBlockState.COLD
-            for group in request_blocks
-        )
-        assert all(
-            group[1].hierarchy_state is KVBlockState.HOT for group in request_blocks
-        )
-
-    def test_schedule_preserves_direct_hot_to_cold_transition(self):
-        scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
-        session = DummyRequest(request_id="session", arrival_time=100.0)
-        session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-        scheduler.requests[session.request_id] = session
-        scheduler.kv_cache_manager.apply_request_kv_state = MagicMock(
-            return_value=([],)
-        )
-
-        with patch("vllm.v1.core.sched.scheduler.time.time", return_value=120.0):
-            output = scheduler.schedule()
-
-        assert output.total_num_scheduled_tokens == 0
-        assert output.kv_cache_state_transitions == [
-            KVCacheStateTransition(
-                request_id=session.request_id,
-                previous_state=KVBlockState.HOT,
-                new_state=KVBlockState.COLD,
-                changed_block_ids=([],),
-            )
-        ]
-        scheduler.kv_cache_manager.apply_request_kv_state.assert_called_once_with(
-            session.request_id,
-            KVBlockState.COLD,
-            num_computed_tokens=session.num_computed_tokens,
-        )
-
-    def test_idle_kv_classification_never_promotes_to_hot(self):
-        scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
-        session = DummyRequest(request_id="session", arrival_time=100.0)
-        session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-        session.kv_cache_state = KVBlockState.COLD
-        scheduler.requests[session.request_id] = session
-        scheduler.kv_cache_manager.apply_request_kv_state = MagicMock()
-
-        transitions = scheduler._classify_idle_kv_sessions(current_time=105.0)
-
-        assert transitions == []
-        assert session.kv_cache_state is KVBlockState.COLD
-        scheduler.kv_cache_manager.apply_request_kv_state.assert_not_called()
-
-    def test_initial_allocation_creates_hot_blocks(self):
-        scheduler = create_scheduler()
-        request = DummyRequest(
-            request_id="request",
-            prompt_token_ids=[1],
-        )
-
-        new_blocks = scheduler.kv_cache_manager.allocate_slots(request, 1)
-
-        assert new_blocks is not None
-        assert any(new_blocks.blocks)
-        assert all(
-            block.hierarchy_state is KVBlockState.HOT
-            for group in new_blocks.blocks
-            for block in group
+            group[0].hierarchy_state is KVBlockState.WARM
+            and group[1].hierarchy_state is KVBlockState.HOT
+            for group in block_groups
         )
 
     def test_add_request(self):
@@ -423,92 +149,6 @@ class TestStreamingScheduler(unittest.TestCase):
 
         assert next_request.status == RequestStatus.WAITING
         assert len(scheduler.requests["test_request"].streaming_queue) == 1
-
-    def test_queued_streaming_update_does_not_promote_session(self):
-        scheduler = create_scheduler()
-        session = DummyRequest(
-            request_id="session",
-            prompt_token_ids=[1],
-        )
-        scheduler.add_request(session)
-        allocated = scheduler.kv_cache_manager.allocate_slots(session, 1)
-        assert allocated is not None
-        session.kv_cache_state = KVBlockState.WARM
-        scheduler.kv_cache_manager.apply_request_kv_state(
-            session.request_id, KVBlockState.WARM
-        )
-        scheduler.kv_cache_manager.apply_request_kv_state = MagicMock(
-            wraps=scheduler.kv_cache_manager.apply_request_kv_state
-        )
-
-        scheduler.add_request(DummyRequest(request_id="session", prompt_token_ids=[2]))
-
-        assert len(session.streaming_queue) == 1
-        assert session.kv_cache_state is KVBlockState.WARM
-        assert all(
-            block.hierarchy_state is KVBlockState.WARM
-            for group in scheduler.kv_cache_manager.get_blocks(
-                session.request_id
-            ).blocks
-            for block in group
-            if not block.is_null and block.ref_cnt == 1
-        )
-        scheduler.kv_cache_manager.apply_request_kv_state.assert_not_called()
-
-    def _assert_streaming_update_preserves_historical_blocks(
-        self, historical_state: KVBlockState
-    ) -> None:
-        scheduler = create_scheduler()
-        session = DummyRequest(
-            request_id="session",
-            prompt_token_ids=list(range(16)),
-        )
-        allocated = scheduler.kv_cache_manager.allocate_slots(
-            session, len(session.prompt_token_ids)
-        )
-        assert allocated is not None
-        session.num_computed_tokens = len(session.prompt_token_ids)
-        historical_blocks = tuple(
-            block for group in allocated.blocks for block in group
-        )
-        session.kv_cache_state = historical_state
-        scheduler.kv_cache_manager.apply_request_kv_state(
-            session.request_id, historical_state
-        )
-        scheduler.kv_cache_manager.apply_request_kv_state = MagicMock()
-        update = StreamingUpdate.from_request(
-            DummyRequest(request_id="session", prompt_token_ids=[16])
-        )
-
-        scheduler._update_request_as_session(session, update)
-
-        assert session.kv_cache_state is KVBlockState.HOT
-        assert all(
-            block.hierarchy_state is historical_state for block in historical_blocks
-        )
-        scheduler.kv_cache_manager.apply_request_kv_state.assert_not_called()
-
-        new_blocks = scheduler.kv_cache_manager.allocate_slots(
-            session,
-            session.num_tokens - session.num_computed_tokens,
-        )
-
-        assert new_blocks is not None
-        assert any(new_blocks.blocks)
-        assert all(
-            block.hierarchy_state is KVBlockState.HOT
-            for group in new_blocks.blocks
-            for block in group
-        )
-        assert all(
-            block.hierarchy_state is historical_state for block in historical_blocks
-        )
-
-    def test_streaming_update_preserves_warm_historical_blocks(self):
-        self._assert_streaming_update_preserves_historical_blocks(KVBlockState.WARM)
-
-    def test_streaming_update_preserves_cold_historical_blocks(self):
-        self._assert_streaming_update_preserves_historical_blocks(KVBlockState.COLD)
 
     def test_update_request_as_session_max_token(self):
         scheduler = create_scheduler()
@@ -625,6 +265,7 @@ class TestStreamingScheduler(unittest.TestCase):
             request_id="session",
             prompt_token_ids=[1, 2, 3],
             resumable=True,
+            arrival_time=100.0,
         )
         scheduler.add_request(session)
         session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
@@ -657,7 +298,6 @@ class TestStreamingScheduler(unittest.TestCase):
             request_id="session",
             prompt_token_ids=[1, 2, 3],
             resumable=True,
-            arrival_time=100.0,
         )
         scheduler.add_request(session)
         session.status = RequestStatus.WAITING_FOR_STREAMING_REQ

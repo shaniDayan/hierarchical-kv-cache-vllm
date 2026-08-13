@@ -336,6 +336,101 @@ def _get_hkv_per_token_head_scale_views(
     return k_scale_cache, v_scale_cache, head_size
 
 
+def quantize_hkv_blocks_to_warm(
+    *,
+    hot_kv_caches: dict[str, torch.Tensor],
+    warm_kv_caches: dict[str, torch.Tensor],
+    hot_to_warm_maps: dict[str, torch.Tensor],
+    hot_block_ids: Sequence[int],
+    warm_slot_ids: Sequence[int],
+    device: torch.device,
+) -> None:
+    """Quantize HOT blocks into WARM slots and publish their map entries."""
+    if len(hot_block_ids) != len(warm_slot_ids):
+        raise ValueError("HOT block and WARM slot counts must match")
+    if not hot_block_ids:
+        return
+    if len(set(warm_slot_ids)) != len(warm_slot_ids):
+        raise ValueError("WARM slot IDs must be unique")
+
+    layer_names = (
+        hot_kv_caches.keys()
+        & warm_kv_caches.keys()
+        & hot_to_warm_maps.keys()
+    )
+    if not layer_names:
+        raise ValueError("No HOT/WARM cache and map tensors are available")
+
+    operations = []
+    maps: dict[int, torch.Tensor] = {}
+    processed_pairs: set[tuple[int, int]] = set()
+    block_size = None
+    for layer_name in layer_names:
+        hot_cache = hot_kv_caches[layer_name]
+        warm_cache = warm_kv_caches[layer_name]
+        hot_to_warm_map = hot_to_warm_maps[layer_name]
+        k_scales, v_scales, head_size = _get_hkv_per_token_head_scale_views(
+            warm_cache
+        )
+        if (
+            hot_cache.shape[1] != 2
+            or hot_cache.shape[2] != warm_cache.shape[2]
+            or hot_cache.shape[3] != warm_cache.shape[3]
+            or hot_cache.shape[4] != head_size
+        ):
+            raise ValueError("Incompatible HOT/WARM KV-cache layouts")
+        if max(hot_block_ids) >= hot_cache.shape[0] or max(warm_slot_ids) >= (
+            warm_cache.shape[0]
+        ):
+            raise ValueError("HOT block or WARM slot is out of range")
+        for hot_block_id, warm_slot_id in zip(
+            hot_block_ids, warm_slot_ids, strict=True
+        ):
+            previous = hot_to_warm_map[hot_block_id].item()
+            if previous not in (-1, warm_slot_id):
+                raise ValueError(
+                    f"HOT block {hot_block_id} is already mapped to {previous}"
+                )
+
+        pair = (
+            hot_cache.untyped_storage().data_ptr(),
+            warm_cache.untyped_storage().data_ptr(),
+        )
+        if pair not in processed_pairs:
+            processed_pairs.add(pair)
+            warm_key, warm_value = warm_cache.unbind(1)
+            operations.append((hot_cache, warm_key, warm_value, k_scales, v_scales))
+        maps[hot_to_warm_map.untyped_storage().data_ptr()] = hot_to_warm_map
+        block_size = warm_cache.shape[2]
+
+    assert block_size is not None
+    hot_ids = torch.tensor(hot_block_ids, dtype=torch.int64, device=device)
+    warm_ids = torch.tensor(warm_slot_ids, dtype=torch.int64, device=device)
+    offsets = torch.arange(block_size, dtype=torch.int64, device=device)
+    destination_slots = (warm_ids[:, None] * block_size + offsets).reshape(-1)
+
+    for hot_cache, warm_key, warm_value, k_scales, v_scales in operations:
+        hot_blocks = hot_cache.index_select(0, hot_ids)
+        hot_key = hot_blocks[:, 0].reshape(
+            -1, hot_blocks.shape[3], hot_blocks.shape[4]
+        )
+        hot_value = hot_blocks[:, 1].reshape(
+            -1, hot_blocks.shape[3], hot_blocks.shape[4]
+        )
+        triton_reshape_and_cache_flash_per_token_head_quant(
+            hot_key,
+            hot_value,
+            warm_key,
+            warm_value,
+            k_scales,
+            v_scales,
+            destination_slots,
+        )
+
+    for hot_to_warm_map in maps.values():
+        hot_to_warm_map[hot_ids] = warm_ids.to(torch.int32)
+
+
 def debug_demote_one_hkv_block(
     hot_kv_caches: dict[str, torch.Tensor],
     warm_kv_caches: dict[str, torch.Tensor],
@@ -406,209 +501,17 @@ def debug_demote_one_hkv_block(
     if source_block_id is None:
         return False
 
-    warm_block_id = 0
-    destination_slots = warm_block_id * block_size + torch.arange(
-        block_size, dtype=torch.int64, device=device
+    quantize_hkv_blocks_to_warm(
+        hot_kv_caches=hot_kv_caches,
+        warm_kv_caches=warm_kv_caches,
+        hot_to_warm_maps=hot_to_warm_maps,
+        hot_block_ids=(source_block_id,),
+        warm_slot_ids=(0,),
+        device=device,
     )
-    processed_cache_pairs: set[tuple[int, int]] = set()
-    processed_layers = 0
-    k_max_error = 0.0
-    v_max_error = 0.0
-    k_total_absolute_error = 0.0
-    v_total_absolute_error = 0.0
-    k_total_element_count = 0
-    v_total_element_count = 0
-    nonzero_int8_values = 0
-    min_scale = float("inf")
-    max_scale = float("-inf")
-
-    for layer_name in hot_kv_caches.keys() & warm_kv_caches.keys():
-        hot_cache = hot_kv_caches[layer_name]
-        warm_cache = warm_kv_caches[layer_name]
-        if not isinstance(hot_cache, torch.Tensor) or not isinstance(
-            warm_cache, torch.Tensor
-        ):
-            continue
-
-        cache_pair = (
-            hot_cache.untyped_storage().data_ptr(),
-            warm_cache.untyped_storage().data_ptr(),
-        )
-        if cache_pair in processed_cache_pairs:
-            continue
-        processed_cache_pairs.add(cache_pair)
-
-        if hot_cache.ndim != 5 or hot_cache.shape[1] != 2:
-            raise ValueError(
-                f"HOT KV cache for {layer_name!r} must be five-dimensional"
-            )
-        if warm_cache.ndim != 5 or warm_cache.shape[1] != 2:
-            raise ValueError(
-                f"WARM KV cache for {layer_name!r} must be five-dimensional"
-            )
-        if not hot_cache.is_floating_point():
-            raise ValueError(
-                f"HOT KV cache for {layer_name!r} must be floating point"
-            )
-        if hot_cache.stride(-1) != 1:
-            raise ValueError(
-                f"HOT KV cache for {layer_name!r} must have contiguous heads"
-            )
-        if source_block_id >= hot_cache.shape[0]:
-            raise ValueError(
-                f"HOT block {source_block_id} is unavailable for {layer_name!r}"
-            )
-        if warm_cache.shape[0] <= warm_block_id:
-            raise ValueError(f"WARM KV cache for {layer_name!r} has no block zero")
-
-        warm_k_scale_cache, warm_v_scale_cache, head_size = (
-            _get_hkv_per_token_head_scale_views(warm_cache)
-        )
-        if (
-            hot_cache.shape[2] != block_size
-            or warm_cache.shape[2] != block_size
-            or hot_cache.shape[3] != warm_cache.shape[3]
-            or hot_cache.shape[4] != head_size
-        ):
-            raise ValueError(
-                f"Incompatible HOT/WARM KV-cache layouts for {layer_name!r}"
-            )
-        if hot_cache.device != device or warm_cache.device != device:
-            raise ValueError(
-                f"HOT/WARM KV caches for {layer_name!r} must be on {device}"
-            )
-        if cache_pair[0] == cache_pair[1]:
-            raise ValueError("HOT and WARM KV caches must not share storage")
-
-        hot_key = hot_cache[source_block_id, 0]
-        hot_value = hot_cache[source_block_id, 1]
-        warm_key_cache, warm_value_cache = warm_cache.unbind(1)
-        triton_reshape_and_cache_flash_per_token_head_quant(
-            hot_key,
-            hot_value,
-            warm_key_cache,
-            warm_value_cache,
-            warm_k_scale_cache,
-            warm_v_scale_cache,
-            destination_slots,
-        )
-
-        reconstructed_key = (
-            warm_key_cache[warm_block_id, :, :, :head_size].float()
-            * warm_k_scale_cache[warm_block_id].unsqueeze(-1)
-        )
-        reconstructed_value = (
-            warm_value_cache[warm_block_id, :, :, :head_size].float()
-            * warm_v_scale_cache[warm_block_id].unsqueeze(-1)
-        )
-        k_absolute_error = (reconstructed_key - hot_key.float()).abs()
-        v_absolute_error = (reconstructed_value - hot_value.float()).abs()
-
-        k_max_error = max(k_max_error, k_absolute_error.max().item())
-        v_max_error = max(v_max_error, v_absolute_error.max().item())
-        k_total_absolute_error += k_absolute_error.sum(dtype=torch.float64).item()
-        v_total_absolute_error += v_absolute_error.sum(dtype=torch.float64).item()
-        k_total_element_count += k_absolute_error.numel()
-        v_total_element_count += v_absolute_error.numel()
-        nonzero_int8_values += int(
-            torch.count_nonzero(
-                warm_key_cache[warm_block_id, :, :, :head_size]
-            ).item()
-        )
-        nonzero_int8_values += int(
-            torch.count_nonzero(
-                warm_value_cache[warm_block_id, :, :, :head_size]
-            ).item()
-        )
-        min_scale = min(
-            min_scale,
-            warm_k_scale_cache[warm_block_id].min().item(),
-            warm_v_scale_cache[warm_block_id].min().item(),
-        )
-        max_scale = max(
-            max_scale,
-            warm_k_scale_cache[warm_block_id].max().item(),
-            warm_v_scale_cache[warm_block_id].max().item(),
-        )
-        processed_layers += 1
-
-    if processed_layers == 0:
-        return False
-
-    relevant_map_entries: list[torch.Tensor] = []
-    unique_maps_to_update: dict[int, torch.Tensor] = {}
-    for layer_name in (
-        hot_kv_caches.keys()
-        & warm_kv_caches.keys()
-        & hot_to_warm_maps.keys()
-    ):
-        hot_cache = hot_kv_caches[layer_name]
-        warm_cache = warm_kv_caches[layer_name]
-        hot_to_warm_map = hot_to_warm_maps[layer_name]
-        if not isinstance(hot_cache, torch.Tensor) or not isinstance(
-            warm_cache, torch.Tensor
-        ):
-            continue
-        cache_pair = (
-            hot_cache.untyped_storage().data_ptr(),
-            warm_cache.untyped_storage().data_ptr(),
-        )
-        if cache_pair not in processed_cache_pairs:
-            continue
-        if not isinstance(hot_to_warm_map, torch.Tensor):
-            raise ValueError(
-                f"HOT-to-WARM map for {layer_name!r} must be a tensor"
-            )
-        if (
-            not hot_to_warm_map.is_cuda
-            or hot_to_warm_map.device != device
-            or hot_to_warm_map.dtype != torch.int32
-            or hot_to_warm_map.ndim != 1
-        ):
-            raise ValueError(
-                f"Invalid HOT-to-WARM map layout for {layer_name!r}"
-            )
-        if source_block_id >= hot_to_warm_map.shape[0]:
-            raise ValueError(
-                f"HOT block {source_block_id} is outside the map for "
-                f"{layer_name!r}"
-            )
-        previous_warm_block = hot_to_warm_map[source_block_id].item()
-        if previous_warm_block not in (-1, warm_block_id):
-            raise ValueError(
-                f"HOT block {source_block_id} for {layer_name!r} is already "
-                f"mapped to WARM block {previous_warm_block}"
-            )
-
-        relevant_map_entries.append(hot_to_warm_map)
-        map_storage_ptr = hot_to_warm_map.untyped_storage().data_ptr()
-        unique_maps_to_update[map_storage_ptr] = hot_to_warm_map
-
-    if not relevant_map_entries:
-        return False
-
-    # Commit map state only after every cache and map has been validated.
-    for hot_to_warm_map in unique_maps_to_update.values():
-        hot_to_warm_map[source_block_id] = warm_block_id
-
     logger.info(
-        "HKV debug demotion completed: HOT block %d -> WARM block %d, "
-        "layers=%d, map entries=%d, unique maps=%d, "
-        "K max error=%.6g, K mean error=%.6g, "
-        "V max error=%.6g, V mean error=%.6g, "
-        "nonzero int8 values=%d, scale range=[%.6g, %.6g]",
+        "HKV debug demotion completed: HOT block %d -> WARM block 0",
         source_block_id,
-        warm_block_id,
-        processed_layers,
-        len(relevant_map_entries),
-        len(unique_maps_to_update),
-        k_max_error,
-        k_total_absolute_error / k_total_element_count,
-        v_max_error,
-        v_total_absolute_error / v_total_element_count,
-        nonzero_int8_values,
-        min_scale,
-        max_scale,
     )
     return True
 
