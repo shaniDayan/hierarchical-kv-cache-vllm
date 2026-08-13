@@ -146,6 +146,14 @@ class TestStreamingScheduler(unittest.TestCase):
         session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
 
         warm_transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+        assert all(
+            block.hierarchy_state is KVBlockState.WARM
+            for group in scheduler.kv_cache_manager.get_blocks(
+                session.request_id
+            ).blocks
+            for block in group
+            if not block.is_null and block.ref_cnt == 1
+        )
         cold_transitions = scheduler._classify_idle_kv_sessions(current_time=120.0)
 
         block_ids = allocated.get_block_ids()
@@ -209,6 +217,23 @@ class TestStreamingScheduler(unittest.TestCase):
         assert session.kv_cache_state is KVBlockState.COLD
         scheduler.kv_cache_manager.apply_request_kv_state.assert_not_called()
 
+    def test_initial_allocation_creates_hot_blocks(self):
+        scheduler = create_scheduler()
+        request = DummyRequest(
+            request_id="request",
+            prompt_token_ids=[1],
+        )
+
+        new_blocks = scheduler.kv_cache_manager.allocate_slots(request, 1)
+
+        assert new_blocks is not None
+        assert any(new_blocks.blocks)
+        assert all(
+            block.hierarchy_state is KVBlockState.HOT
+            for group in new_blocks.blocks
+            for block in group
+        )
+
     def test_add_request(self):
         scheduler = create_scheduler()
 
@@ -263,50 +288,60 @@ class TestStreamingScheduler(unittest.TestCase):
         )
         scheduler.kv_cache_manager.apply_request_kv_state.assert_not_called()
 
-    def _assert_streaming_update_promotes_session(
-        self, initial_state: KVBlockState
+    def _assert_streaming_update_preserves_historical_blocks(
+        self, historical_state: KVBlockState
     ) -> None:
         scheduler = create_scheduler()
         session = DummyRequest(
             request_id="session",
-            prompt_token_ids=[1, 2, 3],
+            prompt_token_ids=list(range(16)),
         )
-        session.num_computed_tokens = len(session.prompt_token_ids)
         allocated = scheduler.kv_cache_manager.allocate_slots(
             session, len(session.prompt_token_ids)
         )
         assert allocated is not None
-        session.kv_cache_state = initial_state
+        session.num_computed_tokens = len(session.prompt_token_ids)
+        historical_blocks = tuple(
+            block for group in allocated.blocks for block in group
+        )
+        session.kv_cache_state = historical_state
         scheduler.kv_cache_manager.apply_request_kv_state(
-            session.request_id, initial_state
+            session.request_id, historical_state
         )
-        scheduler.kv_cache_manager.apply_request_kv_state = MagicMock(
-            wraps=scheduler.kv_cache_manager.apply_request_kv_state
-        )
+        scheduler.kv_cache_manager.apply_request_kv_state = MagicMock()
         update = StreamingUpdate.from_request(
-            DummyRequest(request_id="session", prompt_token_ids=[4, 5])
+            DummyRequest(request_id="session", prompt_token_ids=[16])
         )
 
         scheduler._update_request_as_session(session, update)
 
         assert session.kv_cache_state is KVBlockState.HOT
-        scheduler.kv_cache_manager.apply_request_kv_state.assert_called_once_with(
-            session.request_id, KVBlockState.HOT
+        assert all(
+            block.hierarchy_state is historical_state for block in historical_blocks
         )
+        scheduler.kv_cache_manager.apply_request_kv_state.assert_not_called()
+
+        new_blocks = scheduler.kv_cache_manager.allocate_slots(
+            session,
+            session.num_tokens - session.num_computed_tokens,
+        )
+
+        assert new_blocks is not None
+        assert any(new_blocks.blocks)
         assert all(
             block.hierarchy_state is KVBlockState.HOT
-            for group in scheduler.kv_cache_manager.get_blocks(
-                session.request_id
-            ).blocks
+            for group in new_blocks.blocks
             for block in group
-            if not block.is_null and block.ref_cnt > 0
+        )
+        assert all(
+            block.hierarchy_state is historical_state for block in historical_blocks
         )
 
-    def test_streaming_update_promotes_warm_session(self):
-        self._assert_streaming_update_promotes_session(KVBlockState.WARM)
+    def test_streaming_update_preserves_warm_historical_blocks(self):
+        self._assert_streaming_update_preserves_historical_blocks(KVBlockState.WARM)
 
-    def test_streaming_update_promotes_cold_session(self):
-        self._assert_streaming_update_promotes_session(KVBlockState.COLD)
+    def test_streaming_update_preserves_cold_historical_blocks(self):
+        self._assert_streaming_update_preserves_historical_blocks(KVBlockState.COLD)
 
     def test_update_request_as_session_max_token(self):
         scheduler = create_scheduler()

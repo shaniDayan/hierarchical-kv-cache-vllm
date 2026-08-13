@@ -1224,11 +1224,10 @@ class Scheduler(SchedulerInterface):
         session.num_prompt_tokens = len(session.prompt_token_ids)
         session.arrival_time = update.arrival_time
         session.mark_activity(update.arrival_time)
+        # The request is active again, but historical residency is preserved
+        # for lazy mixed HOT/WARM attention. Future COLD restoration will
+        # explicitly move COLD blocks to WARM before attention.
         session.kv_cache_state = KVBlockState.HOT
-        self.kv_cache_manager.apply_request_kv_state(
-            session.request_id,
-            KVBlockState.HOT,
-        )
         session.sampling_params = update.sampling_params
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
