@@ -434,6 +434,25 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        # This maintenance runs only when schedule() is already invoked. A
+        # future deadline wakeup is needed when all sessions await streaming input.
+        kv_state_transitions = self._classify_idle_kv_sessions()
+        for (
+            request_id,
+            previous_state,
+            new_state,
+            changed_block_ids,
+        ) in kv_state_transitions:
+            logger.info(
+                "Idle KV state transition: request_id=%s %s->%s "
+                "changed_blocks=%d changed_block_ids_by_group=%s",
+                request_id,
+                previous_state.value,
+                new_state.value,
+                sum(len(group) for group in changed_block_ids),
+                changed_block_ids,
+            )
+
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
         defer_prefills = (
