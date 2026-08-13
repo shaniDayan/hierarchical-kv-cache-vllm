@@ -49,6 +49,26 @@ def test_prefix_caching_from_cli():
         args = parser.parse_args(["--prefix-caching-hash-algo", "invalid"])
 
 
+def test_kv_cache_idle_thresholds_from_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--kv-cache-hot-idle-threshold-seconds",
+            "10.5",
+            "--kv-cache-cold-idle-threshold-seconds",
+            "30",
+        ]
+    )
+
+    engine_args = EngineArgs.from_cli_args(args=args)
+    vllm_config = engine_args.create_engine_config()
+
+    assert engine_args.kv_cache_hot_idle_threshold_seconds == 10.5
+    assert engine_args.kv_cache_cold_idle_threshold_seconds == 30.0
+    assert vllm_config.scheduler_config.kv_cache_hot_idle_threshold_seconds == 10.5
+    assert vllm_config.scheduler_config.kv_cache_cold_idle_threshold_seconds == 30.0
+
+
 @pytest.mark.skipif(_xxhash is None, reason="xxhash not installed")
 def test_prefix_caching_xxhash_from_cli():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())

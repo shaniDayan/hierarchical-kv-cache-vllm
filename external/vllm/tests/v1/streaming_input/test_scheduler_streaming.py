@@ -51,8 +51,13 @@ class DummyRequest(Request):
         )
 
 
-def create_scheduler() -> Scheduler:
+def create_scheduler(
+    hot_threshold: float | None = None,
+    cold_threshold: float | None = None,
+) -> Scheduler:
     vllm_config = VllmConfig(device_config=DeviceConfig("cpu"))
+    vllm_config.scheduler_config.kv_cache_hot_idle_threshold_seconds = hot_threshold
+    vllm_config.scheduler_config.kv_cache_cold_idle_threshold_seconds = cold_threshold
     vllm_config.model_config = MagicMock()
     vllm_config.model_config.skip_tokenizer_init = True
     vllm_config.model_config.is_multimodal_model = False
@@ -84,6 +89,126 @@ def create_scheduler() -> Scheduler:
 
 
 class TestStreamingScheduler(unittest.TestCase):
+    def test_idle_kv_classification_disabled(self):
+        scheduler = create_scheduler()
+
+        assert scheduler._classify_idle_kv_sessions(current_time=100.0) == []
+
+    def test_idle_kv_classification_ignores_ineligible_requests(self):
+        scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+        non_resumable = DummyRequest(
+            request_id="non_resumable",
+            resumable=False,
+            arrival_time=0.0,
+        )
+        waiting = DummyRequest(request_id="waiting", arrival_time=0.0)
+        running = DummyRequest(request_id="running", arrival_time=0.0)
+        non_resumable.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+        waiting.status = RequestStatus.WAITING
+        running.status = RequestStatus.RUNNING
+        scheduler.requests = {
+            request.request_id: request for request in (non_resumable, waiting, running)
+        }
+        scheduler.kv_cache_manager.apply_request_kv_state = MagicMock()
+
+        transitions = scheduler._classify_idle_kv_sessions(current_time=20.0)
+
+        assert transitions == []
+        assert all(
+            request.kv_cache_state is KVBlockState.HOT
+            for request in scheduler.requests.values()
+        )
+        scheduler.kv_cache_manager.apply_request_kv_state.assert_not_called()
+
+    def test_idle_kv_classification_unchanged_below_hot_threshold(self):
+        scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+        session = DummyRequest(request_id="session", arrival_time=100.0)
+        session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+        scheduler.requests[session.request_id] = session
+        scheduler.kv_cache_manager.apply_request_kv_state = MagicMock()
+
+        transitions = scheduler._classify_idle_kv_sessions(current_time=109.0)
+
+        assert transitions == []
+        assert session.kv_cache_state is KVBlockState.HOT
+        scheduler.kv_cache_manager.apply_request_kv_state.assert_not_called()
+
+    def test_idle_kv_classification_transitions_and_grouped_block_ids(self):
+        scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+        session = DummyRequest(
+            request_id="session",
+            prompt_token_ids=[1],
+            arrival_time=100.0,
+        )
+        scheduler.add_request(session)
+        allocated = scheduler.kv_cache_manager.allocate_slots(session, 1)
+        assert allocated is not None
+        session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+        warm_transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+        cold_transitions = scheduler._classify_idle_kv_sessions(current_time=120.0)
+
+        block_ids = allocated.get_block_ids()
+        assert warm_transitions == [
+            (
+                session.request_id,
+                KVBlockState.HOT,
+                KVBlockState.WARM,
+                block_ids,
+            )
+        ]
+        assert cold_transitions == [
+            (
+                session.request_id,
+                KVBlockState.WARM,
+                KVBlockState.COLD,
+                block_ids,
+            )
+        ]
+        assert session.kv_cache_state is KVBlockState.COLD
+        assert all(
+            block.hierarchy_state is KVBlockState.COLD
+            for group in scheduler.kv_cache_manager.get_blocks(
+                session.request_id
+            ).blocks
+            for block in group
+            if not block.is_null and block.ref_cnt == 1
+        )
+
+    def test_idle_kv_classification_can_transition_directly_to_cold(self):
+        scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+        session = DummyRequest(request_id="session", arrival_time=100.0)
+        session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+        scheduler.requests[session.request_id] = session
+        scheduler.kv_cache_manager.apply_request_kv_state = MagicMock(
+            return_value=([],)
+        )
+
+        transitions = scheduler._classify_idle_kv_sessions(current_time=120.0)
+
+        assert transitions == [
+            (
+                session.request_id,
+                KVBlockState.HOT,
+                KVBlockState.COLD,
+                ([],),
+            )
+        ]
+
+    def test_idle_kv_classification_never_promotes_to_hot(self):
+        scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+        session = DummyRequest(request_id="session", arrival_time=100.0)
+        session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+        session.kv_cache_state = KVBlockState.COLD
+        scheduler.requests[session.request_id] = session
+        scheduler.kv_cache_manager.apply_request_kv_state = MagicMock()
+
+        transitions = scheduler._classify_idle_kv_sessions(current_time=105.0)
+
+        assert transitions == []
+        assert session.kv_cache_state is KVBlockState.COLD
+        scheduler.kv_cache_manager.apply_request_kv_state.assert_not_called()
+
     def test_add_request(self):
         scheduler = create_scheduler()
 

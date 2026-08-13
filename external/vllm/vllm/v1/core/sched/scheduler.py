@@ -53,7 +53,7 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.kv_cache_state import KVBlockState
+from vllm.v1.kv_cache_state import KVBlockState, classify_request_kv_state
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -64,6 +64,12 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+_KV_STATE_COLDNESS = {
+    KVBlockState.HOT: 0,
+    KVBlockState.WARM: 1,
+    KVBlockState.COLD: 2,
+}
 
 
 class Scheduler(SchedulerInterface):
@@ -80,6 +86,12 @@ class Scheduler(SchedulerInterface):
     ) -> None:
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
+        self.kv_cache_hot_idle_threshold_seconds = (
+            self.scheduler_config.kv_cache_hot_idle_threshold_seconds
+        )
+        self.kv_cache_cold_idle_threshold_seconds = (
+            self.scheduler_config.kv_cache_cold_idle_threshold_seconds
+        )
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.kv_cache_config = kv_cache_config
@@ -1224,6 +1236,58 @@ class Scheduler(SchedulerInterface):
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+    def _classify_idle_kv_sessions(
+        self,
+        current_time: float | None = None,
+    ) -> list[
+        tuple[
+            str,
+            KVBlockState,
+            KVBlockState,
+            tuple[list[int], ...],
+        ]
+    ]:
+        """Classify inactive resumable sessions into colder KV states."""
+        hot_threshold = self.kv_cache_hot_idle_threshold_seconds
+        cold_threshold = self.kv_cache_cold_idle_threshold_seconds
+        if hot_threshold is None or cold_threshold is None:
+            return []
+
+        if current_time is None:
+            current_time = time.time()
+
+        transitions = []
+        for request in self.requests.values():
+            if not request.resumable or (
+                request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+            ):
+                continue
+
+            previous_state = request.kv_cache_state
+            new_state = classify_request_kv_state(
+                request.get_idle_time(current_time),
+                hot_threshold,
+                cold_threshold,
+            )
+            if _KV_STATE_COLDNESS[new_state] <= _KV_STATE_COLDNESS[previous_state]:
+                continue
+
+            request.kv_cache_state = new_state
+            changed_block_ids = self.kv_cache_manager.apply_request_kv_state(
+                request.request_id,
+                new_state,
+            )
+            transitions.append(
+                (
+                    request.request_id,
+                    previous_state,
+                    new_state,
+                    changed_block_ids,
+                )
+            )
+
+        return transitions
 
     def _make_cached_request_data(
         self,

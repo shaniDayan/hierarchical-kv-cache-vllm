@@ -1392,6 +1392,44 @@ def test_scheduler_config_init():
         print(SchedulerConfig.default_factory().max_model_len)
 
 
+def test_kv_cache_idle_thresholds_disabled_by_default():
+    config = SchedulerConfig.default_factory()
+
+    assert config.kv_cache_hot_idle_threshold_seconds is None
+    assert config.kv_cache_cold_idle_threshold_seconds is None
+
+
+def test_valid_kv_cache_idle_thresholds():
+    config = SchedulerConfig.default_factory(
+        kv_cache_hot_idle_threshold_seconds=10.0,
+        kv_cache_cold_idle_threshold_seconds=20.0,
+    )
+
+    assert config.kv_cache_hot_idle_threshold_seconds == 10.0
+    assert config.kv_cache_cold_idle_threshold_seconds == 20.0
+
+
+@pytest.mark.parametrize(
+    ("hot_threshold", "cold_threshold"),
+    [
+        (10.0, None),
+        (None, 20.0),
+        (-1.0, 20.0),
+        (10.0, -1.0),
+        (10.0, 10.0),
+        (20.0, 10.0),
+        (float("nan"), 20.0),
+        (10.0, float("inf")),
+    ],
+)
+def test_invalid_kv_cache_idle_thresholds(hot_threshold, cold_threshold):
+    with pytest.raises(ValidationError):
+        SchedulerConfig.default_factory(
+            kv_cache_hot_idle_threshold_seconds=hot_threshold,
+            kv_cache_cold_idle_threshold_seconds=cold_threshold,
+        )
+
+
 @pytest.mark.parametrize(
     (
         "model_id",

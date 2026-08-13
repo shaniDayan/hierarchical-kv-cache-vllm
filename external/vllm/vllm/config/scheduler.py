@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Callable
 from dataclasses import InitVar
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
@@ -166,6 +167,12 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
+    kv_cache_hot_idle_threshold_seconds: float | None = None
+    """Idle time at which a resumable session's KV cache becomes WARM."""
+
+    kv_cache_cold_idle_threshold_seconds: float | None = None
+    """Idle time at which a resumable session's KV cache becomes COLD."""
+
     @staticmethod
     def default_factory(**kwargs):
         """
@@ -235,6 +242,24 @@ class SchedulerConfig:
         return None if value is None else handler(value)
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
+        hot_threshold = self.kv_cache_hot_idle_threshold_seconds
+        cold_threshold = self.kv_cache_cold_idle_threshold_seconds
+        if (hot_threshold is None) != (cold_threshold is None):
+            raise ValueError(
+                "KV cache HOT and COLD idle thresholds must both be set or both "
+                "be omitted"
+            )
+        if hot_threshold is not None and cold_threshold is not None:
+            if not math.isfinite(hot_threshold) or not math.isfinite(cold_threshold):
+                raise ValueError("KV cache idle thresholds must be finite")
+            if hot_threshold < 0 or cold_threshold < 0:
+                raise ValueError("KV cache idle thresholds must be non-negative")
+            if cold_threshold <= hot_threshold:
+                raise ValueError(
+                    "KV cache COLD idle threshold must be greater than the HOT "
+                    "idle threshold"
+                )
+
         if is_encoder_decoder:
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True
