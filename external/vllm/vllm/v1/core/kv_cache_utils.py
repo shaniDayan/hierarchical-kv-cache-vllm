@@ -118,6 +118,7 @@ class KVBlockState(str, Enum):
 
     HOT = "hot"
     WARM = "warm"
+    COLD = "cold"
 
 
 @dataclass(slots=True)
