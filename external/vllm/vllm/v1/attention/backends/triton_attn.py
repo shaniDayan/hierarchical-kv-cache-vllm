@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """High-Performance Triton-only Attention layer."""
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -53,6 +54,59 @@ logger = init_logger(__name__)
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+
+
+def _get_hkv_warm_scale_views(
+    kv_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Create FP32 views over inline INT8 per-token-head scales."""
+    if kv_cache.ndim != 5 or kv_cache.shape[1] != 2:
+        raise ValueError(
+            "WARM KV cache must have shape "
+            "(num_blocks, 2, block_size, num_kv_heads, padded_head_size)"
+        )
+    if kv_cache.dtype != torch.int8:
+        raise ValueError(f"WARM KV cache must use torch.int8; got {kv_cache.dtype}")
+    if not kv_cache.is_contiguous() or kv_cache.storage_offset() != 0:
+        raise ValueError("WARM KV cache must be a contiguous base tensor")
+
+    num_blocks, _, block_size, num_kv_heads, padded_head_size = kv_cache.shape
+    dtype_size = kv_cache.element_size()
+    float32_size = torch.finfo(torch.float32).bits // 8
+    scale_pad = float32_size // dtype_size
+    head_size = padded_head_size - scale_pad
+    if min(num_blocks, block_size, num_kv_heads, head_size) <= 0:
+        raise ValueError(f"Invalid WARM KV-cache shape: {tuple(kv_cache.shape)}")
+    if head_size * dtype_size % float32_size != 0:
+        raise ValueError("WARM KV-cache scale storage is not FP32-aligned")
+
+    raw_storage = kv_cache.untyped_storage()
+    base_f32 = torch.tensor(
+        [], dtype=torch.float32, device=kv_cache.device
+    ).set_(raw_storage)
+    kv_half_bytes = (
+        block_size * num_kv_heads * padded_head_size * dtype_size
+    )
+    scale_shape = (num_blocks, block_size, num_kv_heads)
+    scale_stride = (
+        2 * kv_half_bytes // float32_size,
+        num_kv_heads * padded_head_size * dtype_size // float32_size,
+        padded_head_size * dtype_size // float32_size,
+    )
+    scale_offset = head_size * dtype_size // float32_size
+    k_scale_cache = torch.as_strided(
+        base_f32,
+        size=scale_shape,
+        stride=scale_stride,
+        storage_offset=scale_offset,
+    )
+    v_scale_cache = torch.as_strided(
+        base_f32,
+        size=scale_shape,
+        stride=scale_stride,
+        storage_offset=kv_half_bytes // float32_size + scale_offset,
+    )
+    return k_scale_cache, v_scale_cache, head_size
 
 
 @dataclass
@@ -587,6 +641,75 @@ class TritonAttentionImpl(AttentionImpl):
                 layer,
             )
 
+        hkv_warm_k = None
+        hkv_warm_v = None
+        hkv_hot_to_warm_map = None
+        hkv_k_scale_cache = None
+        hkv_v_scale_cache = None
+        hkv_mixed_read_enabled = (
+            os.getenv("HKV_DEBUG_MIXED_READ", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        warm_kv_cache = getattr(layer, "_hkv_warm_kv_cache", None)
+        hot_to_warm_map = getattr(layer, "_hkv_hot_to_warm_map", None)
+        if (
+            hkv_mixed_read_enabled
+            and warm_kv_cache is not None
+            and hot_to_warm_map is not None
+        ):
+            if not isinstance(warm_kv_cache, torch.Tensor) or not isinstance(
+                hot_to_warm_map, torch.Tensor
+            ):
+                raise ValueError("Mixed HKV state must use tensors")
+            if self._kv_quant_mode != KVQuantMode.NONE:
+                raise ValueError(
+                    "Mixed HKV reads require an unquantized HOT KV cache"
+                )
+            if (
+                kv_cache.ndim != 5
+                or kv_cache.shape[1] != 2
+                or not kv_cache.is_floating_point()
+            ):
+                raise ValueError(
+                    "Mixed HKV reads require a five-dimensional floating-point "
+                    "HOT KV cache"
+                )
+            if warm_kv_cache.ndim != 5 or warm_kv_cache.shape[1] != 2:
+                raise ValueError(
+                    "Mixed HKV reads require a five-dimensional WARM KV cache "
+                    "with a K/V dimension of 2"
+                )
+            if warm_kv_cache.dtype != torch.int8:
+                raise ValueError("Mixed HKV reads require a torch.int8 WARM cache")
+            if kv_cache.shape[2] != warm_kv_cache.shape[2]:
+                raise ValueError("HOT and WARM KV-cache block sizes must match")
+            if kv_cache.shape[3] != warm_kv_cache.shape[3]:
+                raise ValueError("HOT and WARM KV-head counts must match")
+            if warm_kv_cache.shape[0] < 1:
+                raise ValueError("Mixed HKV reads require at least one WARM block")
+            if (
+                kv_cache.device != warm_kv_cache.device
+                or kv_cache.device != hot_to_warm_map.device
+            ):
+                raise ValueError("HOT, WARM, and HKV map devices must match")
+            if (
+                hot_to_warm_map.ndim != 1
+                or hot_to_warm_map.dtype != torch.int32
+                or hot_to_warm_map.shape[0] != kv_cache.shape[0]
+            ):
+                raise ValueError(
+                    "HKV map must be one-dimensional torch.int32 with one "
+                    "entry per HOT block"
+                )
+
+            hkv_k_scale_cache, hkv_v_scale_cache, warm_head_size = (
+                _get_hkv_warm_scale_views(warm_kv_cache)
+            )
+            if warm_head_size != kv_cache.shape[4]:
+                raise ValueError("Unpadded WARM and HOT head sizes must match")
+            hkv_warm_k, hkv_warm_v = warm_kv_cache.unbind(1)
+            hkv_hot_to_warm_map = hot_to_warm_map
+
         # Per-token-head quantized KV cache: use separate scale caches.
         if self._is_per_token_head_quant:
             self._ensure_scale_caches(kv_cache)
@@ -671,6 +794,11 @@ class TritonAttentionImpl(AttentionImpl):
             v_scale_cache=v_scale_cache,
             chunk_lookback=self.chunk_lookback,
             use_td=self.use_td,
+            hkv_warm_k=hkv_warm_k,
+            hkv_warm_v=hkv_warm_v,
+            hkv_hot_to_warm_map=hkv_hot_to_warm_map,
+            hkv_k_scale_cache=hkv_k_scale_cache,
+            hkv_v_scale_cache=hkv_v_scale_cache,
         )
 
         return output

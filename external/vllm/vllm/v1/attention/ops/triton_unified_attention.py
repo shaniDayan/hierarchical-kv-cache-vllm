@@ -257,6 +257,26 @@ def kernel_unified_attention(
     stride_vs_blk: tl.int64 = None,
     stride_vs_slot: tl.int64 = None,
     stride_vs_head: tl.int64 = None,
+    # Experimental mixed HOT/WARM cache state.
+    hkv_warm_k_ptr=None,
+    hkv_warm_v_ptr=None,
+    hkv_hot_to_warm_map_ptr=None,
+    hkv_k_scale_cache_ptr=None,
+    hkv_v_scale_cache_ptr=None,
+    stride_hkv_k_blk: tl.int64 = None,
+    stride_hkv_k_slot: tl.int64 = None,
+    stride_hkv_k_head: tl.int64 = None,
+    stride_hkv_k_dim: tl.int64 = None,
+    stride_hkv_v_blk: tl.int64 = None,
+    stride_hkv_v_slot: tl.int64 = None,
+    stride_hkv_v_head: tl.int64 = None,
+    stride_hkv_v_dim: tl.int64 = None,
+    stride_hkv_ks_blk: tl.int64 = None,
+    stride_hkv_ks_slot: tl.int64 = None,
+    stride_hkv_ks_head: tl.int64 = None,
+    stride_hkv_vs_blk: tl.int64 = None,
+    stride_hkv_vs_slot: tl.int64 = None,
+    stride_hkv_vs_head: tl.int64 = None,
     # KV cache quantization mode handled inside this kernel via constexpr
     # branches: NONE (0), FP8_PER_TENSOR (1), INT8_PER_TOKEN_HEAD (2),
     # FP8_PER_TOKEN_HEAD (3).
@@ -273,10 +293,20 @@ def kernel_unified_attention(
     # (see ``unified_attention`` wrapper for the gating rules).
     USE_TD: tl.constexpr = False,
     USE_TD_QO: tl.constexpr = False,
+    USE_HKV_MIXED_READ: tl.constexpr = False,
     Q_IS_FP8: tl.constexpr = False,
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
+    USE_TOKEN_HEAD_SCALES: tl.constexpr = (
+        USE_PER_TOKEN_HEAD_SCALES or USE_HKV_MIXED_READ
+    )
     USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
+
+    if USE_HKV_MIXED_READ:
+        tl.static_assert(
+            not USE_TD,
+            "Mixed HKV reads do not support tensor-descriptor KV loads",
+        )
 
     if USE_TD:
         tl.static_assert(
@@ -407,6 +437,14 @@ def kernel_unified_attention(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
 
+        if USE_HKV_MIXED_READ:
+            warm_block_idx = tl.load(
+                hkv_hot_to_warm_map_ptr + physical_block_idx,
+                mask=tile_mask,
+                other=-1,
+            ).to(tl.int64)
+            is_warm = warm_block_idx >= 0
+
         if USE_TD:
             # All TILE_SIZE slots within a single KV tile map to one
             # physical block (guaranteed by ``BLOCK_SIZE % TILE_SIZE == 0``
@@ -446,6 +484,8 @@ def kernel_unified_attention(
                 HEAD_SIZE,
                 HEAD_SIZE_PADDED,
             )
+            K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
+            V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
         else:
             v_offset = (
                 physical_block_idx[:, None] * stride_v_cache_0
@@ -459,20 +499,59 @@ def kernel_unified_attention(
                 + offs_d[:, None] * stride_k_cache_3
                 + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
             )
-            # K : (HEAD_SIZE, TILE_SIZE)
-            K_load = tl.load(
-                key_cache_ptr + k_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :],
-                other=0.0,
-            )
-            # V : (TILE_SIZE, HEAD_SIZE)
-            V_load = tl.load(
-                value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
-                other=0.0,
-            )
-        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
-        V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
+            if USE_HKV_MIXED_READ:
+                hot_lane_mask = tile_mask & ~is_warm
+                warm_k_offset = (
+                    warm_block_idx[None, :] * stride_hkv_k_blk
+                    + kv_head_idx * stride_hkv_k_head
+                    + offs_d[:, None] * stride_hkv_k_dim
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_hkv_k_slot
+                )
+                warm_v_offset = (
+                    warm_block_idx[:, None] * stride_hkv_v_blk
+                    + kv_head_idx * stride_hkv_v_head
+                    + offs_d[None, :] * stride_hkv_v_dim
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_hkv_v_slot
+                )
+                # HOT and WARM reads use disjoint masks. WARM lanes never
+                # dereference the corresponding HOT block.
+                K_hot = tl.load(
+                    key_cache_ptr + k_offset,
+                    mask=dim_mask[:, None] & hot_lane_mask[None, :],
+                    other=0.0,
+                ).to(Q.dtype)
+                V_hot = tl.load(
+                    value_cache_ptr + v_offset,
+                    mask=dim_mask[None, :] & hot_lane_mask[:, None],
+                    other=0.0,
+                ).to(Q.dtype)
+                K_warm = tl.load(
+                    hkv_warm_k_ptr + warm_k_offset,
+                    mask=dim_mask[:, None] & is_warm[None, :] & tile_mask[None, :],
+                    other=0.0,
+                ).to(Q.dtype)
+                V_warm = tl.load(
+                    hkv_warm_v_ptr + warm_v_offset,
+                    mask=dim_mask[None, :] & is_warm[:, None] & tile_mask[:, None],
+                    other=0.0,
+                ).to(Q.dtype)
+                K = tl.where(is_warm[None, :], K_warm, K_hot)
+                V = tl.where(is_warm[:, None], V_warm, V_hot)
+            else:
+                # K : (HEAD_SIZE, TILE_SIZE)
+                K_load = tl.load(
+                    key_cache_ptr + k_offset,
+                    mask=dim_mask[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
+                # V : (TILE_SIZE, HEAD_SIZE)
+                V_load = tl.load(
+                    value_cache_ptr + v_offset,
+                    mask=dim_mask[None, :] & tile_mask[:, None],
+                    other=0.0,
+                )
+                K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
+                V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
         # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
         if USE_PER_TOKEN_HEAD_SCALES:
@@ -491,6 +570,28 @@ def kernel_unified_attention(
             )
             v_token_head_scales = tl.load(
                 v_scale_cache_ptr + v_scale_idx, mask=tile_mask, other=1.0
+            )
+        elif USE_HKV_MIXED_READ:
+            hkv_k_scale_idx = (
+                warm_block_idx * stride_hkv_ks_blk
+                + (seq_offset % BLOCK_SIZE) * stride_hkv_ks_slot
+                + kv_head_idx * stride_hkv_ks_head
+            )
+            hkv_v_scale_idx = (
+                warm_block_idx * stride_hkv_vs_blk
+                + (seq_offset % BLOCK_SIZE) * stride_hkv_vs_slot
+                + kv_head_idx * stride_hkv_vs_head
+            )
+            warm_scale_mask = tile_mask & is_warm
+            k_token_head_scales = tl.load(
+                hkv_k_scale_cache_ptr + hkv_k_scale_idx,
+                mask=warm_scale_mask,
+                other=1.0,
+            )
+            v_token_head_scales = tl.load(
+                hkv_v_scale_cache_ptr + hkv_v_scale_idx,
+                mask=warm_scale_mask,
+                other=1.0,
             )
 
         query_abs_pos = context_len + query_pos[:, None]
@@ -512,7 +613,7 @@ def kernel_unified_attention(
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        if USE_PER_TOKEN_HEAD_SCALES:
+        if USE_TOKEN_HEAD_SCALES:
             # Per-token-head quant: fuse softmax_scale with per-head k_scale
             # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
             S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
@@ -554,7 +655,7 @@ def kernel_unified_attention(
             else:
                 sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
             V = tl.where(sw_mask_v, V, 0.0)
-        if USE_PER_TOKEN_HEAD_SCALES:
+        if USE_TOKEN_HEAD_SCALES:
             # Per-token-head quant: apply v_scale to P instead of V.
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
             acc += tl.dot(P_v, V)
@@ -818,6 +919,11 @@ def unified_attention(
     # The non-TD branch is dead-code-eliminated at Triton compile time so
     # disabling this flag costs nothing.
     use_td: bool = False,
+    hkv_warm_k=None,
+    hkv_warm_v=None,
+    hkv_hot_to_warm_map=None,
+    hkv_k_scale_cache=None,
+    hkv_v_scale_cache=None,
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -830,6 +936,16 @@ def unified_attention(
     use_per_token_head_scales = kv_quant_mode in (
         KVQuantMode.INT8_PER_TOKEN_HEAD,
         KVQuantMode.FP8_PER_TOKEN_HEAD,
+    )
+    use_hkv_mixed_read = all(
+        tensor is not None
+        for tensor in (
+            hkv_warm_k,
+            hkv_warm_v,
+            hkv_hot_to_warm_map,
+            hkv_k_scale_cache,
+            hkv_v_scale_cache,
+        )
     )
     if use_per_token_head_scales:
         assert k_scale_cache is not None and v_scale_cache is not None, (
@@ -856,6 +972,80 @@ def unified_attention(
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
+
+    if use_hkv_mixed_read:
+        if kv_quant_mode != KVQuantMode.NONE:
+            raise ValueError("Mixed HKV reads require KVQuantMode.NONE")
+        if use_td:
+            raise ValueError(
+                "Mixed HKV reads do not support tensor-descriptor KV loads"
+            )
+        if (
+            not k.is_floating_point()
+            or not v.is_floating_point()
+            or k.dtype != v.dtype
+        ):
+            raise ValueError(
+                "Mixed HKV reads require matching floating-point HOT K/V caches"
+            )
+        if (
+            k.ndim != 4
+            or v.ndim != 4
+            or k.shape != v.shape
+            or k.shape[3] != head_size
+        ):
+            raise ValueError("Incompatible HOT K/V cache layout")
+        if hkv_warm_k.dtype != torch.int8 or hkv_warm_v.dtype != torch.int8:
+            raise ValueError("Mixed HKV reads require torch.int8 WARM K/V caches")
+        if (
+            hkv_k_scale_cache.dtype != torch.float32
+            or hkv_v_scale_cache.dtype != torch.float32
+        ):
+            raise ValueError("Mixed HKV scale caches must use torch.float32")
+        if (
+            hkv_hot_to_warm_map.dtype != torch.int32
+            or hkv_hot_to_warm_map.ndim != 1
+            or hkv_hot_to_warm_map.shape[0] != k.shape[0]
+            or hkv_hot_to_warm_map.stride(0) != 1
+        ):
+            raise ValueError(
+                "HKV map must be contiguous one-dimensional torch.int32 "
+                "with one entry per HOT block"
+            )
+        if (
+            hkv_warm_k.ndim != 4
+            or hkv_warm_v.ndim != 4
+            or hkv_warm_k.shape != hkv_warm_v.shape
+            or hkv_warm_k.shape[0] < 1
+            or hkv_warm_k.shape[1] != block_size
+            or hkv_warm_k.shape[2] != num_kv_heads
+            or hkv_warm_k.shape[3]
+            != head_size + torch.finfo(torch.float32).bits // 8
+        ):
+            raise ValueError("Incompatible WARM K/V cache layout")
+        expected_scale_shape = (
+            hkv_warm_k.shape[0],
+            block_size,
+            num_kv_heads,
+        )
+        if (
+            hkv_k_scale_cache.shape != expected_scale_shape
+            or hkv_v_scale_cache.shape != expected_scale_shape
+        ):
+            raise ValueError("Incompatible WARM K/V scale-cache layout")
+        hkv_device = k.device
+        if any(
+            tensor.device != hkv_device
+            for tensor in (
+                v,
+                hkv_warm_k,
+                hkv_warm_v,
+                hkv_hot_to_warm_map,
+                hkv_k_scale_cache,
+                hkv_v_scale_cache,
+            )
+        ):
+            raise ValueError("HOT, WARM, scale, and HKV map devices must match")
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -995,6 +1185,32 @@ def unified_attention(
         # Pass the K cache as a stand-in pointer; never dereferenced.
         k_scale_ptr = k
         v_scale_ptr = v
+
+    if use_hkv_mixed_read:
+        hkv_k_strides = hkv_warm_k.stride()
+        hkv_v_strides = hkv_warm_v.stride()
+        hkv_ks_strides = hkv_k_scale_cache.stride()
+        hkv_vs_strides = hkv_v_scale_cache.stride()
+        hkv_k_blk, hkv_k_slot, hkv_k_head, hkv_k_dim = hkv_k_strides
+        hkv_v_blk, hkv_v_slot, hkv_v_head, hkv_v_dim = hkv_v_strides
+        hkv_ks_blk, hkv_ks_slot, hkv_ks_head = hkv_ks_strides
+        hkv_vs_blk, hkv_vs_slot, hkv_vs_head = hkv_vs_strides
+        hkv_warm_k_ptr = hkv_warm_k
+        hkv_warm_v_ptr = hkv_warm_v
+        hkv_map_ptr = hkv_hot_to_warm_map
+        hkv_k_scale_ptr = hkv_k_scale_cache
+        hkv_v_scale_ptr = hkv_v_scale_cache
+    else:
+        hkv_k_blk = hkv_k_slot = hkv_k_head = hkv_k_dim = 0
+        hkv_v_blk = hkv_v_slot = hkv_v_head = hkv_v_dim = 0
+        hkv_ks_blk = hkv_ks_slot = hkv_ks_head = 0
+        hkv_vs_blk = hkv_vs_slot = hkv_vs_head = 0
+        # Valid stand-in pointers; the constexpr-false path never reads them.
+        hkv_warm_k_ptr = k
+        hkv_warm_v_ptr = v
+        hkv_map_ptr = block_table
+        hkv_k_scale_ptr = k
+        hkv_v_scale_ptr = v
     # 3D needs real segm tensors; 2D never touches them but Triton wants
     # a non-null pointer.  Reuse ``out`` as the placeholder.
     segm_output_ptr = softmax_segm_output if use_3d else out
@@ -1031,6 +1247,11 @@ def unified_attention(
         qq_bias_ptr=qq_bias,
         k_scale_cache_ptr=k_scale_ptr,
         v_scale_cache_ptr=v_scale_ptr,
+        hkv_warm_k_ptr=hkv_warm_k_ptr,
+        hkv_warm_v_ptr=hkv_warm_v_ptr,
+        hkv_hot_to_warm_map_ptr=hkv_map_ptr,
+        hkv_k_scale_cache_ptr=hkv_k_scale_ptr,
+        hkv_v_scale_cache_ptr=hkv_v_scale_ptr,
         scale=softmax_scale,
         q_scale=q_descale,
         k_scale=k_descale,
@@ -1075,6 +1296,20 @@ def unified_attention(
         stride_vs_blk=vs_blk,
         stride_vs_slot=vs_slot,
         stride_vs_head=vs_head,
+        stride_hkv_k_blk=hkv_k_blk,
+        stride_hkv_k_slot=hkv_k_slot,
+        stride_hkv_k_head=hkv_k_head,
+        stride_hkv_k_dim=hkv_k_dim,
+        stride_hkv_v_blk=hkv_v_blk,
+        stride_hkv_v_slot=hkv_v_slot,
+        stride_hkv_v_head=hkv_v_head,
+        stride_hkv_v_dim=hkv_v_dim,
+        stride_hkv_ks_blk=hkv_ks_blk,
+        stride_hkv_ks_slot=hkv_ks_slot,
+        stride_hkv_ks_head=hkv_ks_head,
+        stride_hkv_vs_blk=hkv_vs_blk,
+        stride_hkv_vs_slot=hkv_vs_slot,
+        stride_hkv_vs_head=hkv_vs_head,
         query_start_len_ptr=cu_seqlens_q,
         BLOCK_Q=BLOCK_Q,
         num_seqs=num_seqs,
@@ -1088,6 +1323,7 @@ def unified_attention(
         CHUNK_SIZE=chunk_size,
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
+        USE_HKV_MIXED_READ=use_hkv_mixed_read,
         **launch_kwargs,
     )
 
