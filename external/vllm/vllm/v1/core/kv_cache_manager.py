@@ -587,7 +587,11 @@ class KVCacheManager:
         request_id: str,
         state: KVBlockState,
     ) -> tuple[list[int], ...]:
-        """Apply a request-level hierarchy state to its unshared blocks."""
+        """Apply a request-level state and return changed private block IDs.
+
+        Shared blocks are kept HOT but excluded from the returned request-level
+        transition payload.
+        """
         changed_block_ids: list[list[int]] = []
         for group in self.get_blocks(request_id).blocks:
             changed_group: list[int] = []
@@ -595,11 +599,14 @@ class KVCacheManager:
                 if block.is_null or block.ref_cnt == 0:
                     continue
 
-                block_state = KVBlockState.HOT if block.ref_cnt > 1 else state
-                if block.hierarchy_state is block_state:
+                if block.ref_cnt > 1:
+                    block.hierarchy_state = KVBlockState.HOT
                     continue
 
-                block.hierarchy_state = block_state
+                if block.hierarchy_state is state:
+                    continue
+
+                block.hierarchy_state = state
                 changed_group.append(block.block_id)
             changed_block_ids.append(changed_group)
 

@@ -61,6 +61,7 @@ from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_state import KVBlockState, KVCacheStateTransition
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     DraftTokenIds,
@@ -832,6 +833,38 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
+    def _handle_kv_cache_state_transitions(
+        self,
+        transitions: list[KVCacheStateTransition],
+    ) -> None:
+        """Validate logical KV-state work before physical migration exists."""
+        supported_transitions = {
+            (KVBlockState.HOT, KVBlockState.WARM),
+            (KVBlockState.WARM, KVBlockState.COLD),
+            (KVBlockState.HOT, KVBlockState.COLD),
+        }
+        for transition in transitions:
+            state_change = (transition.previous_state, transition.new_state)
+            if state_change not in supported_transitions:
+                raise ValueError(
+                    "Unsupported KV-cache state transition: "
+                    f"{transition.previous_state.value}->"
+                    f"{transition.new_state.value}"
+                )
+            for group in transition.changed_block_ids:
+                for block_id in group:
+                    if (
+                        not isinstance(block_id, int)
+                        or isinstance(block_id, bool)
+                        or block_id < 0
+                    ):
+                        raise ValueError(
+                            "KV-cache transition block IDs must be "
+                            f"non-negative integers; got {block_id!r}"
+                        )
+
+        logger.debug("Received %d KV-cache state transitions", len(transitions))
+
     @torch.inference_mode()
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
@@ -841,6 +874,11 @@ class Worker(WorkerBase):
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
+
+        if scheduler_output.kv_cache_state_transitions:
+            self._handle_kv_cache_state_transitions(
+                scheduler_output.kv_cache_state_transitions
+            )
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0

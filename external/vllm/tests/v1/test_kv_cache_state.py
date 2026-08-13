@@ -2,13 +2,39 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import pickle
 
 import pytest
 
-from vllm.v1.kv_cache_state import KVBlockState, classify_request_kv_state
+from vllm.v1.kv_cache_state import (
+    KVBlockState,
+    KVCacheStateTransition,
+    classify_request_kv_state,
+)
 
 HOT_THRESHOLD = 10.0
 COLD_THRESHOLD = 20.0
+
+
+def test_kv_cache_state_transition_equality_and_pickle_round_trip():
+    transition = KVCacheStateTransition(
+        request_id="request",
+        previous_state=KVBlockState.HOT,
+        new_state=KVBlockState.WARM,
+        changed_block_ids=([1, 2], [], [3]),
+    )
+
+    equivalent = KVCacheStateTransition(
+        request_id="request",
+        previous_state=KVBlockState.HOT,
+        new_state=KVBlockState.WARM,
+        changed_block_ids=([1, 2], [], [3]),
+    )
+    restored = pickle.loads(pickle.dumps(transition))
+
+    assert transition == equivalent
+    assert restored == transition
+    assert restored.changed_block_ids == ([1, 2], [], [3])
 
 
 def test_classify_request_kv_state_hot_below_boundary():

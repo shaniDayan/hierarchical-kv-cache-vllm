@@ -20,7 +20,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
 )
-from vllm.v1.kv_cache_state import KVBlockState
+from vllm.v1.kv_cache_state import KVBlockState, KVCacheStateTransition
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.structured_output import StructuredOutputManager
@@ -106,6 +106,7 @@ class TestStreamingScheduler(unittest.TestCase):
         output = scheduler.schedule()
 
         assert output.num_scheduled_tokens == {}
+        assert output.kv_cache_state_transitions == []
         scheduler.kv_cache_manager.apply_request_kv_state.assert_not_called()
 
     def test_schedule_demotes_idle_session_while_another_request_runs(self):
@@ -131,6 +132,14 @@ class TestStreamingScheduler(unittest.TestCase):
 
         assert active_request.request_id in warm_output.num_scheduled_tokens
         assert session.kv_cache_state is KVBlockState.WARM
+        assert warm_output.kv_cache_state_transitions == [
+            KVCacheStateTransition(
+                request_id=session.request_id,
+                previous_state=KVBlockState.HOT,
+                new_state=KVBlockState.WARM,
+                changed_block_ids=allocated.get_block_ids(),
+            )
+        ]
         assert all(
             block.hierarchy_state is KVBlockState.WARM
             for group in scheduler.kv_cache_manager.get_blocks(
@@ -141,9 +150,17 @@ class TestStreamingScheduler(unittest.TestCase):
         )
 
         with patch("vllm.v1.core.sched.scheduler.time.time", return_value=120.0):
-            scheduler.schedule()
+            cold_output = scheduler.schedule()
 
         assert session.kv_cache_state is KVBlockState.COLD
+        assert cold_output.kv_cache_state_transitions == [
+            KVCacheStateTransition(
+                request_id=session.request_id,
+                previous_state=KVBlockState.WARM,
+                new_state=KVBlockState.COLD,
+                changed_block_ids=allocated.get_block_ids(),
+            )
+        ]
         assert all(
             block.hierarchy_state is KVBlockState.COLD
             for group in scheduler.kv_cache_manager.get_blocks(
@@ -198,8 +215,17 @@ class TestStreamingScheduler(unittest.TestCase):
             patch("vllm.v1.core.sched.scheduler.time.time", return_value=110.0),
             self.assertLogs("vllm.v1.core.sched.scheduler", level="INFO") as captured,
         ):
-            scheduler.schedule()
+            output = scheduler.schedule()
 
+        assert output.total_num_scheduled_tokens == 0
+        assert output.kv_cache_state_transitions == [
+            KVCacheStateTransition(
+                request_id=session.request_id,
+                previous_state=KVBlockState.HOT,
+                new_state=KVBlockState.WARM,
+                changed_block_ids=([],),
+            )
+        ]
         log_output = "\n".join(captured.output)
         assert "request_id=session" in log_output
         assert "hot->warm" in log_output
@@ -218,6 +244,7 @@ class TestStreamingScheduler(unittest.TestCase):
 
         assert list(output.num_scheduled_tokens) == ["first", "second"]
         assert output.num_scheduled_tokens == {"first": 2, "second": 1}
+        assert output.kv_cache_state_transitions == []
 
     def test_idle_kv_classification_disabled(self):
         scheduler = create_scheduler()
@@ -288,19 +315,19 @@ class TestStreamingScheduler(unittest.TestCase):
 
         block_ids = allocated.get_block_ids()
         assert warm_transitions == [
-            (
-                session.request_id,
-                KVBlockState.HOT,
-                KVBlockState.WARM,
-                block_ids,
+            KVCacheStateTransition(
+                request_id=session.request_id,
+                previous_state=KVBlockState.HOT,
+                new_state=KVBlockState.WARM,
+                changed_block_ids=block_ids,
             )
         ]
         assert cold_transitions == [
-            (
-                session.request_id,
-                KVBlockState.WARM,
-                KVBlockState.COLD,
-                block_ids,
+            KVCacheStateTransition(
+                request_id=session.request_id,
+                previous_state=KVBlockState.WARM,
+                new_state=KVBlockState.COLD,
+                changed_block_ids=block_ids,
             )
         ]
         assert session.kv_cache_state is KVBlockState.COLD
@@ -313,7 +340,7 @@ class TestStreamingScheduler(unittest.TestCase):
             if not block.is_null and block.ref_cnt == 1
         )
 
-    def test_idle_kv_classification_can_transition_directly_to_cold(self):
+    def test_schedule_preserves_direct_hot_to_cold_transition(self):
         scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
         session = DummyRequest(request_id="session", arrival_time=100.0)
         session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
@@ -322,14 +349,16 @@ class TestStreamingScheduler(unittest.TestCase):
             return_value=([],)
         )
 
-        transitions = scheduler._classify_idle_kv_sessions(current_time=120.0)
+        with patch("vllm.v1.core.sched.scheduler.time.time", return_value=120.0):
+            output = scheduler.schedule()
 
-        assert transitions == [
-            (
-                session.request_id,
-                KVBlockState.HOT,
-                KVBlockState.COLD,
-                ([],),
+        assert output.total_num_scheduled_tokens == 0
+        assert output.kv_cache_state_transitions == [
+            KVCacheStateTransition(
+                request_id=session.request_id,
+                previous_state=KVBlockState.HOT,
+                new_state=KVBlockState.COLD,
+                changed_block_ids=([],),
             )
         ]
 

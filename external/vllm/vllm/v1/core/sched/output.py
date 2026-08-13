@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
+
+from vllm.v1.kv_cache_state import KVCacheStateTransition
 
 if TYPE_CHECKING:
     import numpy as np
@@ -240,6 +242,11 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Logical request KV-state transitions for the worker to process.
+    kv_cache_state_transitions: list[KVCacheStateTransition] = field(
+        default_factory=list
+    )
+
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
@@ -256,6 +263,7 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            kv_cache_state_transitions=[],
         )
 
 

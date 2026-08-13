@@ -53,13 +53,15 @@ def test_apply_warm_across_groups_and_skip_ineligible_blocks():
 
     changed = manager.apply_request_kv_state("request", KVBlockState.WARM)
 
-    assert changed == ([0, 4], [10], [])
+    assert changed == ([0], [10], [])
     assert groups[0][0].hierarchy_state is KVBlockState.WARM
     assert warm_block.hierarchy_state is KVBlockState.WARM
     assert null_block.hierarchy_state is KVBlockState.HOT
     assert unreferenced_block.hierarchy_state is KVBlockState.HOT
     assert shared_warm_block.hierarchy_state is KVBlockState.HOT
     assert shared_hot_block.hierarchy_state is KVBlockState.HOT
+    assert 4 not in changed[0]
+    assert 5 not in changed[0]
     assert groups[1][0].hierarchy_state is KVBlockState.WARM
     manager.get_blocks.assert_called_once_with("request")
 

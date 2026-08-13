@@ -53,7 +53,11 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.kv_cache_state import KVBlockState, classify_request_kv_state
+from vllm.v1.kv_cache_state import (
+    KVBlockState,
+    KVCacheStateTransition,
+    classify_request_kv_state,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -437,20 +441,15 @@ class Scheduler(SchedulerInterface):
         # This maintenance runs only when schedule() is already invoked. A
         # future deadline wakeup is needed when all sessions await streaming input.
         kv_state_transitions = self._classify_idle_kv_sessions()
-        for (
-            request_id,
-            previous_state,
-            new_state,
-            changed_block_ids,
-        ) in kv_state_transitions:
+        for transition in kv_state_transitions:
             logger.info(
                 "Idle KV state transition: request_id=%s %s->%s "
                 "changed_blocks=%d changed_block_ids_by_group=%s",
-                request_id,
-                previous_state.value,
-                new_state.value,
-                sum(len(group) for group in changed_block_ids),
-                changed_block_ids,
+                transition.request_id,
+                transition.previous_state.value,
+                transition.new_state.value,
+                sum(len(group) for group in transition.changed_block_ids),
+                transition.changed_block_ids,
             )
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
@@ -1104,6 +1103,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            kv_cache_state_transitions=kv_state_transitions,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
         )
 
@@ -1258,14 +1258,7 @@ class Scheduler(SchedulerInterface):
     def _classify_idle_kv_sessions(
         self,
         current_time: float | None = None,
-    ) -> list[
-        tuple[
-            str,
-            KVBlockState,
-            KVBlockState,
-            tuple[list[int], ...],
-        ]
-    ]:
+    ) -> list[KVCacheStateTransition]:
         """Classify inactive resumable sessions into colder KV states."""
         hot_threshold = self.kv_cache_hot_idle_threshold_seconds
         cold_threshold = self.kv_cache_cold_idle_threshold_seconds
@@ -1297,11 +1290,11 @@ class Scheduler(SchedulerInterface):
                 new_state,
             )
             transitions.append(
-                (
-                    request.request_id,
-                    previous_state,
-                    new_state,
-                    changed_block_ids,
+                KVCacheStateTransition(
+                    request_id=request.request_id,
+                    previous_state=previous_state,
+                    new_state=new_state,
+                    changed_block_ids=changed_block_ids,
                 )
             )
 
