@@ -20,6 +20,7 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
+from vllm.v1.kv_cache_state import KVBlockState
 from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
@@ -94,6 +95,7 @@ class Request:
             )
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
         self.last_activity_time: float = self.arrival_time
+        self.kv_cache_state = KVBlockState.HOT
 
         self.status = RequestStatus.WAITING
         self.events: list[EngineCoreEvent] = []

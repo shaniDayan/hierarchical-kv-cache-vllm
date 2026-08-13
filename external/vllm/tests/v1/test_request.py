@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from vllm.sampling_params import SamplingParams
+from vllm.v1.kv_cache_state import KVBlockState, classify_request_kv_state
 from vllm.v1.request import Request, RequestStatus
 
 
@@ -18,6 +19,25 @@ def test_request_activity_initialized_from_arrival_time():
     request = create_request(arrival_time=100.0)
 
     assert request.last_activity_time == request.arrival_time
+
+
+def test_request_kv_cache_state_initialized_hot():
+    request = create_request(arrival_time=100.0)
+
+    assert request.kv_cache_state is KVBlockState.HOT
+
+
+def test_classifying_idle_time_does_not_mutate_request():
+    request = create_request(arrival_time=100.0)
+
+    state = classify_request_kv_state(
+        idle_time=request.get_idle_time(current_time=110.0),
+        hot_threshold=5.0,
+        cold_threshold=20.0,
+    )
+
+    assert state is KVBlockState.WARM
+    assert request.kv_cache_state is KVBlockState.HOT
 
 
 def test_request_mark_activity_with_explicit_time():

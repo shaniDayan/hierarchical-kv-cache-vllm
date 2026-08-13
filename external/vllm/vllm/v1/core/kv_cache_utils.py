@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV-Cache Utilities."""
-from enum import Enum 
+
 import copy
 import hashlib
 import math
@@ -35,6 +35,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+from vllm.v1.kv_cache_state import KVBlockState
 from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
 
@@ -112,13 +113,6 @@ def init_none_hash(hash_fn: Callable[[Any], bytes]):
         NONE_HASH = BlockHash(os.urandom(32))
     else:
         NONE_HASH = BlockHash(hash_fn(hash_seed))
-
-class KVBlockState(str, Enum):
-    """Hierarchical state of a physical KV-cache block."""
-
-    HOT = "hot"
-    WARM = "warm"
-    COLD = "cold"
 
 
 @dataclass(slots=True)
