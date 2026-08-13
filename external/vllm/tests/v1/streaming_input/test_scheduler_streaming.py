@@ -113,11 +113,12 @@ class TestStreamingScheduler(unittest.TestCase):
         scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
         session = DummyRequest(
             request_id="session",
-            prompt_token_ids=[1],
+            prompt_token_ids=list(range(16)),
             arrival_time=100.0,
         )
-        allocated = scheduler.kv_cache_manager.allocate_slots(session, 1)
+        allocated = scheduler.kv_cache_manager.allocate_slots(session, 16)
         assert allocated is not None
+        session.num_computed_tokens = 16
         scheduler.requests[session.request_id] = session
         session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
 
@@ -294,32 +295,35 @@ class TestStreamingScheduler(unittest.TestCase):
         scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
         session = DummyRequest(
             request_id="session",
-            prompt_token_ids=[1],
+            prompt_token_ids=list(range(20)),
             arrival_time=100.0,
         )
         scheduler.add_request(session)
-        allocated = scheduler.kv_cache_manager.allocate_slots(session, 1)
+        allocated = scheduler.kv_cache_manager.allocate_slots(session, 20)
         assert allocated is not None
+        session.num_computed_tokens = 20
         session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
 
         warm_transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+        request_blocks = scheduler.kv_cache_manager.get_blocks(
+            session.request_id
+        ).blocks
+        complete_block_ids = tuple([group[0].block_id] for group in request_blocks)
         assert all(
-            block.hierarchy_state is KVBlockState.WARM
-            for group in scheduler.kv_cache_manager.get_blocks(
-                session.request_id
-            ).blocks
-            for block in group
-            if not block.is_null and block.ref_cnt == 1
+            group[0].hierarchy_state is KVBlockState.WARM
+            for group in request_blocks
+        )
+        assert all(
+            group[1].hierarchy_state is KVBlockState.HOT for group in request_blocks
         )
         cold_transitions = scheduler._classify_idle_kv_sessions(current_time=120.0)
 
-        block_ids = allocated.get_block_ids()
         assert warm_transitions == [
             KVCacheStateTransition(
                 request_id=session.request_id,
                 previous_state=KVBlockState.HOT,
                 new_state=KVBlockState.WARM,
-                changed_block_ids=block_ids,
+                changed_block_ids=complete_block_ids,
             )
         ]
         assert cold_transitions == [
@@ -327,17 +331,16 @@ class TestStreamingScheduler(unittest.TestCase):
                 request_id=session.request_id,
                 previous_state=KVBlockState.WARM,
                 new_state=KVBlockState.COLD,
-                changed_block_ids=block_ids,
+                changed_block_ids=complete_block_ids,
             )
         ]
         assert session.kv_cache_state is KVBlockState.COLD
         assert all(
-            block.hierarchy_state is KVBlockState.COLD
-            for group in scheduler.kv_cache_manager.get_blocks(
-                session.request_id
-            ).blocks
-            for block in group
-            if not block.is_null and block.ref_cnt == 1
+            group[0].hierarchy_state is KVBlockState.COLD
+            for group in request_blocks
+        )
+        assert all(
+            group[1].hierarchy_state is KVBlockState.HOT for group in request_blocks
         )
 
     def test_schedule_preserves_direct_hot_to_cold_transition(self):
@@ -361,6 +364,11 @@ class TestStreamingScheduler(unittest.TestCase):
                 changed_block_ids=([],),
             )
         ]
+        scheduler.kv_cache_manager.apply_request_kv_state.assert_called_once_with(
+            session.request_id,
+            KVBlockState.COLD,
+            num_computed_tokens=session.num_computed_tokens,
+        )
 
     def test_idle_kv_classification_never_promotes_to_hot(self):
         scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)

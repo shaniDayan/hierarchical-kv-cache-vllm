@@ -1288,6 +1288,7 @@ class Scheduler(SchedulerInterface):
             changed_block_ids = self.kv_cache_manager.apply_request_kv_state(
                 request.request_id,
                 new_state,
+                num_computed_tokens=request.num_computed_tokens,
             )
             transitions.append(
                 KVCacheStateTransition(

@@ -155,6 +155,9 @@ class KVCacheManager:
             metrics_collector=self.metrics_collector,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+        self.block_sizes = tuple(
+            manager.block_size for manager in self.coordinator.single_type_managers
+        )
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
 
@@ -586,20 +589,41 @@ class KVCacheManager:
         self,
         request_id: str,
         state: KVBlockState,
+        *,
+        num_computed_tokens: int | None = None,
     ) -> tuple[list[int], ...]:
         """Apply a request-level state and return changed private block IDs.
 
         Shared blocks are kept HOT but excluded from the returned request-level
-        transition payload.
+        transition payload. When a computed-token boundary is supplied,
+        demotion applies only to complete blocks; HOT application remains
+        unfiltered so it can repair or promote every eligible block.
         """
+        if num_computed_tokens is not None and num_computed_tokens < 0:
+            raise ValueError("num_computed_tokens must be non-negative")
+
         changed_block_ids: list[list[int]] = []
-        for group in self.get_blocks(request_id).blocks:
+        request_blocks = self.get_blocks(request_id).blocks
+        for group, block_size in zip(request_blocks, self.block_sizes, strict=True):
             changed_group: list[int] = []
-            for block in group:
+            num_complete_blocks = (
+                num_computed_tokens // block_size
+                if num_computed_tokens is not None
+                else None
+            )
+            for block_index, block in enumerate(group):
                 if block.is_null or block.ref_cnt == 0:
                     continue
 
                 if block.ref_cnt > 1:
+                    block.hierarchy_state = KVBlockState.HOT
+                    continue
+
+                if (
+                    state is not KVBlockState.HOT
+                    and num_complete_blocks is not None
+                    and block_index >= num_complete_blocks
+                ):
                     block.hierarchy_state = KVBlockState.HOT
                     continue
 
