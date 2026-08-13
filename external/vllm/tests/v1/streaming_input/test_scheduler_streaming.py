@@ -35,6 +35,7 @@ class DummyRequest(Request):
         prompt_token_ids=None,
         mm_features: list[MultiModalFeatureSpec] | None = None,
         max_tokens: int | None = 16,
+        arrival_time: float | None = None,
     ):
         super().__init__(
             request_id=request_id,
@@ -45,6 +46,7 @@ class DummyRequest(Request):
             pooling_params=None,
             mm_features=mm_features,
             resumable=resumable,
+            arrival_time=arrival_time,
         )
 
 
@@ -251,6 +253,7 @@ class TestStreamingScheduler(unittest.TestCase):
             request_id="session",
             prompt_token_ids=[1, 2, 3],
             resumable=True,
+            arrival_time=100.0,
         )
         scheduler.add_request(session)
         session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
@@ -260,6 +263,7 @@ class TestStreamingScheduler(unittest.TestCase):
             request_id="session",
             prompt_token_ids=[4, 5],
             resumable=True,
+            arrival_time=200.0,
         )
 
         scheduler.add_request(next_request)
@@ -269,6 +273,7 @@ class TestStreamingScheduler(unittest.TestCase):
         # becomes WAITING
         assert session.status == RequestStatus.WAITING
         assert session.prompt_token_ids == [1, 2, 3, 4, 5]
+        assert session.last_activity_time == 200.0
 
         _ = scheduler.schedule()
 

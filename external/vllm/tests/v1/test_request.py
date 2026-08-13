@@ -1,6 +1,45 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from vllm.v1.request import RequestStatus
+from vllm.sampling_params import SamplingParams
+from vllm.v1.request import Request, RequestStatus
+
+
+def create_request(arrival_time: float) -> Request:
+    return Request(
+        request_id="request",
+        prompt_token_ids=[],
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        arrival_time=arrival_time,
+    )
+
+
+def test_request_activity_initialized_from_arrival_time():
+    request = create_request(arrival_time=100.0)
+
+    assert request.last_activity_time == request.arrival_time
+
+
+def test_request_mark_activity_with_explicit_time():
+    request = create_request(arrival_time=100.0)
+
+    request.mark_activity(125.0)
+
+    assert request.last_activity_time == 125.0
+
+
+def test_request_idle_time():
+    request = create_request(arrival_time=100.0)
+    request.mark_activity(125.0)
+
+    assert request.get_idle_time(current_time=130.0) == 5.0
+
+
+def test_request_idle_time_never_negative():
+    request = create_request(arrival_time=100.0)
+    request.mark_activity(125.0)
+
+    assert request.get_idle_time(current_time=120.0) == 0.0
 
 
 def test_request_status_fmt_str():
