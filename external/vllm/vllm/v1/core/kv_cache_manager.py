@@ -16,6 +16,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
+from vllm.v1.kv_cache_state import KVBlockState
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
@@ -580,6 +581,29 @@ class KVCacheManager:
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
         """Get the blocks of a request."""
         return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))
+
+    def apply_request_kv_state(
+        self,
+        request_id: str,
+        state: KVBlockState,
+    ) -> tuple[list[int], ...]:
+        """Apply a request-level hierarchy state to its unshared blocks."""
+        changed_block_ids: list[list[int]] = []
+        for group in self.get_blocks(request_id).blocks:
+            changed_group: list[int] = []
+            for block in group:
+                if block.is_null or block.ref_cnt == 0:
+                    continue
+
+                block_state = KVBlockState.HOT if block.ref_cnt > 1 else state
+                if block.hierarchy_state is block_state:
+                    continue
+
+                block.hierarchy_state = block_state
+                changed_group.append(block.block_id)
+            changed_block_ids.append(changed_group)
+
+        return tuple(changed_block_ids)
 
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
         """Get the block ids of a request."""
