@@ -20,7 +20,7 @@ instead of embedding feature-specific logic directly.
 import functools
 import gc
 import time
-from copy import deepcopy
+from copy import copy, deepcopy
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -49,8 +49,17 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
-from vllm.v1.kv_cache_state import KVBlockState, KVCacheStateTransition
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.kv_cache_state import (
+    KVBlockState,
+    KVCacheStateTransition,
+    KVCacheTransitionResult,
+    KVCacheTransitionStatus,
+)
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    DraftTokenIds,
+    ModelRunnerOutput,
+)
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
@@ -77,7 +86,9 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
 from vllm.v1.worker.gpu.hkv_migration import (
+    HKVWarmCapacityError,
     HKVWarmMigrationManager,
+    HKVWarmStaleValidationError,
     is_hkv_multi_block_warm_migration_enabled,
 )
 from vllm.v1.worker.gpu.input_batch import (
@@ -160,6 +171,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._hkv_warm_slot_table_revision = -1
         self._hkv_warm_slot_table_num_reqs_after_padding = -1
         self._hkv_debug_demote_done = False
+        self._pending_kv_transition_results: list[KVCacheTransitionResult] = []
 
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
@@ -563,10 +575,42 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
+    def _take_kv_transition_results(self) -> list[KVCacheTransitionResult]:
+        results = self._pending_kv_transition_results
+        self._pending_kv_transition_results = []
+        return results
+
+    def _attach_kv_transition_results(
+        self, output: ModelRunnerOutput | None
+    ) -> ModelRunnerOutput:
+        results = self._take_kv_transition_results()
+        if output is None or output is EMPTY_MODEL_RUNNER_OUTPUT or results:
+            out = (
+                copy(output)
+                if output is not None
+                else ModelRunnerOutput([], {})
+            )
+            out.kv_cache_transition_results = results
+            return out
+        return output
+
     def handle_kv_cache_state_transitions(
         self, transitions: list[KVCacheStateTransition]
-    ) -> None:
+    ) -> list[KVCacheTransitionResult]:
         """Physically shadow-migrate logical transitions into WARM storage."""
+        if not transitions:
+            return []
+
+        if (
+            self.parallel_config.tensor_parallel_size > 1
+            or self.parallel_config.pipeline_parallel_size > 1
+            or self.dp_size > 1
+        ):
+            raise NotImplementedError(
+                "Hierarchical KV cache WARM migration completion proof is currently "
+                "supported only in single-rank (TP=1, PP=1, DP=1) configuration."
+            )
+
         if self.hkv_warm_migration_manager is None:
             raise ValueError(
                 "Multi-block WARM migration manager is not initialized"
@@ -575,6 +619,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             raise ValueError(
                 "Physical migration requires blocks_per_kv_block == 1"
             )
+
+        results: list[KVCacheTransitionResult] = []
+        needs_cuda_sync = False
+        successful_transitions: list[KVCacheStateTransition] = []
+
         for transition in transitions:
             if (
                 transition.previous_state is not KVBlockState.HOT
@@ -590,7 +639,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     "Physical migration currently supports exactly one "
                     "KV-cache group"
                 )
-            req_index = self.req_states.req_id_to_index[transition.request_id]
+            req_index = self.req_states.req_id_to_index.get(transition.request_id)
+            if req_index is None:
+                results.append(
+                    transition.to_result(
+                        KVCacheTransitionStatus.STALE_VALIDATION,
+                        f"Request {transition.request_id} not found in "
+                        "model runner req_states",
+                    )
+                )
+                continue
+
             group_num_blocks = self.block_tables.num_blocks.np[:, req_index]
             request_block_table = tuple(
                 tuple(
@@ -604,11 +663,46 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     strict=True,
                 )
             )
-            self.hkv_warm_migration_manager.migrate(
-                transition.request_id,
-                transition.changed_blocks,
-                request_block_table,
+            try:
+                enqueued = self.hkv_warm_migration_manager.migrate(
+                    transition.request_id,
+                    transition.changed_blocks,
+                    request_block_table,
+                )
+                if enqueued:
+                    needs_cuda_sync = True
+                successful_transitions.append(transition)
+            except HKVWarmCapacityError as e:
+                results.append(
+                    transition.to_result(
+                        KVCacheTransitionStatus.RETRYABLE_CAPACITY,
+                        str(e),
+                    )
+                )
+            except HKVWarmStaleValidationError as e:
+                results.append(
+                    transition.to_result(
+                        KVCacheTransitionStatus.STALE_VALIDATION,
+                        str(e),
+                    )
+                )
+
+        if needs_cuda_sync:
+            device = (
+                self.device
+                if isinstance(self.device, torch.device)
+                else torch.device(self.device)
             )
+            if device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.current_stream(device).synchronize()
+
+        for transition in successful_transitions:
+            results.append(
+                transition.to_result(KVCacheTransitionStatus.SUCCESS)
+            )
+
+        self._pending_kv_transition_results.extend(results)
+        return results
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -1290,7 +1384,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
-                return empty_output
+                return self._attach_kv_transition_results(empty_output)
 
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
@@ -1326,7 +1420,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
-            return empty_output
+            return self._attach_kv_transition_results(empty_output)
 
         if not dummy_run:
             # Common case.
@@ -1540,7 +1634,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            return self._attach_kv_transition_results(
+                ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            )
 
         # Last rank: sample tokens
         sampler_output, num_sampled, num_rejected = self.sample(
@@ -1574,6 +1670,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            kv_cache_transition_results=self._take_kv_transition_results(),
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
@@ -1673,7 +1770,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not self.is_last_pp_rank:
             self.postprocess_num_computed_tokens(input_batch)
-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            return self._attach_kv_transition_results(
+                ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            )
 
         assert self.pooling_runner is not None
         pooler_output, is_valid = self.pooling_runner.pool(
@@ -1685,6 +1784,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_ids=input_batch.req_ids,
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             kv_connector_output=kv_connector_output,
+            kv_cache_transition_results=self._take_kv_transition_results(),
         )
         async_output = AsyncPoolingOutput(
             model_runner_output=model_runner_output,

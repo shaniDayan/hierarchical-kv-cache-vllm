@@ -56,6 +56,8 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_cache_state import (
     KVBlockState,
     KVCacheStateTransition,
+    KVCacheTransitionResult,
+    KVCacheTransitionStatus,
     classify_request_kv_state,
 )
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -96,6 +98,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_cold_idle_threshold_seconds = (
             self.scheduler_config.kv_cache_cold_idle_threshold_seconds
         )
+        self._next_kv_transition_id: int = 0
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.kv_cache_config = kv_cache_config
@@ -1290,8 +1293,11 @@ class Scheduler(SchedulerInterface):
                 new_state,
                 num_computed_tokens=request.num_computed_tokens,
             )
+            transition_id = self._next_kv_transition_id
+            self._next_kv_transition_id += 1
             transitions.append(
                 KVCacheStateTransition(
+                    transition_id=transition_id,
                     request_id=request.request_id,
                     previous_state=previous_state,
                     new_state=new_state,
@@ -1544,11 +1550,122 @@ class Scheduler(SchedulerInterface):
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
+    def _validate_kv_cache_transition_results(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        expected_transitions = scheduler_output.kv_cache_state_transitions
+        actual_results = getattr(
+            model_runner_output, "kv_cache_transition_results", None
+        )
+        if actual_results is None:
+            actual_results = []
+
+        if not expected_transitions and not actual_results:
+            return
+
+        if len(expected_transitions) != len(actual_results):
+            expected_ids = [t.transition_id for t in expected_transitions]
+            actual_ids = [r.transition_id for r in actual_results]
+            raise ValueError(
+                f"Mismatch in KV transition result count: "
+                f"expected {len(expected_transitions)} results for transitions "
+                f"{expected_ids}, got {len(actual_results)} results {actual_ids}"
+            )
+
+        seen_transition_ids: set[int] = set()
+        for expected, actual in zip(expected_transitions, actual_results, strict=True):
+            if not isinstance(actual, KVCacheTransitionResult):
+                raise TypeError(
+                    f"Expected KVCacheTransitionResult, got {type(actual).__name__}"
+                )
+            if actual.transition_id in seen_transition_ids:
+                raise ValueError(
+                    f"Duplicate KV transition result for "
+                    f"transition_id={actual.transition_id}"
+                )
+            seen_transition_ids.add(actual.transition_id)
+
+            if actual.transition_id != expected.transition_id:
+                raise ValueError(
+                    f"KV transition ID mismatch: expected {expected.transition_id}, "
+                    f"got {actual.transition_id}"
+                )
+
+            if actual.signature != expected.signature:
+                raise ValueError(
+                    f"KV transition signature mismatch for "
+                    f"transition_id={expected.transition_id}: "
+                    f"expected signature {expected.signature}, "
+                    f"got {actual.signature}"
+                )
+
+            if actual.status is not KVCacheTransitionStatus.SUCCESS:
+                self._rollback_kv_cache_transition(expected, actual)
+
+    def _rollback_kv_cache_transition(
+        self,
+        transition: KVCacheStateTransition,
+        result: KVCacheTransitionResult,
+    ) -> None:
+        """Roll back eager scheduler state for a non-successful transition."""
+        logger.warning(
+            "KV cache transition %d for request %s was not successful: "
+            "status=%s, error=%s. Rolling back eager state from %s to %s.",
+            result.transition_id,
+            result.request_id,
+            result.status.value,
+            result.error_message,
+            transition.new_state.value,
+            transition.previous_state.value,
+        )
+        request = self.requests.get(transition.request_id)
+        if request is None:
+            return
+
+        if request.kv_cache_state == transition.new_state:
+            request.kv_cache_state = transition.previous_state
+
+        request_blocks = self.kv_cache_manager.get_blocks(
+            transition.request_id
+        ).blocks
+        for group_idx, group_transitions in enumerate(
+            transition.changed_blocks
+        ):
+            if group_idx >= len(request_blocks):
+                raise ValueError(
+                    f"Cache group index {group_idx} out of range during "
+                    f"rollback for request {transition.request_id}"
+                )
+            current_group = request_blocks[group_idx]
+            for block_trans in group_transitions:
+                logical_idx = block_trans.logical_block_index
+                expected_hot_id = block_trans.source_hot_block_id
+                if logical_idx >= len(current_group):
+                    raise ValueError(
+                        f"Logical block index {logical_idx} out of range "
+                        f"during rollback for request {transition.request_id}"
+                    )
+                block = current_group[logical_idx]
+                if block.block_id != expected_hot_id:
+                    raise ValueError(
+                        f"Physical block ID mismatch during rollback for "
+                        f"request {transition.request_id} group {group_idx} "
+                        f"logical block {logical_idx}: expected block_id "
+                        f"{expected_hot_id}, found {block.block_id}"
+                    )
+                if block.hierarchy_state == transition.new_state:
+                    block.hierarchy_state = transition.previous_state
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        self._validate_kv_cache_transition_results(
+            scheduler_output, model_runner_output
+        )
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict

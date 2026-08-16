@@ -26,6 +26,10 @@ class HKVWarmReservationError(HKVWarmAllocatorError):
     """Raised for invalid reservation lifecycle operations."""
 
 
+class HKVWarmStaleValidationError(HKVWarmAllocatorError):
+    """Raised when transition source HOT blocks or bounds do not match current state."""
+
+
 def is_hkv_multi_block_warm_migration_enabled() -> bool:
     return os.getenv("HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION") == "1"
 
@@ -297,8 +301,12 @@ class HKVWarmMigrationManager:
         request_id: str,
         changed_blocks: Sequence[Sequence[KVCacheBlockTransition]],
         request_block_table: Sequence[Sequence[int]],
-    ) -> None:
-        """Populate logical WARM residency from validated HOT blocks."""
+    ) -> bool:
+        """Populate logical WARM residency from validated HOT blocks.
+
+        Returns True if new quantization work was enqueued, False if all
+        requested blocks were already resident (idempotent repeat).
+        """
         if len(changed_blocks) != len(request_block_table):
             raise ValueError("transition and block-table groups must match")
 
@@ -337,13 +345,13 @@ class HKVWarmMigrationManager:
                 normalized[key] = source_hot_block_id
 
                 if block.logical_block_index >= len(current_group):
-                    raise ValueError(
+                    raise HKVWarmStaleValidationError(
                         f"logical block index {block.logical_block_index} is "
                         f"outside current block-table group {cache_group_index}"
                     )
                 current_hot_block_id = current_group[block.logical_block_index]
                 if current_hot_block_id != block.source_hot_block_id:
-                    raise ValueError(
+                    raise HKVWarmStaleValidationError(
                         f"source HOT block {block.source_hot_block_id} does not "
                         f"match current block-table value {current_hot_block_id} "
                         f"for {key!r}"
@@ -354,7 +362,7 @@ class HKVWarmMigrationManager:
                     and existing.temporary_shadow_hot_block_id
                     != block.source_hot_block_id
                 ):
-                    raise ValueError(
+                    raise HKVWarmStaleValidationError(
                         f"logical key {key!r} already shadows "
                         f"HOT block {existing.temporary_shadow_hot_block_id}"
                     )
@@ -365,7 +373,7 @@ class HKVWarmMigrationManager:
             if key not in self.warm_residency
         }
         if not new_entries:
-            return
+            return False
 
         reservation = self.allocator.reserve_many(new_entries)
         mappings = dict(reservation.mappings)
@@ -418,6 +426,7 @@ class HKVWarmMigrationManager:
                 temporary_shadow_hot_block_id=hot_block_id,
             )
         self.warm_residency_revision += 1
+        return True
 
     def release_request(self, request_id: str) -> tuple[int, ...]:
         """Invalidate and release all WARM mappings owned by a request."""

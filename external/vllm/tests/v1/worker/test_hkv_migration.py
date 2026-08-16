@@ -10,6 +10,7 @@ from vllm.v1.worker.gpu.hkv_migration import (
     HKVWarmCapacityError,
     HKVWarmMigrationManager,
     HKVWarmSlotAllocator,
+    HKVWarmStaleValidationError,
 )
 
 
@@ -146,7 +147,7 @@ def test_logical_residency_is_idempotent_and_released(monkeypatch):
 @pytest.mark.parametrize(
     ("case", "error", "message"),
     [
-        ("stale_source", ValueError, "does not match"),
+        ("stale_source", HKVWarmStaleValidationError, "does not match"),
         ("conflicting_duplicate", ValueError, "conflicting HOT sources"),
         ("capacity", HKVWarmCapacityError, "only 1 available"),
         ("quantization", RuntimeError, "quantization failed"),

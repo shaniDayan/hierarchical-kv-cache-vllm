@@ -122,6 +122,7 @@ class TestStreamingScheduler(unittest.TestCase):
         )
         assert transitions == [
             KVCacheStateTransition(
+                transition_id=0,
                 request_id=session.request_id,
                 previous_state=KVBlockState.HOT,
                 new_state=KVBlockState.WARM,
