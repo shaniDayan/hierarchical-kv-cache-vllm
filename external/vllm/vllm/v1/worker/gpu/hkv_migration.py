@@ -104,6 +104,16 @@ class HKVWarmSlotAllocator:
         """Return the logical owner token associated with ``source``."""
         return self._source_to_owner_token.get(source)
 
+    def sources_owned_by(self, owner_token: Hashable) -> tuple[HKVBlockSource, ...]:
+        """Return the sources associated with a logical owner."""
+        self._require_no_active_reservation()
+        self._validate_owner_token(owner_token)
+        return tuple(
+            source
+            for source, existing_owner in self._source_to_owner_token.items()
+            if existing_owner == owner_token
+        )
+
     def reserve_many(
         self,
         sources: Iterable[HKVBlockSource],
@@ -363,3 +373,24 @@ class HKVWarmMigrationManager:
             self.allocator.rollback(reservation)
             raise
         self.allocator.commit(reservation)
+
+    def release_request(self, request_id: str) -> tuple[int, ...]:
+        """Invalidate and release all WARM mappings owned by a request."""
+        sources = self.allocator.sources_owned_by(request_id)
+        if not sources:
+            return ()
+        if any(source.cache_group_index != 0 for source in sources):
+            raise ValueError("WARM migration cleanup supports only cache group 0")
+
+        hot_block_ids = [source.kernel_hot_block_id for source in sources]
+        unique_maps = {}
+        for hot_to_warm_map in self.hot_to_warm_maps.values():
+            storage_key = (
+                hot_to_warm_map.device,
+                hot_to_warm_map.untyped_storage().data_ptr(),
+            )
+            unique_maps[storage_key] = hot_to_warm_map
+        for hot_to_warm_map in unique_maps.values():
+            hot_to_warm_map[hot_block_ids] = -1
+
+        return self.allocator.release_sources(sources)

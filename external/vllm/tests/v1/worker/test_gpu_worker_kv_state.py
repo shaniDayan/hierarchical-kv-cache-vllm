@@ -147,3 +147,22 @@ def test_insufficient_warm_capacity_leaves_state_unchanged():
 
     assert hot_to_warm_maps == {}
     assert manager.allocator.num_owned_slots == 0
+
+
+def test_finished_request_releases_warm_state_before_runner_removal():
+    events = []
+    target = SimpleNamespace(
+        hkv_warm_migration_manager=SimpleNamespace(
+            release_request=lambda req_id: events.append(("release", req_id))
+        ),
+        _remove_request=lambda req_id: events.append(("remove", req_id)),
+    )
+    output = SchedulerOutput.make_empty()
+    output.finished_req_ids = {"finished-request"}
+
+    GPUModelRunner.finish_requests(target, output)
+
+    assert events == [
+        ("release", "finished-request"),
+        ("remove", "finished-request"),
+    ]

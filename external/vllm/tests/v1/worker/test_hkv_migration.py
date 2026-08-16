@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
 
 from vllm.v1.worker.gpu.hkv_migration import (
     HKVBlockSource,
     HKVWarmCapacityError,
+    HKVWarmMigrationManager,
     HKVWarmOwnershipError,
     HKVWarmSlotAllocator,
 )
@@ -79,3 +81,48 @@ def test_allocator_failures_are_atomic_and_preserve_existing_mappings():
     assert allocator.lookup(existing) == 0
     assert allocator.owner_token_of(existing) == "request-a"
     allocator.validate_invariants()
+
+
+def test_release_request_invalidates_owned_maps_and_reuses_slots():
+    hot_to_warm_map = torch.full((16,), -1, dtype=torch.int32)
+    manager = HKVWarmMigrationManager(
+        warm_capacity=3,
+        hot_kv_caches={},
+        warm_kv_caches={},
+        hot_to_warm_maps={"layer": hot_to_warm_map, "alias": hot_to_warm_map},
+        device="cpu",
+    )
+    request_sources = (source(0, 3), source(0, 7))
+    request_reservation = manager.allocator.reserve_many(
+        request_sources, owner_token="request-a"
+    )
+    manager.allocator.commit(request_reservation)
+    other_source = source(0, 11)
+    other_reservation = manager.allocator.reserve_many(
+        (other_source,), owner_token="request-b"
+    )
+    manager.allocator.commit(other_reservation)
+    published_mappings = request_reservation.mappings + other_reservation.mappings
+    for block_source, slot in published_mappings:
+        hot_to_warm_map[block_source.kernel_hot_block_id] = slot
+
+    assert manager.release_request("request-a") == (0, 1)
+    assert hot_to_warm_map[3].item() == -1
+    assert hot_to_warm_map[7].item() == -1
+    assert hot_to_warm_map[11].item() == 2
+    assert all(
+        manager.allocator.lookup(source_) is None for source_ in request_sources
+    )
+    assert manager.allocator.owner_token_of(other_source) == "request-b"
+
+    assert manager.release_request("request-a") == ()
+    replacement_sources = (source(0, 5), source(0, 13))
+    replacement = manager.allocator.reserve_many(
+        replacement_sources, owner_token="request-c"
+    )
+    assert replacement.mappings == (
+        (replacement_sources[0], 0),
+        (replacement_sources[1], 1),
+    )
+    manager.allocator.commit(replacement)
+    manager.allocator.validate_invariants()
