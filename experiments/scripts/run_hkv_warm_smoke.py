@@ -69,10 +69,9 @@ class HKVSmokeWorkerExtension:
         assert not maps or all(value == maps[0] for value in maps)
         values = maps[0] if maps else []
         allocator = manager.allocator if manager is not None else None
-        allocator_mappings = [] if allocator is None else sorted(
-            [source.cache_group_index, source.kernel_hot_block_id, slot]
-            for source, slot in allocator._source_to_slot.items()
-        )
+        residency_items = () if manager is None else sorted(manager.warm_residency.items())
+        allocator_mappings = [] if allocator is None else [
+            [*key, allocator.lookup(key)] for key, _ in residency_items]
         index = runner.req_states.req_id_to_index.get(request_id)
         blocks, computed = [], None
         if index is not None:
@@ -83,14 +82,16 @@ class HKVSmokeWorkerExtension:
         residency = [] if manager is None else [
             {"key": list(key), "warm_slot_id": entry.warm_slot_id,
              "temporary_shadow_hot_block_id": entry.temporary_shadow_hot_block_id}
-            for key, entry in sorted(manager.warm_residency.items())
+            for key, entry in residency_items
             if key[0] == request_id
         ]
-        request_slots = [] if allocator is None else sorted(
-            [source.cache_group_index, source.kernel_hot_block_id, slot]
-            for source, slot in allocator._source_to_slot.items()
-            if allocator._source_to_owner_token[source] == request_id
-        )
+        request_slots = [] if allocator is None else [
+            [key[1], key[2], allocator.lookup(key)]
+            for key, _ in residency_items if key[0] == request_id]
+        allocator_matches = allocator is None or all(
+            allocator.lookup(key) == entry.warm_slot_id for key, entry in residency_items)
+        ownership_count_matches = allocator is None or (
+            allocator.num_owned_slots == len(residency_items))
         hot_ids = sorted(item["temporary_shadow_hot_block_id"] for item in residency)
         hot_cache_checks = []
         for name, cache in runner.hkv_hot_kv_caches.items():
@@ -107,6 +108,8 @@ class HKVSmokeWorkerExtension:
             "warm_mappings": [[i, slot] for i, slot in enumerate(values) if slot >= 0],
             "allocator_mappings": allocator_mappings,
             "request_slot_ownership": request_slots,
+            "allocator_matches_residency": allocator_matches,
+            "ownership_count_matches": ownership_count_matches,
             "warm_residency": residency,
             "projection_matches_residency": projection_agrees,
             "residency_matches_block_table": residency_matches_blocks,
@@ -226,15 +229,12 @@ async def run(args):
     if args.mode == "mixed":
         assert demotion["mixed_read_enabled"] and resumed["mixed_read_enabled"]
         assert len(mappings) >= 2 and len(set(mappings.values())) == len(mappings)
-        allocator_map = {block: slot for group, block, slot in
-                         demotion["allocator_mappings"] if group == 0}
-        assert allocator_map == mappings
         assert pre_resume_mappings_persisted
         assert set(mappings).issubset(mapped_block_ids_at_resume)
         assert hot_block_ids_at_resume
-        assert demotion["projection_matches_residency"] and demotion["residency_matches_block_table"] and demotion["hot_copy_retained"]
-        assert repeat_check["repeat_idempotency"]["passed"] and before_release["projection_matches_residency"]
-        assert before_release["hot_copy_retained"] and after_release["release_result"]["passed"]
+        assert demotion["projection_matches_residency"] and demotion["residency_matches_block_table"] and demotion["hot_copy_retained"] and demotion["allocator_matches_residency"] and demotion["ownership_count_matches"]
+        assert repeat_check["repeat_idempotency"]["passed"] and repeat_check["allocator_matches_residency"] and repeat_check["ownership_count_matches"] and before_release["projection_matches_residency"]
+        assert before_release["hot_copy_retained"] and before_release["allocator_matches_residency"] and before_release["ownership_count_matches"] and after_release["release_result"]["passed"] and after_release["allocator_matches_residency"] and after_release["ownership_count_matches"]
     else:
         assert not demotion["mixed_read_enabled"]
         assert not resumed["mixed_read_enabled"]
