@@ -10,6 +10,10 @@ class HKVSmokeWorkerExtension:
     def inspect_hkv_smoke(self, request_id):
         import torch
         runner = self.model_runner
+        mixed_read_enabled = (
+            os.getenv("HKV_DEBUG_MIXED_READ", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
         maps = [value.cpu().tolist() for value in runner.hkv_hot_to_warm_maps.values()]
         assert not maps or all(value == maps[0] for value in maps)
         values = maps[0] if maps else []
@@ -29,6 +33,7 @@ class HKVSmokeWorkerExtension:
         return {
             "request_id": request_id, "num_computed_tokens": computed,
             "block_ids": blocks,
+            "mixed_read_enabled": mixed_read_enabled,
             "warm_mappings": [[i, slot] for i, slot in enumerate(values) if slot >= 0],
             "allocator_mappings": allocator_mappings,
             "max_gpu_allocated_bytes": torch.cuda.max_memory_allocated(),
@@ -115,15 +120,36 @@ async def run(args):
             f"continuation_yielded={continuation_yielded}, current_turn={turn}, "
             f"turn_1_outputs={output_counts[1]}, turn_2_outputs={output_counts[2]}")
     mappings = dict(demotion["warm_mappings"])
+    resumed_mappings = dict(resumed["warm_mappings"])
+    mapped_block_ids_at_resume = sorted(
+        block_id
+        for block_id in resumed["block_ids"]
+        if block_id in resumed_mappings
+    )
+    hot_block_ids_at_resume = sorted(
+        block_id
+        for block_id in resumed["block_ids"]
+        if block_id not in resumed_mappings
+    )
+    pre_resume_mappings_persisted = bool(mappings) and all(
+        resumed_mappings.get(block_id) == slot
+        for block_id, slot in mappings.items()
+    )
     expected_complete_historical_blocks = historical_token_count // 16  # Excludes first generated final token.
     assert expected_complete_historical_blocks >= 2
     if args.mode == "mixed":
+        assert demotion["mixed_read_enabled"] and resumed["mixed_read_enabled"]
         assert len(mappings) >= 2 and len(set(mappings.values())) == len(mappings)
         allocator_map = {block: slot for group, block, slot in
                          demotion["allocator_mappings"] if group == 0}
         assert allocator_map == mappings
+        assert pre_resume_mappings_persisted
+        assert set(mappings).issubset(mapped_block_ids_at_resume)
+        assert hot_block_ids_at_resume
     else:
-        assert not mappings
+        assert not demotion["mixed_read_enabled"]
+        assert not resumed["mixed_read_enabled"]
+        assert not mappings and not resumed_mappings
     elapsed = time.perf_counter() - started - idle_elapsed
     result = {
         "mode": args.mode, "request_id": "hkv-target", "transition": "HOT->WARM",
@@ -131,6 +157,13 @@ async def run(args):
         "demotion": demotion, "observed_migrated_block_ids": sorted(mappings),
         "migration_evidence": "post-migration GPU HOT-to-WARM map",
         "migrated_block_slots": demotion["allocator_mappings"],
+        "warm_quantization_and_mapping_observed": bool(mappings),
+        "mixed_attention_read_enabled": demotion["mixed_read_enabled"],
+        "mixed_attention_read_evidence": {
+            "pre_resume_mappings_persisted": pre_resume_mappings_persisted,
+            "warm_block_ids_in_resumed_block_table": mapped_block_ids_at_resume,
+            "hot_block_ids_in_resumed_block_table": hot_block_ids_at_resume,
+        },
         "partial_tail_evidence": "Scheduler first transitioned two complete blocks; a third block transitioned only after continuation (verified in scheduler log).",
         "after_resume": resumed, "generated_token_ids": token_ids,
         "generated_text": text, "generation_time_seconds": elapsed,
@@ -171,6 +204,7 @@ def main():
         "HKV_ENABLE_PHYSICAL_TIERS": "1", "HKV_WARM_POOL_BLOCKS": "16",
         "HKV_DEBUG_DEMOTE_ONE_BLOCK": "0",
         "HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION": "1" if args.mode == "mixed" else "0",
+        "HKV_DEBUG_MIXED_READ": "1" if args.mode == "mixed" else "0",
     })
     asyncio.run(run(args))
 
