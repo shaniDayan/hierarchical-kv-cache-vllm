@@ -7,9 +7,60 @@ from contextlib import suppress
 from pathlib import Path
 
 class HKVSmokeWorkerExtension:
-    def inspect_hkv_smoke(self, request_id):
+    def inspect_hkv_smoke(self, request_id, action="inspect"):
         import torch
         runner = self.model_runner
+        manager = runner.hkv_warm_migration_manager
+        if action == "repeat":
+            from vllm.v1.kv_cache_state import KVCacheBlockTransition
+            from vllm.v1.worker.gpu import attn_utils
+            before = self.inspect_hkv_smoke(request_id)
+            index = runner.req_states.req_id_to_index[request_id]
+            groups = [[] for _ in runner.block_tables.block_tables]
+            for item in before["warm_residency"]:
+                _, group, logical = item["key"]
+                groups[group].append(KVCacheBlockTransition(
+                    logical, item["temporary_shadow_hot_block_id"]))
+            current = tuple(tuple(table.gpu[index, :int(count)].tolist())
+                            for table, count in zip(runner.block_tables.block_tables,
+                            runner.block_tables.num_blocks.np[:, index], strict=True))
+            real_quantize = attn_utils.quantize_hkv_blocks_to_warm
+            quantize_calls = 0
+            def counted_quantize(**kwargs):
+                nonlocal quantize_calls
+                quantize_calls += 1
+                return real_quantize(**kwargs)
+            attn_utils.quantize_hkv_blocks_to_warm = counted_quantize
+            try:
+                manager.migrate(request_id, tuple(groups), current)
+            finally:
+                attn_utils.quantize_hkv_blocks_to_warm = real_quantize
+            after = self.inspect_hkv_smoke(request_id)
+            slots_unchanged = before["request_slot_ownership"] == after["request_slot_ownership"]
+            residency_unchanged = before["warm_residency"] == after["warm_residency"]
+            after["repeat_idempotency"] = {
+                "quantization_calls": quantize_calls, "slot_ownership_unchanged": slots_unchanged,
+                "residency_unchanged": residency_unchanged,
+                "passed": quantize_calls == 0 and slots_unchanged and residency_unchanged,
+            }
+            return after
+        if action == "release":
+            before = self.inspect_hkv_smoke(request_id)
+            released_hot_ids = sorted(item["temporary_shadow_hot_block_id"] for item in before["warm_residency"])
+            released_slots = manager.release_request(request_id)
+            after = self.inspect_hkv_smoke(request_id)
+            projection = next(iter(runner.hkv_hot_to_warm_maps.values()))
+            projection_values = projection[released_hot_ids].cpu().tolist()
+            after["release_result"] = {
+                "released_slots": list(released_slots),
+                "released_projection_values": list(zip(released_hot_ids, projection_values, strict=True)),
+                "no_residency": not after["warm_residency"],
+                "no_owned_slots": not after["request_slot_ownership"],
+                "projections_invalidated": all(value == -1 for value in projection_values),
+            }
+            release = after["release_result"]
+            release["passed"] = all(release[key] for key in ("no_residency", "no_owned_slots", "projections_invalidated"))
+            return after
         mixed_read_enabled = (
             os.getenv("HKV_DEBUG_MIXED_READ", "").strip().lower()
             in {"1", "true", "yes", "on"}
@@ -17,7 +68,6 @@ class HKVSmokeWorkerExtension:
         maps = [value.cpu().tolist() for value in runner.hkv_hot_to_warm_maps.values()]
         assert not maps or all(value == maps[0] for value in maps)
         values = maps[0] if maps else []
-        manager = runner.hkv_warm_migration_manager
         allocator = manager.allocator if manager is not None else None
         allocator_mappings = [] if allocator is None else sorted(
             [source.cache_group_index, source.kernel_hot_block_id, slot]
@@ -30,12 +80,39 @@ class HKVSmokeWorkerExtension:
             table = runner.block_tables.block_tables[0].gpu
             blocks = table[index, :count].cpu().tolist()
             computed = int(runner.req_states.num_computed_tokens_np[index])
+        residency = [] if manager is None else [
+            {"key": list(key), "warm_slot_id": entry.warm_slot_id,
+             "temporary_shadow_hot_block_id": entry.temporary_shadow_hot_block_id}
+            for key, entry in sorted(manager.warm_residency.items())
+            if key[0] == request_id
+        ]
+        request_slots = [] if allocator is None else sorted(
+            [source.cache_group_index, source.kernel_hot_block_id, slot]
+            for source, slot in allocator._source_to_slot.items()
+            if allocator._source_to_owner_token[source] == request_id
+        )
+        hot_ids = sorted(item["temporary_shadow_hot_block_id"] for item in residency)
+        hot_cache_checks = []
+        for name, cache in runner.hkv_hot_kv_caches.items():
+            in_range = all(block < cache.shape[0] for block in hot_ids)
+            samples = cache[hot_ids, 0, 0, 0, 0].cpu().tolist() if in_range else []
+            hot_cache_checks.append({"name": name, "storage_bytes": cache.untyped_storage().nbytes(),
+                                     "ids_in_range": in_range, "readable_samples": samples})
+        projection_agrees = all(values[item["temporary_shadow_hot_block_id"]] == item["warm_slot_id"] for item in residency)
+        residency_matches_blocks = all(item["key"][1] == 0 and blocks[item["key"][2]] == item["temporary_shadow_hot_block_id"] for item in residency)
         return {
             "request_id": request_id, "num_computed_tokens": computed,
             "block_ids": blocks,
             "mixed_read_enabled": mixed_read_enabled,
             "warm_mappings": [[i, slot] for i, slot in enumerate(values) if slot >= 0],
             "allocator_mappings": allocator_mappings,
+            "request_slot_ownership": request_slots,
+            "warm_residency": residency,
+            "projection_matches_residency": projection_agrees,
+            "residency_matches_block_table": residency_matches_blocks,
+            "hot_copy_retained": bool(hot_ids) and all(block in blocks for block in hot_ids)
+                                 and all(check["storage_bytes"] > 0 and check["ids_in_range"] for check in hot_cache_checks),
+            "hot_cache_checks": hot_cache_checks,
             "max_gpu_allocated_bytes": torch.cuda.max_memory_allocated(),
             "max_gpu_reserved_bytes": torch.cuda.max_memory_reserved(),
         }
@@ -85,6 +162,7 @@ async def run(args):
         "Keep scheduling while the session is idle.", keep_params, "hkv-keepalive"
     )))
     token_ids, text, demotion, resumed = [], "", None, None
+    repeat_check, before_release, after_release = None, None, None
     started, idle_elapsed = time.perf_counter(), 0.0
     try:
         async for output in engine.generate(inputs(), first, "hkv-target"):
@@ -101,10 +179,18 @@ async def run(args):
                 demotion = (await engine.engine_core.collective_rpc_async(
                     "inspect_hkv_smoke", args=("hkv-target",)))[0]
                 resume.set()
-            elif turn == 2 and resumed is None:
-                resumed = (await engine.engine_core.collective_rpc_async(
-                    "inspect_hkv_smoke", args=("hkv-target",)))[0]
-                turn_two_observed.set()
+            elif turn == 2:
+                if resumed is None:
+                    resumed = (await engine.engine_core.collective_rpc_async(
+                        "inspect_hkv_smoke", args=("hkv-target",)))[0]
+                if completion.finish_reason and before_release is None:
+                    if args.mode == "mixed":
+                        repeat_check = (await engine.engine_core.collective_rpc_async(
+                            "inspect_hkv_smoke", args=("hkv-target", "repeat")))[0]
+                        before_release = repeat_check
+                        after_release = (await engine.engine_core.collective_rpc_async(
+                            "inspect_hkv_smoke", args=("hkv-target", "release")))[0]
+                    turn_two_observed.set()
     finally:
         keep.cancel()
         with suppress(asyncio.CancelledError):
@@ -146,6 +232,9 @@ async def run(args):
         assert pre_resume_mappings_persisted
         assert set(mappings).issubset(mapped_block_ids_at_resume)
         assert hot_block_ids_at_resume
+        assert demotion["projection_matches_residency"] and demotion["residency_matches_block_table"] and demotion["hot_copy_retained"]
+        assert repeat_check["repeat_idempotency"]["passed"] and before_release["projection_matches_residency"]
+        assert before_release["hot_copy_retained"] and after_release["release_result"]["passed"]
     else:
         assert not demotion["mixed_read_enabled"]
         assert not resumed["mixed_read_enabled"]
@@ -164,12 +253,15 @@ async def run(args):
             "warm_block_ids_in_resumed_block_table": mapped_block_ids_at_resume,
             "hot_block_ids_in_resumed_block_table": hot_block_ids_at_resume,
         },
+        "before_release": before_release,
+        "repeat_idempotency": None if repeat_check is None else repeat_check["repeat_idempotency"],
+        "after_release": after_release,
         "partial_tail_evidence": "Scheduler first transitioned two complete blocks; a third block transitioned only after continuation (verified in scheduler log).",
         "after_resume": resumed, "generated_token_ids": token_ids,
         "generated_text": text, "generation_time_seconds": elapsed,
         "tokens_per_second": len(token_ids) / elapsed,
         "peak_allocated_bytes": resumed["max_gpu_allocated_bytes"], "peak_reserved_bytes": resumed["max_gpu_reserved_bytes"],
-        "physical_migration_enabled": args.mode == "mixed", "migration_retains_hot_copy": args.mode == "mixed", "first_chunk_yielded": first_yielded, "continuation_yielded": continuation_yielded, "turn_output_counts": output_counts,
+        "physical_migration_enabled": args.mode == "mixed", "migration_retains_hot_copy": bool(before_release and before_release["hot_copy_retained"]), "first_chunk_yielded": first_yielded, "continuation_yielded": continuation_yielded, "turn_output_counts": output_counts,
     }
     if args.baseline_json:
         expected = json.loads(Path(args.baseline_json).read_text())["generated_token_ids"]
@@ -186,6 +278,7 @@ async def run(args):
             "first_mismatch_position": first_mismatch,
             "baseline_token_count": len(expected), "mixed_token_count": len(token_ids),
         })
+        assert result["exact_token_match"]
     path = Path(args.result_json)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(result, indent=2))
