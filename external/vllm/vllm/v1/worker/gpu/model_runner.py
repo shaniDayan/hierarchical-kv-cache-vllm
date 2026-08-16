@@ -838,12 +838,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
         finished_req_ids = scheduler_output.finished_req_ids
-        if self.hkv_warm_migration_manager is not None:
-            for req_id in finished_req_ids:
-                self.hkv_warm_migration_manager.release_request(req_id)
         preempted_req_ids = scheduler_output.preempted_req_ids
         if preempted_req_ids:
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
+        if self.hkv_warm_migration_manager is not None:
+            for req_id in finished_req_ids:
+                self.hkv_warm_migration_manager.release_request(req_id)
         for req_id in finished_req_ids:
             self._remove_request(req_id)
 

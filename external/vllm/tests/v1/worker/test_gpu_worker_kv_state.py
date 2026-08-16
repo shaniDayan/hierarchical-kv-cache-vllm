@@ -149,7 +149,19 @@ def test_insufficient_warm_capacity_leaves_state_unchanged():
     assert manager.allocator.num_owned_slots == 0
 
 
-def test_finished_request_releases_warm_state_before_runner_removal():
+@pytest.mark.parametrize(
+    ("finished_req_ids", "preempted_req_ids"),
+    [
+        ({"request"}, None),
+        (set(), {"request"}),
+        ({"request"}, {"request"}),
+    ],
+    ids=("finished", "preempted", "finished-and-preempted"),
+)
+def test_request_releases_warm_state_before_runner_removal(
+    finished_req_ids: set[str],
+    preempted_req_ids: set[str] | None,
+):
     events = []
     target = SimpleNamespace(
         hkv_warm_migration_manager=SimpleNamespace(
@@ -158,11 +170,12 @@ def test_finished_request_releases_warm_state_before_runner_removal():
         _remove_request=lambda req_id: events.append(("remove", req_id)),
     )
     output = SchedulerOutput.make_empty()
-    output.finished_req_ids = {"finished-request"}
+    output.finished_req_ids = finished_req_ids
+    output.preempted_req_ids = preempted_req_ids
 
     GPUModelRunner.finish_requests(target, output)
 
     assert events == [
-        ("release", "finished-request"),
-        ("remove", "finished-request"),
+        ("release", "request"),
+        ("remove", "request"),
     ]
