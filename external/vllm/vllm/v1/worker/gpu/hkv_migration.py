@@ -7,6 +7,8 @@ from collections.abc import Hashable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from vllm.v1.kv_cache_state import KVCacheBlockTransition
+
 
 class HKVWarmAllocatorError(RuntimeError):
     """Base error for WARM-slot allocation failures."""
@@ -61,6 +63,12 @@ class HKVWarmReservation:
     owner_token: Hashable
     _reservation_id: int = field(repr=False, compare=False)
     _allocator_token: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class HKVWarmResidency:
+    warm_slot_id: int
+    temporary_shadow_hot_block_id: int
 
 
 class HKVWarmSlotAllocator:
@@ -335,20 +343,75 @@ class HKVWarmMigrationManager:
         self.warm_kv_caches = warm_kv_caches
         self.hot_to_warm_maps = hot_to_warm_maps
         self.device = device
+        self.warm_residency: dict[tuple[str, int, int], HKVWarmResidency] = {}
 
-    def migrate(self, request_id: str, hot_block_ids: Sequence[int]) -> None:
-        """Shadow-migrate previously unmapped HOT blocks into WARM slots."""
-        sources = tuple(
-            dict.fromkeys(HKVBlockSource(0, block_id) for block_id in hot_block_ids)
+    def migrate(
+        self,
+        request_id: str,
+        changed_blocks: Sequence[Sequence[KVCacheBlockTransition]],
+        request_block_table: Sequence[Sequence[int]],
+    ) -> None:
+        """Populate logical WARM residency from validated HOT blocks."""
+        if len(changed_blocks) != len(request_block_table):
+            raise ValueError("transition and block-table groups must match")
+
+        normalized: dict[tuple[str, int, int], HKVBlockSource] = {}
+        for cache_group_index, group in enumerate(changed_blocks):
+            current_group = request_block_table[cache_group_index]
+            for block in group:
+                if not isinstance(block, KVCacheBlockTransition):
+                    raise TypeError("invalid KV-cache block transition")
+                if (
+                    not isinstance(block.logical_block_index, int)
+                    or isinstance(block.logical_block_index, bool)
+                    or block.logical_block_index < 0
+                ):
+                    raise ValueError(
+                        "logical block index must be a non-negative integer"
+                    )
+                key = (request_id, cache_group_index, block.logical_block_index)
+                source = HKVBlockSource(cache_group_index, block.source_hot_block_id)
+                previous_source = normalized.get(key)
+                if previous_source is not None and previous_source != source:
+                    raise ValueError(
+                        f"logical key {key!r} has conflicting HOT sources"
+                    )
+                normalized[key] = source
+
+                if block.logical_block_index >= len(current_group):
+                    raise ValueError(
+                        f"logical block index {block.logical_block_index} is "
+                        f"outside current block-table group {cache_group_index}"
+                    )
+                current_hot_block_id = current_group[block.logical_block_index]
+                if current_hot_block_id != block.source_hot_block_id:
+                    raise ValueError(
+                        f"source HOT block {block.source_hot_block_id} does not "
+                        f"match current block-table value {current_hot_block_id} "
+                        f"for {key!r}"
+                    )
+                existing = self.warm_residency.get(key)
+                if (
+                    existing is not None
+                    and existing.temporary_shadow_hot_block_id
+                    != block.source_hot_block_id
+                ):
+                    raise ValueError(
+                        f"logical key {key!r} already shadows "
+                        f"HOT block {existing.temporary_shadow_hot_block_id}"
+                    )
+
+        new_entries = {
+            key: source
+            for key, source in normalized.items()
+            if key not in self.warm_residency
+        }
+        if not new_entries:
+            return
+
+        reservation = self.allocator.reserve_many(
+            new_entries.values(), owner_token=request_id
         )
-        if not sources:
-            return
-
-        reservation = self.allocator.reserve_many(sources, owner_token=request_id)
-        if not reservation.newly_allocated:
-            self.allocator.commit(reservation)
-            return
-
         mappings = dict(reservation.mappings)
         new_hot_block_ids = tuple(
             source.kernel_hot_block_id for source in reservation.newly_allocated
@@ -356,33 +419,68 @@ class HKVWarmMigrationManager:
         new_warm_slot_ids = tuple(
             mappings[source] for source in reservation.newly_allocated
         )
+        projection_snapshots = []
         try:
-            from vllm.v1.worker.gpu.attn_utils import (
-                quantize_hkv_blocks_to_warm,
-            )
+            if new_hot_block_ids:
+                unique_maps = {
+                    (
+                        hot_to_warm_map.device,
+                        hot_to_warm_map.untyped_storage().data_ptr(),
+                    ): hot_to_warm_map
+                    for hot_to_warm_map in self.hot_to_warm_maps.values()
+                }
+                projection_snapshots = [
+                    (
+                        hot_to_warm_map,
+                        hot_to_warm_map[list(new_hot_block_ids)].clone(),
+                    )
+                    for hot_to_warm_map in unique_maps.values()
+                ]
+                from vllm.v1.worker.gpu.attn_utils import (
+                    quantize_hkv_blocks_to_warm,
+                )
 
-            quantize_hkv_blocks_to_warm(
-                hot_kv_caches=self.hot_kv_caches,
-                warm_kv_caches=self.warm_kv_caches,
-                hot_to_warm_maps=self.hot_to_warm_maps,
-                hot_block_ids=new_hot_block_ids,
-                warm_slot_ids=new_warm_slot_ids,
-                device=self.device,
-            )
+                quantize_hkv_blocks_to_warm(
+                    hot_kv_caches=self.hot_kv_caches,
+                    warm_kv_caches=self.warm_kv_caches,
+                    hot_to_warm_maps=self.hot_to_warm_maps,
+                    hot_block_ids=new_hot_block_ids,
+                    warm_slot_ids=new_warm_slot_ids,
+                    device=self.device,
+                )
         except Exception:
-            self.allocator.rollback(reservation)
+            try:
+                for hot_to_warm_map, previous in projection_snapshots:
+                    hot_to_warm_map[list(new_hot_block_ids)] = previous
+            finally:
+                self.allocator.rollback(reservation)
             raise
         self.allocator.commit(reservation)
+        for key, source in new_entries.items():
+            self.warm_residency[key] = HKVWarmResidency(
+                warm_slot_id=mappings[source],
+                temporary_shadow_hot_block_id=source.kernel_hot_block_id,
+            )
 
     def release_request(self, request_id: str) -> tuple[int, ...]:
         """Invalidate and release all WARM mappings owned by a request."""
         sources = self.allocator.sources_owned_by(request_id)
-        if not sources:
+        request_entries = [
+            (key, entry)
+            for key, entry in self.warm_residency.items()
+            if key[0] == request_id
+        ]
+        if not request_entries:
             return ()
-        if any(source.cache_group_index != 0 for source in sources):
+        if any(key[1] != 0 for key, _ in request_entries):
             raise ValueError("WARM migration cleanup supports only cache group 0")
 
-        hot_block_ids = [source.kernel_hot_block_id for source in sources]
+        hot_block_ids = list(
+            dict.fromkeys(
+                entry.temporary_shadow_hot_block_id
+                for _, entry in request_entries
+            )
+        )
         unique_maps = {}
         for hot_to_warm_map in self.hot_to_warm_maps.values():
             storage_key = (
@@ -393,4 +491,6 @@ class HKVWarmMigrationManager:
         for hot_to_warm_map in unique_maps.values():
             hot_to_warm_map[hot_block_ids] = -1
 
+        for key, _ in request_entries:
+            del self.warm_residency[key]
         return self.allocator.release_sources(sources)

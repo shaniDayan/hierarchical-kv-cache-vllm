@@ -579,12 +579,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     "Physical migration currently supports exactly one "
                     "KV-cache group"
                 )
+            req_index = self.req_states.req_id_to_index[transition.request_id]
+            group_num_blocks = self.block_tables.num_blocks.np[:, req_index]
+            request_block_table = tuple(
+                tuple(
+                    block_table.gpu[
+                        req_index, : int(num_blocks)
+                    ].tolist()
+                )
+                for block_table, num_blocks in zip(
+                    self.block_tables.block_tables,
+                    group_num_blocks,
+                    strict=True,
+                )
+            )
             self.hkv_warm_migration_manager.migrate(
                 transition.request_id,
-                [
-                    block.source_hot_block_id
-                    for block in transition.changed_blocks[0]
-                ],
+                transition.changed_blocks,
+                request_block_table,
             )
 
     def _init_kv_zero_meta(self) -> None:

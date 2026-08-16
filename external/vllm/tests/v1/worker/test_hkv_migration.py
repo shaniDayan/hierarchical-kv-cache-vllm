@@ -4,6 +4,8 @@
 import pytest
 import torch
 
+from vllm.v1.kv_cache_state import KVCacheBlockTransition
+from vllm.v1.worker.gpu import attn_utils
 from vllm.v1.worker.gpu.hkv_migration import (
     HKVBlockSource,
     HKVWarmCapacityError,
@@ -15,6 +17,10 @@ from vllm.v1.worker.gpu.hkv_migration import (
 
 def source(group: int, block: int) -> HKVBlockSource:
     return HKVBlockSource(group, block)
+
+
+def transition(logical_block: int, hot_block: int) -> KVCacheBlockTransition:
+    return KVCacheBlockTransition(logical_block, hot_block)
 
 
 def test_allocator_determinism_identity_and_reuse():
@@ -83,46 +89,110 @@ def test_allocator_failures_are_atomic_and_preserve_existing_mappings():
     allocator.validate_invariants()
 
 
-def test_release_request_invalidates_owned_maps_and_reuses_slots():
+def test_logical_residency_is_idempotent_and_released(monkeypatch):
     hot_to_warm_map = torch.full((16,), -1, dtype=torch.int32)
+    hot_kv_caches = {"layer": object()}
     manager = HKVWarmMigrationManager(
         warm_capacity=3,
-        hot_kv_caches={},
+        hot_kv_caches=hot_kv_caches,
         warm_kv_caches={},
         hot_to_warm_maps={"layer": hot_to_warm_map, "alias": hot_to_warm_map},
         device="cpu",
     )
-    request_sources = (source(0, 3), source(0, 7))
-    request_reservation = manager.allocator.reserve_many(
-        request_sources, owner_token="request-a"
+
+    quantized = []
+
+    def quantize(**kwargs):
+        quantized.append((kwargs["hot_block_ids"], kwargs["warm_slot_ids"]))
+        hot_to_warm_map[list(kwargs["hot_block_ids"])] = torch.tensor(
+            kwargs["warm_slot_ids"], dtype=torch.int32
+        )
+
+    monkeypatch.setattr(attn_utils, "quantize_hkv_blocks_to_warm", quantize)
+    changed = ([transition(0, 3), transition(1, 7)],)
+    manager.migrate("request-a", changed, ((3, 7),))
+    manager.migrate("request-a", changed, ((3, 7),))
+    manager.migrate("request-b", ([transition(0, 11)],), ((11,),))
+
+    assert quantized == [((3, 7), (0, 1)), ((11,), (2,))]
+    assert manager.warm_residency[("request-a", 0, 0)].warm_slot_id == 0
+    assert (
+        manager.warm_residency[("request-a", 0, 1)]
+        .temporary_shadow_hot_block_id
+        == 7
     )
-    manager.allocator.commit(request_reservation)
-    other_source = source(0, 11)
-    other_reservation = manager.allocator.reserve_many(
-        (other_source,), owner_token="request-b"
-    )
-    manager.allocator.commit(other_reservation)
-    published_mappings = request_reservation.mappings + other_reservation.mappings
-    for block_source, slot in published_mappings:
-        hot_to_warm_map[block_source.kernel_hot_block_id] = slot
+    assert manager.hot_kv_caches is hot_kv_caches
 
     assert manager.release_request("request-a") == (0, 1)
     assert hot_to_warm_map[3].item() == -1
     assert hot_to_warm_map[7].item() == -1
     assert hot_to_warm_map[11].item() == 2
-    assert all(
-        manager.allocator.lookup(source_) is None for source_ in request_sources
-    )
-    assert manager.allocator.owner_token_of(other_source) == "request-b"
+    assert not any(key[0] == "request-a" for key in manager.warm_residency)
+    assert manager.allocator.owner_token_of(source(0, 11)) == "request-b"
 
     assert manager.release_request("request-a") == ()
-    replacement_sources = (source(0, 5), source(0, 13))
-    replacement = manager.allocator.reserve_many(
-        replacement_sources, owner_token="request-c"
+    manager.migrate(
+        "request-c",
+        ([transition(0, 5), transition(1, 13)],),
+        ((5, 13),),
     )
-    assert replacement.mappings == (
-        (replacement_sources[0], 0),
-        (replacement_sources[1], 1),
+    assert manager.warm_residency[("request-c", 0, 0)].warm_slot_id == 0
+    assert manager.warm_residency[("request-c", 0, 1)].warm_slot_id == 1
+    manager.allocator.validate_invariants()
+
+
+@pytest.mark.parametrize(
+    ("case", "error", "message"),
+    [
+        ("stale_source", ValueError, "does not match"),
+        ("conflicting_duplicate", ValueError, "conflicting HOT sources"),
+        ("capacity", HKVWarmCapacityError, "only 1 available"),
+        ("quantization", RuntimeError, "quantization failed"),
+    ],
+)
+def test_population_failures_preserve_existing_residency(
+    monkeypatch, case, error, message
+):
+    hot_to_warm_map = torch.full((16,), -1, dtype=torch.int32)
+    manager = HKVWarmMigrationManager(
+        warm_capacity=2,
+        hot_kv_caches={},
+        warm_kv_caches={},
+        hot_to_warm_maps={"layer": hot_to_warm_map},
+        device="cpu",
     )
-    manager.allocator.commit(replacement)
+    fail_quantization = False
+
+    def quantize(**kwargs):
+        hot_to_warm_map[list(kwargs["hot_block_ids"])] = torch.tensor(
+            kwargs["warm_slot_ids"], dtype=torch.int32
+        )
+        if fail_quantization:
+            raise RuntimeError("quantization failed")
+
+    monkeypatch.setattr(attn_utils, "quantize_hkv_blocks_to_warm", quantize)
+    manager.migrate("request-a", ([transition(0, 3)],), ((3,),))
+    existing_residency = manager.warm_residency.copy()
+    existing_projection = hot_to_warm_map.clone()
+
+    if case == "stale_source":
+        changed, block_table = ([transition(0, 7)],), ((8,),)
+    elif case == "conflicting_duplicate":
+        changed = ([transition(0, 7), transition(0, 8)],)
+        block_table = ((7,),)
+    elif case == "capacity":
+        changed = ([transition(0, 7), transition(1, 8)],)
+        block_table = ((7, 8),)
+    else:
+        changed, block_table = ([transition(0, 7)],), ((7,),)
+        fail_quantization = True
+
+    with pytest.raises(error, match=message):
+        manager.migrate("request-b", changed, block_table)
+
+    assert manager.warm_residency == existing_residency
+    assert torch.equal(hot_to_warm_map, existing_projection)
+    assert manager.allocator.num_owned_slots == 1
+    assert manager.allocator.lookup(source(0, 3)) == 0
+    assert manager.allocator.lookup(source(0, 7)) is None
     manager.allocator.validate_invariants()

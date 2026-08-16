@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_state import (
@@ -141,11 +142,18 @@ def test_enabled_migration_rejects_unsupported_configurations(
         call()
 
 
-def test_shadow_migration_receives_source_hot_block_ids():
+def test_shadow_migration_preserves_logical_and_cache_group_identity():
     migration_manager = SimpleNamespace(migrate=MagicMock())
     target = SimpleNamespace(
         hkv_warm_migration_manager=migration_manager,
-        block_tables=SimpleNamespace(blocks_per_kv_block=[1]),
+        block_tables=SimpleNamespace(
+            blocks_per_kv_block=[1],
+            block_tables=[
+                SimpleNamespace(gpu=torch.tensor([[0, 1, 7, 3, 4, 11]]))
+            ],
+            num_blocks=SimpleNamespace(np=torch.tensor([[6]])),
+        ),
+        req_states=SimpleNamespace(req_id_to_index={"request": 0}),
     )
     transition = make_transition(
         changed_blocks=(
@@ -158,7 +166,11 @@ def test_shadow_migration_receives_source_hot_block_ids():
 
     GPUModelRunner.handle_kv_cache_state_transitions(target, [transition])
 
-    migration_manager.migrate.assert_called_once_with("request", [7, 11])
+    migration_manager.migrate.assert_called_once_with(
+        "request",
+        transition.changed_blocks,
+        ((0, 1, 7, 3, 4, 11),),
+    )
 
 
 def test_insufficient_warm_capacity_leaves_state_unchanged():
@@ -172,10 +184,15 @@ def test_insufficient_warm_capacity_leaves_state_unchanged():
     )
 
     with pytest.raises(HKVWarmCapacityError):
-        manager.migrate("request", [2, 7])
+        manager.migrate(
+            "request",
+            ([KVCacheBlockTransition(0, 2), KVCacheBlockTransition(1, 7)],),
+            ((2, 7),),
+        )
 
     assert hot_to_warm_maps == {}
     assert manager.allocator.num_owned_slots == 0
+    assert manager.warm_residency == {}
 
 
 @pytest.mark.parametrize(
