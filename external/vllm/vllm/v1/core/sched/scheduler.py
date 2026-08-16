@@ -444,12 +444,12 @@ class Scheduler(SchedulerInterface):
         for transition in kv_state_transitions:
             logger.info(
                 "Idle KV state transition: request_id=%s %s->%s "
-                "changed_blocks=%d changed_block_ids_by_group=%s",
+                "changed_blocks=%d changed_blocks_by_group=%s",
                 transition.request_id,
                 transition.previous_state.value,
                 transition.new_state.value,
-                sum(len(group) for group in transition.changed_block_ids),
-                transition.changed_block_ids,
+                sum(len(group) for group in transition.changed_blocks),
+                transition.changed_blocks,
             )
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
@@ -1285,7 +1285,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             request.kv_cache_state = new_state
-            changed_block_ids = self.kv_cache_manager.apply_request_kv_state(
+            changed_blocks = self.kv_cache_manager.apply_request_kv_state(
                 request.request_id,
                 new_state,
                 num_computed_tokens=request.num_computed_tokens,
@@ -1295,7 +1295,7 @@ class Scheduler(SchedulerInterface):
                     request_id=request.request_id,
                     previous_state=previous_state,
                     new_state=new_state,
-                    changed_block_ids=changed_block_ids,
+                    changed_blocks=changed_blocks,
                 )
             )
 

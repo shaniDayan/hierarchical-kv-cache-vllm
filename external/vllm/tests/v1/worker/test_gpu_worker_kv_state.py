@@ -8,7 +8,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_state import KVBlockState, KVCacheStateTransition
+from vllm.v1.kv_cache_state import (
+    KVBlockState,
+    KVCacheBlockTransition,
+    KVCacheStateTransition,
+)
 from vllm.v1.worker.gpu.hkv_migration import (
     HKVWarmCapacityError,
     HKVWarmMigrationManager,
@@ -20,15 +24,15 @@ from vllm.v1.worker.gpu_worker import Worker
 def make_transition(
     previous_state: KVBlockState = KVBlockState.HOT,
     new_state: KVBlockState = KVBlockState.WARM,
-    changed_block_ids: tuple[list[int], ...] | None = None,
+    changed_blocks: tuple[list[KVCacheBlockTransition], ...] | None = None,
 ) -> KVCacheStateTransition:
-    if changed_block_ids is None:
-        changed_block_ids = ([1],)
+    if changed_blocks is None:
+        changed_blocks = ([KVCacheBlockTransition(0, 1)],)
     return KVCacheStateTransition(
         request_id="request",
         previous_state=previous_state,
         new_state=new_state,
-        changed_block_ids=changed_block_ids,
+        changed_blocks=changed_blocks,
     )
 
 
@@ -112,7 +116,12 @@ def test_enabled_migration_rejects_unsupported_configurations(
             block_tables=SimpleNamespace(blocks_per_kv_block=[1]),
         )
         if case == "multiple_groups":
-            transition = make_transition(changed_block_ids=([1], [2]))
+            transition = make_transition(
+                changed_blocks=(
+                    [KVCacheBlockTransition(0, 1)],
+                    [KVCacheBlockTransition(0, 2)],
+                )
+            )
         elif case == "block_expansion":
             target.block_tables.blocks_per_kv_block = [2]
         elif case == "hot_to_cold":
@@ -130,6 +139,26 @@ def test_enabled_migration_rejects_unsupported_configurations(
 
     with pytest.raises(ValueError, match=message):
         call()
+
+
+def test_shadow_migration_receives_source_hot_block_ids():
+    migration_manager = SimpleNamespace(migrate=MagicMock())
+    target = SimpleNamespace(
+        hkv_warm_migration_manager=migration_manager,
+        block_tables=SimpleNamespace(blocks_per_kv_block=[1]),
+    )
+    transition = make_transition(
+        changed_blocks=(
+            [
+                KVCacheBlockTransition(2, 7),
+                KVCacheBlockTransition(5, 11),
+            ],
+        )
+    )
+
+    GPUModelRunner.handle_kv_cache_state_transitions(target, [transition])
+
+    migration_manager.migrate.assert_called_once_with("request", [7, 11])
 
 
 def test_insufficient_warm_capacity_leaves_state_unchanged():

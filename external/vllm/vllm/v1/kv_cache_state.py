@@ -13,18 +13,27 @@ class KVBlockState(str, Enum):
     COLD = "cold"
 
 
+@dataclass(frozen=True, slots=True)
+class KVCacheBlockTransition:
+    """One changed request block and its current physical HOT source."""
+
+    logical_block_index: int
+    source_hot_block_id: int
+
+
 @dataclass
 class KVCacheStateTransition:
     """A request KV-state transition and its affected private blocks.
 
-    ``changed_block_ids`` preserves cache-group structure and contains only
-    private eligible blocks whose metadata changed to ``new_state``.
+    ``changed_blocks`` preserves cache-group structure. Each entry identifies
+    both the block's logical position in the request and the physical HOT block
+    containing its current KV data.
     """
 
     request_id: str
     previous_state: KVBlockState
     new_state: KVBlockState
-    changed_block_ids: tuple[list[int], ...]
+    changed_blocks: tuple[list[KVCacheBlockTransition], ...]
 
 
 def classify_request_kv_state(

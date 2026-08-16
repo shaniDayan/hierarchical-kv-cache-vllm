@@ -574,13 +574,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     f"got {transition.previous_state.value}->"
                     f"{transition.new_state.value}"
                 )
-            if len(transition.changed_block_ids) != 1:
+            if len(transition.changed_blocks) != 1:
                 raise ValueError(
                     "Physical migration currently supports exactly one "
                     "KV-cache group"
                 )
             self.hkv_warm_migration_manager.migrate(
-                transition.request_id, transition.changed_block_ids[0]
+                transition.request_id,
+                [
+                    block.source_hot_block_id
+                    for block in transition.changed_blocks[0]
+                ],
             )
 
     def _init_kv_zero_meta(self) -> None:

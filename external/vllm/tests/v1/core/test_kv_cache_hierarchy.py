@@ -7,7 +7,7 @@ import pytest
 
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.kv_cache_state import KVBlockState
+from vllm.v1.kv_cache_state import KVBlockState, KVCacheBlockTransition
 
 
 def make_manager(
@@ -45,8 +45,8 @@ def test_apply_request_state_private_shared_and_idempotent():
     manager = make_manager(groups, (4, 4))
 
     assert manager.apply_request_kv_state("request", KVBlockState.WARM) == (
-        [0],
-        [10],
+        [KVCacheBlockTransition(logical_block_index=0, source_hot_block_id=0)],
+        [KVCacheBlockTransition(logical_block_index=0, source_hot_block_id=10)],
     )
     assert private.hierarchy_state is KVBlockState.WARM
     assert unchanged.hierarchy_state is KVBlockState.WARM
@@ -64,16 +64,16 @@ def test_apply_request_state_private_shared_and_idempotent():
     [
         ((4,), 0, ([],)),
         ((4,), 3, ([],)),
-        ((4,), 4, ([0],)),
-        ((4,), 5, ([0],)),
-        ((4,), 8, ([0, 1],)),
-        ((4, 8), 8, ([0, 1], [10])),
+        ((4,), 4, ([(0, 0)],)),
+        ((4,), 5, ([(0, 0)],)),
+        ((4,), 8, ([(0, 0), (1, 1)],)),
+        ((4, 8), 8, ([(0, 0), (1, 1)], [(0, 10)])),
     ],
 )
 def test_apply_demotion_uses_complete_blocks_per_group(
     block_sizes: tuple[int, ...],
     num_computed_tokens: int,
-    expected: tuple[list[int], ...],
+    expected: tuple[list[tuple[int, int]], ...],
 ):
     groups = tuple(
         [make_block(group * 10 + index) for index in range(2)]
@@ -87,8 +87,13 @@ def test_apply_demotion_uses_complete_blocks_per_group(
         num_computed_tokens=num_computed_tokens,
     )
 
-    assert changed == expected
-    for group, changed_ids in zip(groups, expected, strict=True):
+    expected_transitions = tuple(
+        [KVCacheBlockTransition(index, block_id) for index, block_id in group]
+        for group in expected
+    )
+    assert changed == expected_transitions
+    for group, changed_group in zip(groups, expected_transitions, strict=True):
+        changed_ids = {block.source_hot_block_id for block in changed_group}
         assert [block.hierarchy_state for block in group] == [
             KVBlockState.COLD
             if block.block_id in changed_ids

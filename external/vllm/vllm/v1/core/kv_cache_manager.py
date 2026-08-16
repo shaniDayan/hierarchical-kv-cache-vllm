@@ -16,7 +16,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
-from vllm.v1.kv_cache_state import KVBlockState
+from vllm.v1.kv_cache_state import KVBlockState, KVCacheBlockTransition
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
@@ -591,8 +591,8 @@ class KVCacheManager:
         state: KVBlockState,
         *,
         num_computed_tokens: int | None = None,
-    ) -> tuple[list[int], ...]:
-        """Apply a request-level state and return changed private block IDs.
+    ) -> tuple[list[KVCacheBlockTransition], ...]:
+        """Apply a request-level state and return changed private blocks.
 
         Shared blocks are kept HOT but excluded from the returned request-level
         transition payload. When a computed-token boundary is supplied,
@@ -602,10 +602,10 @@ class KVCacheManager:
         if num_computed_tokens is not None and num_computed_tokens < 0:
             raise ValueError("num_computed_tokens must be non-negative")
 
-        changed_block_ids: list[list[int]] = []
+        changed_blocks: list[list[KVCacheBlockTransition]] = []
         request_blocks = self.get_blocks(request_id).blocks
         for group, block_size in zip(request_blocks, self.block_sizes, strict=True):
-            changed_group: list[int] = []
+            changed_group: list[KVCacheBlockTransition] = []
             num_complete_blocks = (
                 num_computed_tokens // block_size
                 if num_computed_tokens is not None
@@ -631,10 +631,15 @@ class KVCacheManager:
                     continue
 
                 block.hierarchy_state = state
-                changed_group.append(block.block_id)
-            changed_block_ids.append(changed_group)
+                changed_group.append(
+                    KVCacheBlockTransition(
+                        logical_block_index=block_index,
+                        source_hot_block_id=block.block_id,
+                    )
+                )
+            changed_blocks.append(changed_group)
 
-        return tuple(changed_block_ids)
+        return tuple(changed_blocks)
 
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
         """Get the block ids of a request."""

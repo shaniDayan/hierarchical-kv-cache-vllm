@@ -20,7 +20,11 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
 )
-from vllm.v1.kv_cache_state import KVBlockState, KVCacheStateTransition
+from vllm.v1.kv_cache_state import (
+    KVBlockState,
+    KVCacheBlockTransition,
+    KVCacheStateTransition,
+)
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.structured_output import StructuredOutputManager
@@ -61,6 +65,7 @@ def create_scheduler(
     vllm_config.model_config = MagicMock()
     vllm_config.model_config.skip_tokenizer_init = True
     vllm_config.model_config.is_multimodal_model = False
+    vllm_config.model_config.is_encoder_decoder = False
     vllm_config.model_config.max_model_len = 1024
     vllm_config.model_config.enable_return_routed_experts = False
     vllm_config.cache_config = MagicMock()
@@ -112,13 +117,15 @@ class TestStreamingScheduler(unittest.TestCase):
         block_groups = scheduler.kv_cache_manager.get_blocks(
             session.request_id
         ).blocks
-        complete_block_ids = tuple([group[0].block_id] for group in block_groups)
+        complete_blocks = tuple(
+            [KVCacheBlockTransition(0, group[0].block_id)] for group in block_groups
+        )
         assert transitions == [
             KVCacheStateTransition(
                 request_id=session.request_id,
                 previous_state=KVBlockState.HOT,
                 new_state=KVBlockState.WARM,
-                changed_block_ids=complete_block_ids,
+                changed_blocks=complete_blocks,
             )
         ]
         assert all(
@@ -545,7 +552,7 @@ class TestStreamingScheduler(unittest.TestCase):
         eco_cycle2 = eco_dict_cycle2[session.client_index].outputs[0]
         assert eco_cycle2.finish_reason == FinishReason.STOP
         assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
-        assert session in scheduler.waiting
+        assert session in scheduler.skipped_waiting
         assert session._all_token_ids == [1, 2, 3, 10, STOP_TOKEN]
 
         # CRITICAL ASSERTION: Cached prompt_token_ids STILL must not have changed

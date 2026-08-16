@@ -61,7 +61,11 @@ from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.kv_cache_state import KVBlockState, KVCacheStateTransition
+from vllm.v1.kv_cache_state import (
+    KVBlockState,
+    KVCacheBlockTransition,
+    KVCacheStateTransition,
+)
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     DraftTokenIds,
@@ -854,17 +858,26 @@ class Worker(WorkerBase):
                     f"{transition.previous_state.value}->"
                     f"{transition.new_state.value}"
                 )
-            for group in transition.changed_block_ids:
-                for block_id in group:
-                    if (
-                        not isinstance(block_id, int)
-                        or isinstance(block_id, bool)
-                        or block_id < 0
-                    ):
-                        raise ValueError(
-                            "KV-cache transition block IDs must be "
-                            f"non-negative integers; got {block_id!r}"
+            for group in transition.changed_blocks:
+                for block in group:
+                    if not isinstance(block, KVCacheBlockTransition):
+                        raise TypeError(
+                            "KV-cache transition groups must contain "
+                            "KVCacheBlockTransition values"
                         )
+                    for name, value in (
+                        ("logical block index", block.logical_block_index),
+                        ("source HOT block ID", block.source_hot_block_id),
+                    ):
+                        if (
+                            not isinstance(value, int)
+                            or isinstance(value, bool)
+                            or value < 0
+                        ):
+                            raise ValueError(
+                                f"KV-cache transition {name} must be a "
+                                f"non-negative integer; got {value!r}"
+                            )
 
         if not is_hkv_multi_block_warm_migration_enabled():
             logger.debug("Validated %d KV-cache state transitions", len(transitions))
