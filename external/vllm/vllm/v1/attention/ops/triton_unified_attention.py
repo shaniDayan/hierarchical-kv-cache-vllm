@@ -260,7 +260,7 @@ def kernel_unified_attention(
     # Experimental mixed HOT/WARM cache state.
     hkv_warm_k_ptr=None,
     hkv_warm_v_ptr=None,
-    hkv_hot_to_warm_map_ptr=None,
+    hkv_warm_slot_table_ptr=None,
     hkv_k_scale_cache_ptr=None,
     hkv_v_scale_cache_ptr=None,
     stride_hkv_k_blk: tl.int64 = None,
@@ -433,17 +433,24 @@ def kernel_unified_attention(
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
-
         if USE_HKV_MIXED_READ:
             warm_block_idx = tl.load(
-                hkv_hot_to_warm_map_ptr + physical_block_idx,
+                hkv_warm_slot_table_ptr
+                + block_table_offset
+                + seq_offset // BLOCK_SIZE,
                 mask=tile_mask,
                 other=-1,
             ).to(tl.int64)
             is_warm = warm_block_idx >= 0
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+                mask=tile_mask & ~is_warm,
+                other=0,
+            ).to(tl.int64)
+        else:
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
 
         if USE_TD:
             # All TILE_SIZE slots within a single KV tile map to one
@@ -921,7 +928,7 @@ def unified_attention(
     use_td: bool = False,
     hkv_warm_k=None,
     hkv_warm_v=None,
-    hkv_hot_to_warm_map=None,
+    hkv_warm_slot_table=None,
     hkv_k_scale_cache=None,
     hkv_v_scale_cache=None,
 ):
@@ -942,7 +949,7 @@ def unified_attention(
         for tensor in (
             hkv_warm_k,
             hkv_warm_v,
-            hkv_hot_to_warm_map,
+            hkv_warm_slot_table,
             hkv_k_scale_cache,
             hkv_v_scale_cache,
         )
@@ -1003,14 +1010,14 @@ def unified_attention(
         ):
             raise ValueError("Mixed HKV scale caches must use torch.float32")
         if (
-            hkv_hot_to_warm_map.dtype != torch.int32
-            or hkv_hot_to_warm_map.ndim != 1
-            or hkv_hot_to_warm_map.shape[0] != k.shape[0]
-            or hkv_hot_to_warm_map.stride(0) != 1
+            hkv_warm_slot_table.dtype != torch.int32
+            or hkv_warm_slot_table.ndim != 2
+            or hkv_warm_slot_table.shape[0] < num_seqs
+            or hkv_warm_slot_table.shape[1] != block_table.shape[1]
+            or hkv_warm_slot_table.stride() != block_table.stride()
         ):
             raise ValueError(
-                "HKV map must be contiguous one-dimensional torch.int32 "
-                "with one entry per HOT block"
+                "Logical HKV table must be aligned with the HOT block table"
             )
         if (
             hkv_warm_k.ndim != 4
@@ -1040,12 +1047,14 @@ def unified_attention(
                 v,
                 hkv_warm_k,
                 hkv_warm_v,
-                hkv_hot_to_warm_map,
+                hkv_warm_slot_table,
                 hkv_k_scale_cache,
                 hkv_v_scale_cache,
             )
         ):
-            raise ValueError("HOT, WARM, scale, and HKV map devices must match")
+            raise ValueError(
+                "HOT, WARM, scale, and logical HKV table devices must match"
+            )
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -1197,7 +1206,7 @@ def unified_attention(
         hkv_vs_blk, hkv_vs_slot, hkv_vs_head = hkv_vs_strides
         hkv_warm_k_ptr = hkv_warm_k
         hkv_warm_v_ptr = hkv_warm_v
-        hkv_map_ptr = hkv_hot_to_warm_map
+        hkv_warm_table_ptr = hkv_warm_slot_table
         hkv_k_scale_ptr = hkv_k_scale_cache
         hkv_v_scale_ptr = hkv_v_scale_cache
     else:
@@ -1208,7 +1217,7 @@ def unified_attention(
         # Valid stand-in pointers; the constexpr-false path never reads them.
         hkv_warm_k_ptr = k
         hkv_warm_v_ptr = v
-        hkv_map_ptr = block_table
+        hkv_warm_table_ptr = block_table
         hkv_k_scale_ptr = k
         hkv_v_scale_ptr = v
     # 3D needs real segm tensors; 2D never touches them but Triton wants
@@ -1249,7 +1258,7 @@ def unified_attention(
         v_scale_cache_ptr=v_scale_ptr,
         hkv_warm_k_ptr=hkv_warm_k_ptr,
         hkv_warm_v_ptr=hkv_warm_v_ptr,
-        hkv_hot_to_warm_map_ptr=hkv_map_ptr,
+        hkv_warm_slot_table_ptr=hkv_warm_table_ptr,
         hkv_k_scale_cache_ptr=hkv_k_scale_ptr,
         hkv_v_scale_cache_ptr=hkv_v_scale_ptr,
         scale=softmax_scale,

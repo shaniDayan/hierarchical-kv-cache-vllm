@@ -154,7 +154,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.hkv_hot_kv_caches: dict[str, torch.Tensor] = {}
         self.hkv_warm_kv_caches: dict[str, torch.Tensor] = {}
         self.hkv_hot_to_warm_maps: dict[str, torch.Tensor] = {}
+        self.hkv_warm_slot_table: torch.Tensor | None = None
         self.hkv_warm_migration_manager: HKVWarmMigrationManager | None = None
+        self._hkv_warm_slot_table_req_ids: tuple[str, ...] | None = None
+        self._hkv_warm_slot_table_revision = -1
+        self._hkv_warm_slot_table_num_reqs_after_padding = -1
         self._hkv_debug_demote_done = False
 
         self.vocab_size = self.model_config.get_vocab_size()
@@ -542,6 +546,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     "Experimental multi-block WARM migration requires "
                     "blocks_per_kv_block == 1"
                 )
+            self.hkv_warm_slot_table = torch.full_like(
+                self.block_tables.input_block_tables[0], -1
+            )
+            for layer_name in self.hkv_warm_kv_caches:
+                self.compilation_config.static_forward_context[
+                    layer_name
+                ]._hkv_warm_slot_table = self.hkv_warm_slot_table
             warm_capacity = next(iter(self.hkv_warm_kv_caches.values())).shape[0]
             self.hkv_warm_migration_manager = HKVWarmMigrationManager(
                 warm_capacity=warm_capacity,
@@ -1119,6 +1130,59 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def prepare_attn(
         self, input_batch: InputBatch
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        if self.hkv_warm_slot_table is not None:
+            assert self.hkv_warm_migration_manager is not None
+            active_req_ids = tuple(input_batch.req_ids)
+            residency_revision = (
+                self.hkv_warm_migration_manager.warm_residency_revision
+            )
+            if (
+                active_req_ids != self._hkv_warm_slot_table_req_ids
+                or residency_revision != self._hkv_warm_slot_table_revision
+                or input_batch.num_reqs_after_padding
+                != self._hkv_warm_slot_table_num_reqs_after_padding
+            ):
+                warm_slot_table = self.hkv_warm_slot_table
+                warm_slot_table[: input_batch.num_reqs_after_padding].fill_(-1)
+                active_rows = {
+                    req_id: row for row, req_id in enumerate(active_req_ids)
+                }
+                rows = []
+                logical_block_indices = []
+                warm_slot_ids = []
+                for (
+                    request_id,
+                    cache_group_index,
+                    logical_block_index,
+                ), residency in (
+                    self.hkv_warm_migration_manager.warm_residency.items()
+                ):
+                    row = active_rows.get(request_id)
+                    if row is None:
+                        continue
+                    if cache_group_index != 0:
+                        raise ValueError(
+                            "Logical WARM attention supports only cache group 0"
+                        )
+                    if logical_block_index >= warm_slot_table.shape[1]:
+                        raise ValueError(
+                            f"logical WARM block index {logical_block_index} "
+                            "exceeds the attention block-table width"
+                        )
+                    rows.append(row)
+                    logical_block_indices.append(logical_block_index)
+                    warm_slot_ids.append(residency.warm_slot_id)
+                if rows:
+                    warm_slot_table[rows, logical_block_indices] = torch.tensor(
+                        warm_slot_ids,
+                        dtype=torch.int32,
+                        device=warm_slot_table.device,
+                    )
+                self._hkv_warm_slot_table_req_ids = active_req_ids
+                self._hkv_warm_slot_table_revision = residency_revision
+                self._hkv_warm_slot_table_num_reqs_after_padding = (
+                    input_batch.num_reqs_after_padding
+                )
         # Block tables: num_kv_cache_groups x [num_reqs_padded, max_num_blocks].
         block_tables = self.block_tables.gather_block_tables(
             input_batch.idx_mapping,

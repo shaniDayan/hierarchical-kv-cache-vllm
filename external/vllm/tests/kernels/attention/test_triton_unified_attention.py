@@ -8,8 +8,10 @@ import torch
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.attention.backends.triton_attn import _get_hkv_warm_scale_views
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import KVQuantMode
+from vllm.v1.worker.gpu.attn_utils import quantize_hkv_blocks_to_warm
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -223,6 +225,69 @@ def test_triton_unified_attn(
         torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
         f"{torch.max(torch.abs(output - ref_output))}",
     )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="Logical WARM migration requires CUDA"
+)
+@torch.inference_mode()
+def test_logical_warm_read_ignores_overwritten_hot_source() -> None:
+    torch.set_default_device(DEVICE_TYPE)
+    block_size = 16
+    head_size = 128
+    hot_cache = torch.zeros(
+        (2, 2, block_size, 1, head_size), dtype=torch.float16
+    )
+    hot_cache[1, 0].fill_(1)
+    hot_cache[1, 1].fill_(3)
+    warm_cache = torch.zeros(
+        (1, 2, block_size, 1, head_size + 4), dtype=torch.int8
+    )
+    shadow_projection = torch.full((2,), -1, dtype=torch.int32)
+    quantize_hkv_blocks_to_warm(
+        hot_kv_caches={"layer": hot_cache},
+        warm_kv_caches={"layer": warm_cache},
+        hot_to_warm_maps={"layer": shadow_projection},
+        hot_block_ids=(1,),
+        warm_slot_ids=(0,),
+        device=hot_cache.device,
+    )
+
+    logical_warm_table = torch.full((1, 1), -1, dtype=torch.int32)
+    logical_warm_table[0, 0] = 0
+    shadow_projection.fill_(-1)
+    hot_cache[1, 0].fill_(11)
+    hot_cache[1, 1].fill_(19)
+    query = torch.zeros((1, 1, head_size), dtype=torch.float16)
+    output = torch.empty_like(query)
+    warm_k, warm_v = warm_cache.unbind(1)
+    warm_k_scales, warm_v_scales, _ = _get_hkv_warm_scale_views(warm_cache)
+
+    unified_attention(
+        q=query,
+        k=hot_cache[:, 0],
+        v=hot_cache[:, 1],
+        out=output,
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+        max_seqlen_q=1,
+        seqused_k=torch.tensor([block_size], dtype=torch.int32),
+        max_seqlen_k=block_size,
+        softmax_scale=1.0,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=torch.tensor([[1]], dtype=torch.int32),
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        hkv_warm_k=warm_k,
+        hkv_warm_v=warm_v,
+        hkv_warm_slot_table=logical_warm_table,
+        hkv_k_scale_cache=warm_k_scales,
+        hkv_v_scale_cache=warm_v_scales,
+    )
+
+    torch.testing.assert_close(output, torch.full_like(output, 3), atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(

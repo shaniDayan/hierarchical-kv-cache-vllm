@@ -17,6 +17,7 @@ from vllm.v1.kv_cache_state import (
 from vllm.v1.worker.gpu.hkv_migration import (
     HKVWarmCapacityError,
     HKVWarmMigrationManager,
+    HKVWarmResidency,
 )
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
@@ -171,6 +172,81 @@ def test_shadow_migration_preserves_logical_and_cache_group_identity():
         transition.changed_blocks,
         ((0, 1, 7, 3, 4, 11),),
     )
+
+
+def test_logical_warm_table_rebuild_clears_reused_request_row():
+    warm_slot_table = torch.full((3, 4), 9, dtype=torch.int32)
+    warm_residency = {
+        ("request-a", 0, 2): HKVWarmResidency(
+            warm_slot_id=5,
+            temporary_shadow_hot_block_id=7,
+        )
+    }
+    residency_items = MagicMock(wraps=warm_residency.items)
+    migration_manager = SimpleNamespace(
+        warm_residency=SimpleNamespace(items=residency_items),
+        warm_residency_revision=1,
+    )
+    block_tables = SimpleNamespace(
+        gather_block_tables=MagicMock(
+            return_value=(torch.zeros((3, 4), dtype=torch.int32),)
+        ),
+        compute_slot_mappings=MagicMock(return_value=torch.zeros((1, 1))),
+    )
+    target = SimpleNamespace(
+        hkv_warm_slot_table=warm_slot_table,
+        hkv_warm_migration_manager=migration_manager,
+        _hkv_warm_slot_table_req_ids=None,
+        _hkv_warm_slot_table_revision=-1,
+        _hkv_warm_slot_table_num_reqs_after_padding=-1,
+        block_tables=block_tables,
+    )
+    input_batch = SimpleNamespace(
+        req_ids=["other-request", "request-a"],
+        num_reqs_after_padding=2,
+        idx_mapping=torch.tensor([0, 1]),
+        query_start_loc=torch.tensor([0, 1, 2]),
+        positions=torch.tensor([0, 0]),
+        num_tokens_after_padding=2,
+    )
+
+    GPUModelRunner.prepare_attn(target, input_batch)
+    assert warm_slot_table[:2].tolist() == [
+        [-1, -1, -1, -1],
+        [-1, -1, 5, -1],
+    ]
+    assert residency_items.call_count == 1
+
+    warm_slot_table[0, 0] = 8
+    GPUModelRunner.prepare_attn(target, input_batch)
+    assert warm_slot_table[0, 0].item() == 8
+    assert residency_items.call_count == 1
+
+    warm_residency[("other-request", 0, 1)] = HKVWarmResidency(
+        warm_slot_id=3,
+        temporary_shadow_hot_block_id=4,
+    )
+    migration_manager.warm_residency_revision += 1
+    GPUModelRunner.prepare_attn(target, input_batch)
+    assert warm_slot_table[:2].tolist() == [
+        [-1, 3, -1, -1],
+        [-1, -1, 5, -1],
+    ]
+    assert residency_items.call_count == 2
+
+    input_batch.req_ids = ["request-a", "request-b"]
+    GPUModelRunner.prepare_attn(target, input_batch)
+    assert warm_slot_table[:2].tolist() == [
+        [-1, -1, 5, -1],
+        [-1, -1, -1, -1],
+    ]
+    assert residency_items.call_count == 3
+
+    warm_slot_table[2].fill_(6)
+    input_batch.num_reqs_after_padding = 3
+    GPUModelRunner.prepare_attn(target, input_batch)
+    assert warm_slot_table[2].tolist() == [-1, -1, -1, -1]
+    assert residency_items.call_count == 4
 
 
 def test_insufficient_warm_capacity_leaves_state_unchanged():

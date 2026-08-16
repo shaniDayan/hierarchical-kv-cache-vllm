@@ -344,6 +344,7 @@ class HKVWarmMigrationManager:
         self.hot_to_warm_maps = hot_to_warm_maps
         self.device = device
         self.warm_residency: dict[tuple[str, int, int], HKVWarmResidency] = {}
+        self.warm_residency_revision = 0
 
     def migrate(
         self,
@@ -461,6 +462,7 @@ class HKVWarmMigrationManager:
                 warm_slot_id=mappings[source],
                 temporary_shadow_hot_block_id=source.kernel_hot_block_id,
             )
+        self.warm_residency_revision += 1
 
     def release_request(self, request_id: str) -> tuple[int, ...]:
         """Invalidate and release all WARM mappings owned by a request."""
@@ -493,4 +495,5 @@ class HKVWarmMigrationManager:
 
         for key, _ in request_entries:
             del self.warm_residency[key]
+        self.warm_residency_revision += 1
         return self.allocator.release_sources(sources)

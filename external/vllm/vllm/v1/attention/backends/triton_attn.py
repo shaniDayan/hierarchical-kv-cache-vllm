@@ -643,7 +643,7 @@ class TritonAttentionImpl(AttentionImpl):
 
         hkv_warm_k = None
         hkv_warm_v = None
-        hkv_hot_to_warm_map = None
+        hkv_warm_slot_table = None
         hkv_k_scale_cache = None
         hkv_v_scale_cache = None
         hkv_mixed_read_enabled = (
@@ -651,14 +651,14 @@ class TritonAttentionImpl(AttentionImpl):
             in {"1", "true", "yes", "on"}
         )
         warm_kv_cache = getattr(layer, "_hkv_warm_kv_cache", None)
-        hot_to_warm_map = getattr(layer, "_hkv_hot_to_warm_map", None)
+        warm_slot_table = getattr(layer, "_hkv_warm_slot_table", None)
         if (
             hkv_mixed_read_enabled
             and warm_kv_cache is not None
-            and hot_to_warm_map is not None
+            and warm_slot_table is not None
         ):
             if not isinstance(warm_kv_cache, torch.Tensor) or not isinstance(
-                hot_to_warm_map, torch.Tensor
+                warm_slot_table, torch.Tensor
             ):
                 raise ValueError("Mixed HKV state must use tensors")
             if self._kv_quant_mode != KVQuantMode.NONE:
@@ -689,17 +689,17 @@ class TritonAttentionImpl(AttentionImpl):
                 raise ValueError("Mixed HKV reads require at least one WARM block")
             if (
                 kv_cache.device != warm_kv_cache.device
-                or kv_cache.device != hot_to_warm_map.device
+                or kv_cache.device != warm_slot_table.device
             ):
-                raise ValueError("HOT, WARM, and HKV map devices must match")
+                raise ValueError("HOT, WARM, and logical HKV table devices must match")
             if (
-                hot_to_warm_map.ndim != 1
-                or hot_to_warm_map.dtype != torch.int32
-                or hot_to_warm_map.shape[0] != kv_cache.shape[0]
+                warm_slot_table.ndim != 2
+                or warm_slot_table.dtype != torch.int32
+                or warm_slot_table.stride(1) != 1
             ):
                 raise ValueError(
-                    "HKV map must be one-dimensional torch.int32 with one "
-                    "entry per HOT block"
+                    "Logical HKV table must be two-dimensional contiguous-row "
+                    "torch.int32"
                 )
 
             hkv_k_scale_cache, hkv_v_scale_cache, warm_head_size = (
@@ -708,7 +708,7 @@ class TritonAttentionImpl(AttentionImpl):
             if warm_head_size != kv_cache.shape[4]:
                 raise ValueError("Unpadded WARM and HOT head sizes must match")
             hkv_warm_k, hkv_warm_v = warm_kv_cache.unbind(1)
-            hkv_hot_to_warm_map = hot_to_warm_map
+            hkv_warm_slot_table = warm_slot_table
 
         # Per-token-head quantized KV cache: use separate scale caches.
         if self._is_per_token_head_quant:
@@ -796,7 +796,7 @@ class TritonAttentionImpl(AttentionImpl):
             use_td=self.use_td,
             hkv_warm_k=hkv_warm_k,
             hkv_warm_v=hkv_warm_v,
-            hkv_hot_to_warm_map=hkv_hot_to_warm_map,
+            hkv_warm_slot_table=hkv_warm_slot_table,
             hkv_k_scale_cache=hkv_k_scale_cache,
             hkv_v_scale_cache=hkv_v_scale_cache,
         )
