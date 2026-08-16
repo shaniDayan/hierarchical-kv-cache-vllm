@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_state import (
     KVCacheTransitionStatus,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.request import RequestStatus
 from vllm.v1.worker.gpu.hkv_migration import (
     HKVWarmCapacityError,
     HKVWarmMigrationManager,
@@ -514,12 +515,23 @@ def test_zero_token_result_reaches_scheduler():
 
     # Scheduler validation accepts this
     sched = Scheduler.__new__(Scheduler)
+    t = sched_out.kv_cache_state_transitions[0]
+    sched._pending_kv_transitions = {t.request_id: t}
+    sched.requests = {t.request_id: SimpleNamespace(kv_cache_state=KVBlockState.HOT)}
+    sched.kv_cache_manager = SimpleNamespace(
+        commit_request_kv_transition=MagicMock()
+    )
     Scheduler._validate_kv_cache_transition_results(sched, sched_out, out)
 
 
 def test_scheduler_validates_transition_results_exact_match():
     sched = Scheduler.__new__(Scheduler)
     t = make_transition(transition_id=1, request_id="r1")
+    sched._pending_kv_transitions = {"r1": t}
+    sched.requests = {"r1": SimpleNamespace(kv_cache_state=KVBlockState.HOT)}
+    sched.kv_cache_manager = SimpleNamespace(
+        commit_request_kv_transition=MagicMock()
+    )
     sched_out = SchedulerOutput.make_empty()
     sched_out.kv_cache_state_transitions = [t]
 
@@ -528,13 +540,20 @@ def test_scheduler_validates_transition_results_exact_match():
         req_ids=[], req_id_to_index={}, kv_cache_transition_results=[res]
     )
 
-    # Should not raise
+    # Should not raise and commits transition
     Scheduler._validate_kv_cache_transition_results(sched, sched_out, mr_out)
+    assert sched.requests["r1"].kv_cache_state is KVBlockState.WARM
+    assert "r1" not in sched._pending_kv_transitions
 
 
 def test_scheduler_rejects_missing_result():
     sched = Scheduler.__new__(Scheduler)
     t = make_transition(transition_id=1, request_id="r1")
+    sched._pending_kv_transitions = {"r1": t}
+    sched.requests = {"r1": SimpleNamespace(kv_cache_state=KVBlockState.HOT)}
+    sched.kv_cache_manager = SimpleNamespace(
+        commit_request_kv_transition=MagicMock()
+    )
     sched_out = SchedulerOutput.make_empty()
     sched_out.kv_cache_state_transitions = [t]
 
@@ -550,6 +569,11 @@ def test_scheduler_rejects_missing_result():
 def test_scheduler_rejects_extra_result():
     sched = Scheduler.__new__(Scheduler)
     t = make_transition(transition_id=1, request_id="r1")
+    sched._pending_kv_transitions = {"r1": t}
+    sched.requests = {"r1": SimpleNamespace(kv_cache_state=KVBlockState.HOT)}
+    sched.kv_cache_manager = SimpleNamespace(
+        commit_request_kv_transition=MagicMock()
+    )
     sched_out = SchedulerOutput.make_empty()
     sched_out.kv_cache_state_transitions = [t]
 
@@ -571,6 +595,14 @@ def test_scheduler_rejects_duplicate_result():
     sched = Scheduler.__new__(Scheduler)
     t1 = make_transition(transition_id=1, request_id="r1")
     t2 = make_transition(transition_id=2, request_id="r2")
+    sched._pending_kv_transitions = {"r1": t1, "r2": t2}
+    sched.requests = {
+        "r1": SimpleNamespace(kv_cache_state=KVBlockState.HOT),
+        "r2": SimpleNamespace(kv_cache_state=KVBlockState.HOT),
+    }
+    sched.kv_cache_manager = SimpleNamespace(
+        commit_request_kv_transition=MagicMock()
+    )
     sched_out = SchedulerOutput.make_empty()
     sched_out.kv_cache_state_transitions = [t1, t2]
 
@@ -597,6 +629,11 @@ def test_scheduler_rejects_duplicate_result():
 def test_scheduler_rejects_mismatched_transition_id():
     sched = Scheduler.__new__(Scheduler)
     t = make_transition(transition_id=1, request_id="r1")
+    sched._pending_kv_transitions = {"r1": t}
+    sched.requests = {"r1": SimpleNamespace(kv_cache_state=KVBlockState.HOT)}
+    sched.kv_cache_manager = SimpleNamespace(
+        commit_request_kv_transition=MagicMock()
+    )
     sched_out = SchedulerOutput.make_empty()
     sched_out.kv_cache_state_transitions = [t]
 
@@ -625,6 +662,11 @@ def test_scheduler_rejects_mismatched_signature():
         request_id="r1",
         changed_blocks=([KVCacheBlockTransition(0, 5)],),
     )
+    sched._pending_kv_transitions = {"r1": t}
+    sched.requests = {"r1": SimpleNamespace(kv_cache_state=KVBlockState.HOT)}
+    sched.kv_cache_manager = SimpleNamespace(
+        commit_request_kv_transition=MagicMock()
+    )
     sched_out = SchedulerOutput.make_empty()
     sched_out.kv_cache_state_transitions = [t]
 
@@ -648,14 +690,37 @@ def test_scheduler_rejects_mismatched_signature():
         Scheduler._validate_kv_cache_transition_results(sched, sched_out, mr_out)
 
 
-def _make_mock_scheduler_for_rollback(
+def test_scheduler_rejects_missing_pending_transition():
+    sched = Scheduler.__new__(Scheduler)
+    t = make_transition(transition_id=1, request_id="r1")
+    sched._pending_kv_transitions = {}  # Empty pending transitions
+    sched.requests = {"r1": SimpleNamespace(kv_cache_state=KVBlockState.HOT)}
+    sched.kv_cache_manager = SimpleNamespace(
+        commit_request_kv_transition=MagicMock()
+    )
+    sched_out = SchedulerOutput.make_empty()
+    sched_out.kv_cache_state_transitions = [t]
+
+    res = t.to_result(KVCacheTransitionStatus.SUCCESS)
+    mr_out = ModelRunnerOutput(
+        req_ids=[], req_id_to_index={}, kv_cache_transition_results=[res]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="No matching pending KV transition for request r1",
+    ):
+        Scheduler._validate_kv_cache_transition_results(sched, sched_out, mr_out)
+
+
+def _make_mock_scheduler_for_commit(
     request_id: str = "r1",
-    request_state: KVBlockState = KVBlockState.WARM,
+    request_state: KVBlockState = KVBlockState.HOT,
     block_states: list[KVBlockState] | None = None,
     block_ids: list[int] | None = None,
 ) -> tuple[Scheduler, list[SimpleNamespace]]:
     if block_states is None:
-        block_states = [KVBlockState.WARM, KVBlockState.WARM]
+        block_states = [KVBlockState.HOT, KVBlockState.HOT]
     if block_ids is None:
         block_ids = [10, 20]
     blocks = [
@@ -665,18 +730,50 @@ def _make_mock_scheduler_for_rollback(
     request = SimpleNamespace(
         request_id=request_id, kv_cache_state=request_state
     )
+
+    def commit_transition(transition):
+        req_blocks = (blocks,)
+        for group_idx, group_transitions in enumerate(
+            transition.changed_blocks
+        ):
+            if group_idx >= len(req_blocks):
+                raise ValueError(
+                    f"Cache group index {group_idx} out of range during "
+                    f"commit for request {transition.request_id}"
+                )
+            current_group = req_blocks[group_idx]
+            for block_trans in group_transitions:
+                logical_idx = block_trans.logical_block_index
+                expected_hot_id = block_trans.source_hot_block_id
+                if logical_idx >= len(current_group):
+                    raise ValueError(
+                        f"Logical block index {logical_idx} out of range "
+                        f"during commit for request {transition.request_id}"
+                    )
+                block = current_group[logical_idx]
+                if block.block_id != expected_hot_id:
+                    raise ValueError(
+                        f"Physical block ID mismatch during commit for "
+                        f"request {transition.request_id} group {group_idx} "
+                        f"logical block {logical_idx}: expected block_id "
+                        f"{expected_hot_id}, found {block.block_id}"
+                    )
+                block.hierarchy_state = transition.new_state
+
     kv_cache_manager = SimpleNamespace(
-        get_blocks=lambda _req: SimpleNamespace(blocks=(blocks,))
+        get_blocks=lambda _req: SimpleNamespace(blocks=(blocks,)),
+        commit_request_kv_transition=commit_transition,
     )
     sched = Scheduler.__new__(Scheduler)
+    sched._pending_kv_transitions = {}
     sched.requests = {request_id: request}
     sched.kv_cache_manager = kv_cache_manager
     return sched, blocks
 
 
-def test_scheduler_rollback_retryable_capacity_rolls_back_warm_to_hot():
-    sched, blocks = _make_mock_scheduler_for_rollback(
-        block_states=[KVBlockState.WARM, KVBlockState.WARM, KVBlockState.HOT],
+def test_scheduler_retryable_capacity_clears_pending_and_leaves_hot():
+    sched, blocks = _make_mock_scheduler_for_commit(
+        block_states=[KVBlockState.HOT, KVBlockState.HOT, KVBlockState.HOT],
         block_ids=[10, 20, 30],
     )
     t = make_transition(
@@ -689,6 +786,7 @@ def test_scheduler_rollback_retryable_capacity_rolls_back_warm_to_hot():
             ],
         ),
     )
+    sched._pending_kv_transitions = {"r1": t}
     sched_out = SchedulerOutput.make_empty()
     sched_out.kv_cache_state_transitions = [t]
 
@@ -705,11 +803,12 @@ def test_scheduler_rollback_retryable_capacity_rolls_back_warm_to_hot():
     assert blocks[0].hierarchy_state is KVBlockState.HOT
     assert blocks[1].hierarchy_state is KVBlockState.HOT
     assert blocks[2].hierarchy_state is KVBlockState.HOT
+    assert "r1" not in sched._pending_kv_transitions
 
 
-def test_scheduler_rollback_stale_validation_rolls_back_matching_identity():
-    sched, blocks = _make_mock_scheduler_for_rollback(
-        block_states=[KVBlockState.WARM],
+def test_scheduler_stale_validation_clears_pending_and_leaves_hot():
+    sched, blocks = _make_mock_scheduler_for_commit(
+        block_states=[KVBlockState.HOT],
         block_ids=[10],
     )
     t = make_transition(
@@ -717,6 +816,7 @@ def test_scheduler_rollback_stale_validation_rolls_back_matching_identity():
         request_id="r1",
         changed_blocks=([KVCacheBlockTransition(0, 10)],),
     )
+    sched._pending_kv_transitions = {"r1": t}
     sched_out = SchedulerOutput.make_empty()
     sched_out.kv_cache_state_transitions = [t]
 
@@ -731,11 +831,12 @@ def test_scheduler_rollback_stale_validation_rolls_back_matching_identity():
 
     assert sched.requests["r1"].kv_cache_state is KVBlockState.HOT
     assert blocks[0].hierarchy_state is KVBlockState.HOT
+    assert "r1" not in sched._pending_kv_transitions
 
 
-def test_scheduler_success_preserves_warm_state():
-    sched, blocks = _make_mock_scheduler_for_rollback(
-        block_states=[KVBlockState.WARM, KVBlockState.WARM],
+def test_scheduler_success_commits_warm_state():
+    sched, blocks = _make_mock_scheduler_for_commit(
+        block_states=[KVBlockState.HOT, KVBlockState.HOT],
         block_ids=[10, 20],
     )
     t = make_transition(
@@ -748,6 +849,7 @@ def test_scheduler_success_preserves_warm_state():
             ],
         ),
     )
+    sched._pending_kv_transitions = {"r1": t}
     sched_out = SchedulerOutput.make_empty()
     sched_out.kv_cache_state_transitions = [t]
 
@@ -761,12 +863,13 @@ def test_scheduler_success_preserves_warm_state():
     assert sched.requests["r1"].kv_cache_state is KVBlockState.WARM
     assert blocks[0].hierarchy_state is KVBlockState.WARM
     assert blocks[1].hierarchy_state is KVBlockState.WARM
+    assert "r1" not in sched._pending_kv_transitions
 
 
-def test_scheduler_rollback_does_not_modify_untransitioned_blocks():
-    # block 0 was transitioned; block 1 was untransitioned and remained in custom state
-    sched, blocks = _make_mock_scheduler_for_rollback(
-        block_states=[KVBlockState.WARM, KVBlockState.WARM],
+def test_scheduler_success_does_not_modify_untransitioned_blocks():
+    # block 0 was transitioned; block 1 was untransitioned and remained HOT
+    sched, blocks = _make_mock_scheduler_for_commit(
+        block_states=[KVBlockState.HOT, KVBlockState.HOT],
         block_ids=[10, 20],
     )
     t = make_transition(
@@ -774,27 +877,26 @@ def test_scheduler_rollback_does_not_modify_untransitioned_blocks():
         request_id="r1",
         changed_blocks=([KVCacheBlockTransition(0, 10)],),
     )
+    sched._pending_kv_transitions = {"r1": t}
     sched_out = SchedulerOutput.make_empty()
     sched_out.kv_cache_state_transitions = [t]
 
-    res = t.to_result(
-        KVCacheTransitionStatus.RETRYABLE_CAPACITY, "no warm slots"
-    )
+    res = t.to_result(KVCacheTransitionStatus.SUCCESS)
     mr_out = ModelRunnerOutput(
         req_ids=[], req_id_to_index={}, kv_cache_transition_results=[res]
     )
 
     Scheduler._validate_kv_cache_transition_results(sched, sched_out, mr_out)
 
-    # Block 0 rolled back to HOT, block 1 untouched
-    assert blocks[0].hierarchy_state is KVBlockState.HOT
-    assert blocks[1].hierarchy_state is KVBlockState.WARM
+    assert blocks[0].hierarchy_state is KVBlockState.WARM
+    assert blocks[1].hierarchy_state is KVBlockState.HOT
+    assert "r1" not in sched._pending_kv_transitions
 
 
-def test_scheduler_rollback_fails_closed_on_physical_block_mismatch():
+def test_scheduler_success_fails_closed_on_physical_block_mismatch():
     # current block 0 has block_id=999 instead of 10
-    sched, blocks = _make_mock_scheduler_for_rollback(
-        block_states=[KVBlockState.WARM],
+    sched, blocks = _make_mock_scheduler_for_commit(
+        block_states=[KVBlockState.HOT],
         block_ids=[999],
     )
     t = make_transition(
@@ -802,20 +904,287 @@ def test_scheduler_rollback_fails_closed_on_physical_block_mismatch():
         request_id="r1",
         changed_blocks=([KVCacheBlockTransition(0, 10)],),
     )
+    sched._pending_kv_transitions = {"r1": t}
     sched_out = SchedulerOutput.make_empty()
     sched_out.kv_cache_state_transitions = [t]
 
-    res = t.to_result(
-        KVCacheTransitionStatus.STALE_VALIDATION, "stale block mismatch"
-    )
+    res = t.to_result(KVCacheTransitionStatus.SUCCESS)
     mr_out = ModelRunnerOutput(
         req_ids=[], req_id_to_index={}, kv_cache_transition_results=[res]
     )
 
     with pytest.raises(
         ValueError,
-        match="Physical block ID mismatch during rollback for request r1",
+        match="Physical block ID mismatch during commit for request r1",
     ):
         Scheduler._validate_kv_cache_transition_results(
             sched, sched_out, mr_out
         )
+
+
+def test_scheduler_resume_while_pending_is_deferred_and_proceeds_after_ack():
+    from tests.v1.streaming_input.test_scheduler_streaming import (
+        DummyRequest,
+        create_scheduler,
+    )
+
+    scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+    session = DummyRequest(
+        request_id="session",
+        prompt_token_ids=list(range(20)),
+        arrival_time=100.0,
+    )
+    scheduler.add_request(session)
+    scheduler.kv_cache_manager.allocate_slots(session, 20)
+    session.num_computed_tokens = 20
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    # Step 1: Planning creates pending transition
+    transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+    assert len(transitions) == 1
+    assert "session" in scheduler._pending_kv_transitions
+
+    # Step 2: Incoming prompt chunk arrives while transition is pending
+    # Must NOT raise RuntimeError; must queue into streaming_queue
+    next_chunk = DummyRequest(
+        request_id="session",
+        prompt_token_ids=list(range(20, 30)),
+        arrival_time=111.0,
+    )
+    scheduler.add_request(next_chunk)
+    assert len(session.streaming_queue) == 1
+    assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    # Step 3: Worker ACK arrives
+    sched_out = SchedulerOutput.make_empty()
+    sched_out.kv_cache_state_transitions = transitions
+    mr_out = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_cache_transition_results=[
+            transitions[0].to_result(KVCacheTransitionStatus.SUCCESS)
+        ],
+    )
+    scheduler._validate_kv_cache_transition_results(sched_out, mr_out)
+
+    # Transition committed, pending cleared, queued update processed
+    assert "session" not in scheduler._pending_kv_transitions
+    assert len(session.streaming_queue) == 0
+    assert session.status == RequestStatus.WAITING
+    assert session.kv_cache_state is KVBlockState.HOT
+    assert session.num_computed_tokens == 20
+    block_groups = scheduler.kv_cache_manager.get_blocks(
+        session.request_id
+    ).blocks
+    assert block_groups[0][0].hierarchy_state is KVBlockState.WARM
+
+
+def test_scheduler_abort_while_pending_is_deferred_and_propagates_worker_cleanup():
+    from tests.v1.streaming_input.test_scheduler_streaming import (
+        DummyRequest,
+        create_scheduler,
+    )
+
+    scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+    session = DummyRequest(
+        request_id="session",
+        prompt_token_ids=list(range(20)),
+        arrival_time=100.0,
+    )
+    scheduler.add_request(session)
+    scheduler.kv_cache_manager.allocate_slots(session, 20)
+    session.num_computed_tokens = 20
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    # Step 1: Planning creates pending transition
+    transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+    assert len(transitions) == 1
+    assert "session" in scheduler._pending_kv_transitions
+
+    # Step 2: Client aborts while pending
+    # Must NOT raise RuntimeError; must record deferred abort
+    aborted = scheduler.finish_requests(
+        ["session"], RequestStatus.FINISHED_ABORTED
+    )
+    assert aborted == [("session", 0)]
+    assert scheduler._pending_finish_requests.get("session") == (
+        RequestStatus.FINISHED_ABORTED
+    )
+    # Blocks must NOT be freed yet while migration is pending
+    assert "session" in scheduler.requests
+    assert "session" not in scheduler.finished_req_ids
+
+    # Step 3: Worker ACK arrives
+    sched_out = SchedulerOutput.make_empty()
+    sched_out.kv_cache_state_transitions = transitions
+    mr_out = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_cache_transition_results=[
+            transitions[0].to_result(KVCacheTransitionStatus.SUCCESS)
+        ],
+    )
+    scheduler._validate_kv_cache_transition_results(sched_out, mr_out)
+
+    # Pending cleared, deferred abort executed, blocks freed
+    assert "session" not in scheduler._pending_kv_transitions
+    assert "session" not in scheduler._pending_finish_requests
+    assert "session" not in scheduler.requests
+    assert "session" in scheduler.finished_req_ids
+
+    # Step 4: Next schedule() produces finished_req_ids for worker cleanup
+    migration_manager = SimpleNamespace(
+        release_request=MagicMock(),
+    )
+    runner = SimpleNamespace(
+        hkv_warm_migration_manager=migration_manager,
+        _remove_request=MagicMock(),
+    )
+    next_sched_out = scheduler.schedule()
+    assert "session" in next_sched_out.finished_req_ids
+
+    GPUModelRunner.finish_requests(runner, next_sched_out)
+    migration_manager.release_request.assert_called_once_with("session")
+    runner._remove_request.assert_called_once_with("session")
+
+
+def test_scheduler_queued_finish_sentinel_cleans_up_after_ack():
+    from tests.v1.streaming_input.test_scheduler_streaming import (
+        DummyRequest,
+        create_scheduler,
+    )
+
+    scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+    session = DummyRequest(
+        request_id="session",
+        prompt_token_ids=list(range(20)),
+        arrival_time=100.0,
+    )
+    scheduler.add_request(session)
+    scheduler.kv_cache_manager.allocate_slots(session, 20)
+    session.num_computed_tokens = 20
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    # Step 1: Planning creates pending transition
+    transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+    assert len(transitions) == 1
+    assert "session" in scheduler._pending_kv_transitions
+
+    # Step 2: Streaming finished sentinel (None update) arrives via add_request
+    finish_sentinel = DummyRequest(
+        request_id="session",
+        resumable=False,
+        arrival_time=111.0,
+    )
+    scheduler.add_request(finish_sentinel)
+    assert len(session.streaming_queue) == 1
+    assert session.streaming_queue[0] is None
+
+    # Step 3: Worker ACK arrives
+    sched_out = SchedulerOutput.make_empty()
+    sched_out.kv_cache_state_transitions = transitions
+    mr_out = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_cache_transition_results=[
+            transitions[0].to_result(KVCacheTransitionStatus.SUCCESS)
+        ],
+    )
+    scheduler._validate_kv_cache_transition_results(sched_out, mr_out)
+
+    # Sentinel popped and finished_requests executed
+    assert "session" not in scheduler._pending_kv_transitions
+    assert "session" not in scheduler.requests
+    assert "session" in scheduler.finished_req_ids
+
+
+def test_scheduler_lifecycle_guards_while_pending():
+    t = make_transition(transition_id=1, request_id="r1")
+    sched = Scheduler.__new__(Scheduler)
+    sched._pending_kv_transitions = {"r1": t}
+    sched._pending_finish_requests = {}
+    sched.requests = {
+        "r1": SimpleNamespace(
+            request_id="r1",
+            status=RequestStatus.WAITING_FOR_STREAMING_REQ,
+            is_finished=lambda: False,
+        )
+    }
+
+    # Direct resume call rejected while pending
+    session = SimpleNamespace(request_id="r1")
+    with pytest.raises(
+        RuntimeError, match="Cannot resume request r1 while a KV cache"
+    ):
+        sched._update_request_as_session(session, SimpleNamespace())
+
+    # Direct free rejected while pending
+    req = SimpleNamespace(
+        request_id="r1",
+        is_finished=lambda: True,
+    )
+    with pytest.raises(
+        RuntimeError, match="Cannot free request r1 while a KV cache"
+    ):
+        sched._free_request(req)
+
+    # Preempt rejected while pending
+    running_req = SimpleNamespace(
+        request_id="r1",
+        status=RequestStatus.RUNNING,
+    )
+    with pytest.raises(
+        RuntimeError, match="Cannot preempt request r1 while a KV cache"
+    ):
+        sched._preempt_request(running_req, 100.0)
+
+
+def test_scheduler_fresh_retry_receives_new_transition_id():
+    from tests.v1.streaming_input.test_scheduler_streaming import (
+        DummyRequest,
+        create_scheduler,
+    )
+
+    scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+    session = DummyRequest(
+        request_id="session",
+        prompt_token_ids=list(range(20)),
+        arrival_time=100.0,
+    )
+    scheduler.add_request(session)
+    scheduler.kv_cache_manager.allocate_slots(session, 20)
+    session.num_computed_tokens = 20
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    # Step 1: Initial planning
+    transitions1 = scheduler._classify_idle_kv_sessions(current_time=110.0)
+    assert len(transitions1) == 1
+    assert transitions1[0].transition_id == 0
+    assert scheduler._pending_kv_transitions[session.request_id] == transitions1[0]
+    assert session.kv_cache_state is KVBlockState.HOT
+
+    # Duplicate planning is suppressed
+    assert scheduler._classify_idle_kv_sessions(current_time=110.0) == []
+
+    # Worker reports RETRYABLE_CAPACITY
+    sched_out = SchedulerOutput.make_empty()
+    sched_out.kv_cache_state_transitions = transitions1
+    mr_out = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_cache_transition_results=[
+            transitions1[0].to_result(
+                KVCacheTransitionStatus.RETRYABLE_CAPACITY, "capacity full"
+            )
+        ],
+    )
+    scheduler._validate_kv_cache_transition_results(sched_out, mr_out)
+
+    assert session.kv_cache_state is KVBlockState.HOT
+    assert session.request_id not in scheduler._pending_kv_transitions
+
+    # Step 2: Fresh classification after cleared pending receives new transition_id=1
+    transitions2 = scheduler._classify_idle_kv_sessions(current_time=110.0)
+    assert len(transitions2) == 1
+    assert transitions2[0].transition_id == 1
+    assert scheduler._pending_kv_transitions[session.request_id] == transitions2[0]

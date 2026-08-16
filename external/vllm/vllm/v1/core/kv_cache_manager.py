@@ -16,7 +16,11 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
-from vllm.v1.kv_cache_state import KVBlockState, KVCacheBlockTransition
+from vllm.v1.kv_cache_state import (
+    KVBlockState,
+    KVCacheBlockTransition,
+    KVCacheStateTransition,
+)
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
@@ -585,19 +589,18 @@ class KVCacheManager:
         """Get the blocks of a request."""
         return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))
 
-    def apply_request_kv_state(
+    def plan_request_kv_state(
         self,
         request_id: str,
         state: KVBlockState,
         *,
         num_computed_tokens: int | None = None,
     ) -> tuple[list[KVCacheBlockTransition], ...]:
-        """Apply a request-level state and return changed private blocks.
+        """Plan a request-level state transition without mutating metadata.
 
         Shared blocks are kept HOT but excluded from the returned request-level
         transition payload. When a computed-token boundary is supplied,
-        demotion applies only to complete blocks; HOT application remains
-        unfiltered so it can repair or promote every eligible block.
+        demotion applies only to complete blocks.
         """
         if num_computed_tokens is not None and num_computed_tokens < 0:
             raise ValueError("num_computed_tokens must be non-negative")
@@ -616,7 +619,6 @@ class KVCacheManager:
                     continue
 
                 if block.ref_cnt > 1:
-                    block.hierarchy_state = KVBlockState.HOT
                     continue
 
                 if (
@@ -624,13 +626,11 @@ class KVCacheManager:
                     and num_complete_blocks is not None
                     and block_index >= num_complete_blocks
                 ):
-                    block.hierarchy_state = KVBlockState.HOT
                     continue
 
                 if block.hierarchy_state is state:
                     continue
 
-                block.hierarchy_state = state
                 changed_group.append(
                     KVCacheBlockTransition(
                         logical_block_index=block_index,
@@ -640,6 +640,72 @@ class KVCacheManager:
             changed_blocks.append(changed_group)
 
         return tuple(changed_blocks)
+
+    def commit_request_kv_transition(
+        self,
+        transition: KVCacheStateTransition,
+    ) -> None:
+        """Commit exact planned blocks to target hierarchy state on SUCCESS."""
+        request_blocks = self.get_blocks(transition.request_id).blocks
+        for group_idx, group_transitions in enumerate(transition.changed_blocks):
+            if group_idx >= len(request_blocks):
+                raise ValueError(
+                    f"Cache group index {group_idx} out of range during "
+                    f"commit for request {transition.request_id}"
+                )
+            current_group = request_blocks[group_idx]
+            for block_trans in group_transitions:
+                logical_idx = block_trans.logical_block_index
+                expected_hot_id = block_trans.source_hot_block_id
+                if logical_idx >= len(current_group):
+                    raise ValueError(
+                        f"Logical block index {logical_idx} out of range "
+                        f"during commit for request {transition.request_id}"
+                    )
+                block = current_group[logical_idx]
+                if block.block_id != expected_hot_id:
+                    raise ValueError(
+                        f"Physical block ID mismatch during commit for "
+                        f"request {transition.request_id} group {group_idx} "
+                        f"logical block {logical_idx}: expected block_id "
+                        f"{expected_hot_id}, found {block.block_id}"
+                    )
+                block.hierarchy_state = transition.new_state
+
+    def apply_request_kv_state(
+        self,
+        request_id: str,
+        state: KVBlockState,
+        *,
+        num_computed_tokens: int | None = None,
+    ) -> tuple[list[KVCacheBlockTransition], ...]:
+        """Apply a request-level state and return changed private blocks."""
+        planned = self.plan_request_kv_state(
+            request_id,
+            state,
+            num_computed_tokens=num_computed_tokens,
+        )
+        request_blocks = self.get_blocks(request_id).blocks
+        for group, block_size in zip(request_blocks, self.block_sizes, strict=True):
+            num_complete_blocks = (
+                num_computed_tokens // block_size
+                if num_computed_tokens is not None
+                else None
+            )
+            for block_index, block in enumerate(group):
+                if block.ref_cnt > 1:
+                    block.hierarchy_state = KVBlockState.HOT
+                elif (
+                    state is not KVBlockState.HOT
+                    and num_complete_blocks is not None
+                    and block_index >= num_complete_blocks
+                ):
+                    block.hierarchy_state = KVBlockState.HOT
+        for group_idx, group in enumerate(request_blocks):
+            if group_idx < len(planned):
+                for block_trans in planned[group_idx]:
+                    group[block_trans.logical_block_index].hierarchy_state = state
+        return planned
 
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
         """Get the block ids of a request."""

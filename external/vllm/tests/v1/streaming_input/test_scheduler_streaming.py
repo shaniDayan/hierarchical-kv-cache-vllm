@@ -13,6 +13,7 @@ from vllm.multimodal.inputs import (
     PlaceholderRange,
 )
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
@@ -24,6 +25,7 @@ from vllm.v1.kv_cache_state import (
     KVBlockState,
     KVCacheBlockTransition,
     KVCacheStateTransition,
+    KVCacheTransitionStatus,
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -129,11 +131,37 @@ class TestStreamingScheduler(unittest.TestCase):
                 changed_blocks=complete_blocks,
             )
         ]
+        # Non-mutating planning keeps authoritative state HOT before ACK
+        assert session.kv_cache_state is KVBlockState.HOT
+        assert all(
+            group[0].hierarchy_state is KVBlockState.HOT
+            and group[1].hierarchy_state is KVBlockState.HOT
+            for group in block_groups
+        )
+        assert scheduler._pending_kv_transitions[session.request_id] == transitions[0]
+
+        # Duplicate classification pass is suppressed
+        assert scheduler._classify_idle_kv_sessions(current_time=110.0) == []
+
+        # Validate SUCCESS acknowledgment commits to WARM
+        sched_out = SchedulerOutput.make_empty()
+        sched_out.kv_cache_state_transitions = transitions
+        mr_out = ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            kv_cache_transition_results=[
+                transitions[0].to_result(KVCacheTransitionStatus.SUCCESS)
+            ],
+        )
+        scheduler._validate_kv_cache_transition_results(sched_out, mr_out)
+
+        assert session.kv_cache_state is KVBlockState.WARM
         assert all(
             group[0].hierarchy_state is KVBlockState.WARM
             and group[1].hierarchy_state is KVBlockState.HOT
             for group in block_groups
         )
+        assert session.request_id not in scheduler._pending_kv_transitions
 
     def test_add_request(self):
         scheduler = create_scheduler()

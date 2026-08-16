@@ -100,3 +100,57 @@ def test_apply_demotion_uses_complete_blocks_per_group(
             else KVBlockState.HOT
             for block in group
         ]
+
+
+def test_plan_request_kv_state_non_mutating():
+    private = make_block(0)
+    unchanged = make_block(1, state=KVBlockState.WARM)
+    shared = make_block(2, state=KVBlockState.HOT, ref_cnt=2)
+    null = make_block(3, is_null=True)
+    unreferenced = make_block(4, ref_cnt=0)
+    groups = ([private, unchanged, shared, null, unreferenced], [make_block(10)])
+    manager = make_manager(groups, (4, 4))
+
+    planned = manager.plan_request_kv_state("request", KVBlockState.WARM)
+    assert planned == (
+        [KVCacheBlockTransition(logical_block_index=0, source_hot_block_id=0)],
+        [KVCacheBlockTransition(logical_block_index=0, source_hot_block_id=10)],
+    )
+    # Planning must NOT mutate block hierarchy states
+    assert private.hierarchy_state is KVBlockState.HOT
+    assert unchanged.hierarchy_state is KVBlockState.WARM
+    assert shared.hierarchy_state is KVBlockState.HOT
+    assert null.hierarchy_state is KVBlockState.HOT
+    assert unreferenced.hierarchy_state is KVBlockState.HOT
+
+
+def test_commit_request_kv_transition_success_and_fail_closed():
+    from vllm.v1.kv_cache_state import KVCacheStateTransition
+
+    blk0 = make_block(10)
+    blk1 = make_block(20)
+    groups = ([blk0, blk1],)
+    manager = make_manager(groups, (4,))
+
+    transition = KVCacheStateTransition(
+        transition_id=1,
+        request_id="request",
+        previous_state=KVBlockState.HOT,
+        new_state=KVBlockState.WARM,
+        changed_blocks=([KVCacheBlockTransition(0, 10)],),
+    )
+
+    manager.commit_request_kv_transition(transition)
+    assert blk0.hierarchy_state is KVBlockState.WARM
+    assert blk1.hierarchy_state is KVBlockState.HOT
+
+    # Stale physical identity must fail closed
+    mismatched_transition = KVCacheStateTransition(
+        transition_id=2,
+        request_id="request",
+        previous_state=KVBlockState.HOT,
+        new_state=KVBlockState.WARM,
+        changed_blocks=([KVCacheBlockTransition(1, 999)],),
+    )
+    with pytest.raises(ValueError, match="Physical block ID mismatch"):
+        manager.commit_request_kv_transition(mismatched_transition)
