@@ -279,3 +279,43 @@ def test_commit_request_kv_transition_evicts_prefix_cache_before_reclaim():
     assert blk0.block_hash is None
     assert groups[0][0] is pool.null_block
     assert blk0.ref_cnt == 0
+
+
+def test_finish_mixed_null_and_hot_blocks_no_double_free_or_ref_cnt_corruption():
+    from vllm.v1.kv_cache_state import KVCacheStateTransition
+
+    manager = make_manager(([],), (4,), num_gpu_blocks=16)
+    pool = manager.block_pool
+    blk0, blk1, tail_blk = pool.get_new_blocks(3)
+    groups = ([blk0, blk1, tail_blk],)
+    manager.get_blocks = Mock(return_value=KVCacheBlocks(groups))
+
+    # 1. Commit migration of blk0 and blk1 to WARM
+    transition = KVCacheStateTransition(
+        transition_id=1,
+        request_id="request",
+        previous_state=KVBlockState.HOT,
+        new_state=KVBlockState.WARM,
+        changed_blocks=([
+            KVCacheBlockTransition(0, blk0.block_id),
+            KVCacheBlockTransition(1, blk1.block_id),
+        ],),
+    )
+    manager.commit_request_kv_transition(transition)
+
+    assert groups[0][0] is pool.null_block
+    assert groups[0][1] is pool.null_block
+    assert groups[0][2] is tail_blk
+    free_after_migration = pool.get_num_free_blocks()
+    null_ref_before = pool.null_block.ref_cnt
+
+    # 2. Free request blocks on finish
+    req_blocks = groups[0]
+    pool.free_blocks(reversed(req_blocks))
+
+    # Only tail_blk is freed; blk0 and blk1 are not freed a second time
+    assert tail_blk.ref_cnt == 0
+    assert pool.get_num_free_blocks() == free_after_migration + 1
+
+    # null_block.ref_cnt must not be decremented / corrupted
+    assert pool.null_block.ref_cnt == null_ref_before

@@ -1189,3 +1189,210 @@ def test_scheduler_fresh_retry_receives_new_transition_id():
     assert len(transitions2) == 1
     assert transitions2[0].transition_id == 1
     assert scheduler._pending_kv_transitions[session.request_id] == transitions2[0]
+
+
+def test_scheduler_repeated_resume_and_second_demotion_migrates_only_new_hot_blocks():
+    from tests.v1.streaming_input.test_scheduler_streaming import (
+        DummyRequest,
+        create_scheduler,
+    )
+
+    scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+    session = DummyRequest(
+        request_id="session",
+        prompt_token_ids=list(range(20)),
+        arrival_time=100.0,
+    )
+    scheduler.add_request(session)
+    scheduler.kv_cache_manager.allocate_slots(session, 20)
+    session.num_computed_tokens = 20
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    # Step 1: Turn 1 demotion (Block 0 complete, Block 1 partial tail)
+    transitions1 = scheduler._classify_idle_kv_sessions(current_time=110.0)
+    assert len(transitions1) == 1
+    assert len(transitions1[0].changed_blocks[0]) == 1
+    assert transitions1[0].changed_blocks[0][0].logical_block_index == 0
+
+    sched_out1 = SchedulerOutput.make_empty()
+    sched_out1.kv_cache_state_transitions = transitions1
+    mr_out1 = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_cache_transition_results=[
+            transitions1[0].to_result(KVCacheTransitionStatus.SUCCESS)
+        ],
+    )
+    scheduler._validate_kv_cache_transition_results(sched_out1, mr_out1)
+
+    blocks1 = scheduler.kv_cache_manager.get_blocks(session.request_id).blocks[0]
+    assert blocks1[0].is_null is True
+    assert blocks1[1].is_null is False and blocks1[1].ref_cnt == 1
+
+    # Step 2: Turn 2 input arrives (+30 tokens -> total 50 tokens = 4 blocks)
+    next_chunk = DummyRequest(
+        request_id="session",
+        prompt_token_ids=list(range(20, 50)),
+        arrival_time=111.0,
+    )
+    scheduler.add_request(next_chunk)
+    scheduler.kv_cache_manager.allocate_slots(session, 30)
+    session.num_computed_tokens = 50
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    blocks2 = scheduler.kv_cache_manager.get_blocks(session.request_id).blocks[0]
+    assert len(blocks2) == 4
+    assert blocks2[0].is_null is True  # previous WARM block
+    assert blocks2[1].is_null is False  # now complete
+    assert blocks2[2].is_null is False  # now complete
+    assert blocks2[3].is_null is False  # partial tail
+
+    # Step 3: Turn 2 demotion -> only blocks 1 and 2 planned (0 is null, 3 is partial)
+    transitions2 = scheduler._classify_idle_kv_sessions(current_time=125.0)
+    assert len(transitions2) == 1
+    changed2 = transitions2[0].changed_blocks[0]
+    assert len(changed2) == 2
+    assert changed2[0].logical_block_index == 1
+    assert changed2[1].logical_block_index == 2
+
+    # Step 4: Turn 2 ACK SUCCESS
+    sched_out2 = SchedulerOutput.make_empty()
+    sched_out2.kv_cache_state_transitions = transitions2
+    mr_out2 = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_cache_transition_results=[
+            transitions2[0].to_result(KVCacheTransitionStatus.SUCCESS)
+        ],
+    )
+    scheduler._validate_kv_cache_transition_results(sched_out2, mr_out2)
+
+    blocks3 = scheduler.kv_cache_manager.get_blocks(session.request_id).blocks[0]
+    assert blocks3[0].is_null is True
+    assert blocks3[1].is_null is True
+    assert blocks3[2].is_null is True
+    assert blocks3[3].is_null is False and blocks3[3].ref_cnt == 1
+
+    # Step 5: Finish session -> frees remaining tail HOT block cleanly
+    free_before = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+    null_ref_before = scheduler.kv_cache_manager.block_pool.null_block.ref_cnt
+    scheduler.finish_requests([session.request_id], RequestStatus.FINISHED_STOPPED)
+
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free_before + 1
+    assert scheduler.kv_cache_manager.block_pool.null_block.ref_cnt == null_ref_before
+
+
+def test_scheduler_abort_while_idle_with_warm_residency_releases_resources():
+    from tests.v1.streaming_input.test_scheduler_streaming import (
+        DummyRequest,
+        create_scheduler,
+    )
+
+    scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+    session = DummyRequest(
+        request_id="session",
+        prompt_token_ids=list(range(20)),
+        arrival_time=100.0,
+    )
+    scheduler.add_request(session)
+    scheduler.kv_cache_manager.allocate_slots(session, 20)
+    session.num_computed_tokens = 20
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    # Step 1: Migrate block 0 to WARM
+    transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+    sched_out = SchedulerOutput.make_empty()
+    sched_out.kv_cache_state_transitions = transitions
+    mr_out = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_cache_transition_results=[
+            transitions[0].to_result(KVCacheTransitionStatus.SUCCESS)
+        ],
+    )
+    scheduler._validate_kv_cache_transition_results(sched_out, mr_out)
+
+    # Step 2: Abort session while idle
+    free_before = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+    null_ref_before = scheduler.kv_cache_manager.block_pool.null_block.ref_cnt
+    scheduler.finish_requests([session.request_id], RequestStatus.FINISHED_ABORTED)
+
+    assert session.request_id not in scheduler.requests
+    # Only tail block 1 is returned to pool
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free_before + 1
+    assert scheduler.kv_cache_manager.block_pool.null_block.ref_cnt == null_ref_before
+
+
+def test_scheduler_preempt_request_with_mixed_warm_null_and_hot_blocks():
+    from tests.v1.streaming_input.test_scheduler_streaming import (
+        DummyRequest,
+        create_scheduler,
+    )
+
+    scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+    session = DummyRequest(
+        request_id="session",
+        prompt_token_ids=list(range(20)),
+        arrival_time=100.0,
+    )
+    scheduler.add_request(session)
+    scheduler.kv_cache_manager.allocate_slots(session, 20)
+    session.num_computed_tokens = 20
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    # Step 1: Migrate block 0 to WARM
+    transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+    sched_out = SchedulerOutput.make_empty()
+    sched_out.kv_cache_state_transitions = transitions
+    mr_out = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_cache_transition_results=[
+            transitions[0].to_result(KVCacheTransitionStatus.SUCCESS)
+        ],
+    )
+    scheduler._validate_kv_cache_transition_results(sched_out, mr_out)
+
+    blocks = scheduler.kv_cache_manager.get_blocks(session.request_id).blocks[0]
+    assert blocks[0].is_null is True
+    assert blocks[1].is_null is False and blocks[1].ref_cnt == 1
+
+    # Step 2: Request resumes running in Turn 2
+    session.status = RequestStatus.RUNNING
+    free_before_preempt = (
+        scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+    )
+    null_ref_before = (
+        scheduler.kv_cache_manager.block_pool.null_block.ref_cnt
+    )
+
+    # Step 3: Scheduler preempts the running request
+    scheduler._preempt_request(session, timestamp=120.0)
+
+    # Invariants after preemption:
+    assert session.status == RequestStatus.PREEMPTED
+    assert session.num_computed_tokens == 0
+    assert session.num_preemptions == 1
+    assert session in scheduler.waiting
+
+    # KV cache manager has no remaining blocks for this request
+    assert len(scheduler.kv_cache_manager.get_blocks(session.request_id).blocks[0]) == 0
+
+    # Only remaining real HOT tail block was freed; null_block was not ref-counted/freed
+    assert (
+        scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+        == free_before_preempt + 1
+    )
+    assert (
+        scheduler.kv_cache_manager.block_pool.null_block.ref_cnt
+        == null_ref_before
+    )
+
+    # Step 4: Rescheduling the preempted request allocates fresh blocks
+    allocated = scheduler.kv_cache_manager.allocate_slots(session, 20)
+    assert allocated is not None
+    reallocated_blocks = (
+        scheduler.kv_cache_manager.get_blocks(session.request_id).blocks[0]
+    )
+    assert len(reallocated_blocks) == 2
+    assert all(not b.is_null and b.ref_cnt == 1 for b in reallocated_blocks)
