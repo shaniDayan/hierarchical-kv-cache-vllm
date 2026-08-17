@@ -1393,3 +1393,45 @@ def test_scheduler_preempt_request_with_mixed_warm_null_and_hot_blocks():
     )
     assert len(reallocated_blocks) == 2
     assert all(not b.is_null and b.ref_cnt == 1 for b in reallocated_blocks)
+
+
+def test_scheduler_idle_past_cold_threshold_does_not_schedule_unsupported_cold_transition():
+    from tests.v1.streaming_input.test_scheduler_streaming import (
+        DummyRequest,
+        create_scheduler,
+    )
+
+    scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+    session = DummyRequest(
+        request_id="session",
+        prompt_token_ids=list(range(20)),
+        arrival_time=100.0,
+    )
+    scheduler.add_request(session)
+    scheduler.kv_cache_manager.allocate_slots(session, 20)
+    session.num_computed_tokens = 20
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    # 1. At t=110.0 (idle 10s >= hot_threshold 10s), migrates HOT -> WARM
+    transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+    assert len(transitions) == 1
+    assert transitions[0].previous_state is KVBlockState.HOT
+    assert transitions[0].new_state is KVBlockState.WARM
+
+    sched_out = SchedulerOutput.make_empty()
+    sched_out.kv_cache_state_transitions = transitions
+    mr_out = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_cache_transition_results=[
+            transitions[0].to_result(KVCacheTransitionStatus.SUCCESS)
+        ],
+    )
+    scheduler._validate_kv_cache_transition_results(sched_out, mr_out)
+    assert session.kv_cache_state is KVBlockState.WARM
+
+    # 2. At t=130.0 (idle 30s >= cold_threshold 20s), session is in WARM state.
+    # Because COLD tier is not implemented yet, it must NOT schedule WARM -> COLD.
+    cold_transitions = scheduler._classify_idle_kv_sessions(current_time=130.0)
+    assert cold_transitions == []
+    assert session.kv_cache_state is KVBlockState.WARM

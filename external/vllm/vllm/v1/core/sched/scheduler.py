@@ -1300,6 +1300,13 @@ class Scheduler(SchedulerInterface):
                 hot_threshold,
                 cold_threshold,
             )
+            # COLD migration is not implemented on the worker yet; prevent scheduling
+            # unsupported WARM -> COLD transitions while allowing HOT -> WARM.
+            if new_state is KVBlockState.COLD:
+                if previous_state is KVBlockState.WARM:
+                    continue
+                new_state = KVBlockState.WARM
+
             if _KV_STATE_COLDNESS[new_state] <= _KV_STATE_COLDNESS[previous_state]:
                 continue
 
