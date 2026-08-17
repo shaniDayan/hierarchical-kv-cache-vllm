@@ -287,12 +287,10 @@ def test_logical_warm_table_rebuild_clears_reused_request_row():
 
 
 def test_insufficient_warm_capacity_leaves_state_unchanged():
-    hot_to_warm_maps = {}
     manager = HKVWarmMigrationManager(
         warm_capacity=1,
         hot_kv_caches={},
         warm_kv_caches={},
-        hot_to_warm_maps=hot_to_warm_maps,
         device="cpu",
     )
 
@@ -303,7 +301,6 @@ def test_insufficient_warm_capacity_leaves_state_unchanged():
             ((2, 7),),
         )
 
-    assert hot_to_warm_maps == {}
     assert manager.allocator.num_owned_slots == 0
     assert manager.warm_residency == {}
 

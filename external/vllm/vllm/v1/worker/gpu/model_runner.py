@@ -570,7 +570,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 warm_capacity=warm_capacity,
                 hot_kv_caches=self.hkv_hot_kv_caches,
                 warm_kv_caches=self.hkv_warm_kv_caches,
-                hot_to_warm_maps=self.hkv_hot_to_warm_maps,
                 device=self.device,
             )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)

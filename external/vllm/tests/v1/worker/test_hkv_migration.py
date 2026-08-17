@@ -87,13 +87,11 @@ def test_allocator_failures_are_atomic_and_preserve_existing_mappings():
 
 
 def test_logical_residency_is_idempotent_and_released(monkeypatch):
-    hot_to_warm_map = torch.full((16,), -1, dtype=torch.int32)
     hot_kv_caches = {"layer": object()}
     manager = HKVWarmMigrationManager(
         warm_capacity=3,
         hot_kv_caches=hot_kv_caches,
         warm_kv_caches={},
-        hot_to_warm_maps={"layer": hot_to_warm_map, "alias": hot_to_warm_map},
         device="cpu",
     )
 
@@ -101,9 +99,6 @@ def test_logical_residency_is_idempotent_and_released(monkeypatch):
 
     def quantize(**kwargs):
         quantized.append((kwargs["hot_block_ids"], kwargs["warm_slot_ids"]))
-        hot_to_warm_map[list(kwargs["hot_block_ids"])] = torch.tensor(
-            kwargs["warm_slot_ids"], dtype=torch.int32
-        )
 
     monkeypatch.setattr(attn_utils, "quantize_hkv_blocks_to_warm", quantize)
     changed = ([transition(0, 3), transition(1, 7)],)
@@ -158,7 +153,6 @@ def test_reused_hot_block_id_does_not_alias_or_corrupt_warm_residency(monkeypatc
     hot_cache[17, 1].fill_(2.0)
 
     warm_cache = torch.zeros((4, 2, 16, 4, 68), dtype=torch.int8)
-    hot_to_warm_map = torch.full((32,), -1, dtype=torch.int32)
 
     def mock_quantize(**kwargs):
         for hot_id, warm_slot in zip(
@@ -166,7 +160,6 @@ def test_reused_hot_block_id_does_not_alias_or_corrupt_warm_residency(monkeypatc
         ):
             warm_cache[warm_slot, 0].fill_(int(hot_cache[hot_id, 0][0, 0, 0].item()))
             warm_cache[warm_slot, 1].fill_(int(hot_cache[hot_id, 1][0, 0, 0].item()))
-            hot_to_warm_map[hot_id] = warm_slot
 
     monkeypatch.setattr(attn_utils, "quantize_hkv_blocks_to_warm", mock_quantize)
 
@@ -174,7 +167,6 @@ def test_reused_hot_block_id_does_not_alias_or_corrupt_warm_residency(monkeypatc
         warm_capacity=4,
         hot_kv_caches={"layer": hot_cache},
         warm_kv_caches={"layer": warm_cache},
-        hot_to_warm_maps={"layer": hot_to_warm_map},
         device="cpu",
     )
 
@@ -225,20 +217,15 @@ def test_reused_hot_block_id_does_not_alias_or_corrupt_warm_residency(monkeypatc
 def test_population_failures_preserve_existing_residency(
     monkeypatch, case, error, message
 ):
-    hot_to_warm_map = torch.full((16,), -1, dtype=torch.int32)
     manager = HKVWarmMigrationManager(
         warm_capacity=2,
         hot_kv_caches={},
         warm_kv_caches={},
-        hot_to_warm_maps={"layer": hot_to_warm_map},
         device="cpu",
     )
     fail_quantization = False
 
     def quantize(**kwargs):
-        hot_to_warm_map[list(kwargs["hot_block_ids"])] = torch.tensor(
-            kwargs["warm_slot_ids"], dtype=torch.int32
-        )
         if fail_quantization:
             raise RuntimeError("quantization failed")
 
@@ -246,7 +233,6 @@ def test_population_failures_preserve_existing_residency(
     manager.migrate("request-a", ([transition(0, 3)],), ((3,),))
     existing_revision = manager.warm_residency_revision
     existing_residency = manager.warm_residency.copy()
-    existing_projection = hot_to_warm_map.clone()
 
     if case == "stale_source":
         changed, block_table = ([transition(0, 7)],), ((8,),)
@@ -265,7 +251,6 @@ def test_population_failures_preserve_existing_residency(
 
     assert manager.warm_residency == existing_residency
     assert manager.warm_residency_revision == existing_revision
-    assert torch.equal(hot_to_warm_map, existing_projection)
     assert manager.allocator.num_owned_slots == 1
     assert manager.allocator.lookup(key("request-a", 0, 0)) == 0
     assert manager.allocator.lookup(key("request-b", 0, 0)) is None
@@ -273,43 +258,44 @@ def test_population_failures_preserve_existing_residency(
 
 
 def test_quantize_hkv_blocks_to_warm_accepts_reused_hot_block_id(monkeypatch):
-    """Direct test for production quantize_hkv_blocks_to_warm on HOT-ID reuse.
+    """Direct test for production quantize_hkv_blocks_to_warm without map tensors.
 
-    Verifies that calling quantize_hkv_blocks_to_warm with a physical HOT block
-    ID that was previously mapped to WARM slot A successfully overwrites and maps
-    to WARM slot B without raising a legacy mapping conflict error.
+    Verifies that calling quantize_hkv_blocks_to_warm with physical HOT block
+    IDs and WARM slot IDs operates purely between hot/warm cache tensors without
+    requiring hot_to_warm_maps, and handles reused HOT block IDs cleanly.
     """
     hot_cache = torch.zeros((32, 2, 16, 4, 64), dtype=torch.float16)
     warm_cache = torch.zeros((4, 2, 16, 4, 68), dtype=torch.int8)
-    hot_to_warm_map = torch.full((32,), -1, dtype=torch.int32)
 
-    # Monkeypatch the low-level Triton GPU kernel to a CPU dummy
+    quantized_slots = []
+
+    def mock_triton(hot_k, hot_v, warm_k, warm_v, k_sc, v_sc, dest_slots):
+        quantized_slots.append(dest_slots.clone())
+
     monkeypatch.setattr(
         attn_utils,
         "triton_reshape_and_cache_flash_per_token_head_quant",
-        lambda *args, **kwargs: None,
+        mock_triton,
     )
 
-    # 1. Turn 1: Physical HOT block 17 is quantized to WARM slot 0
+    # 1. Turn 1: Physical HOT block 17 is quantized to WARM slot 0 without map tensor
     attn_utils.quantize_hkv_blocks_to_warm(
         hot_kv_caches={"layer": hot_cache},
         warm_kv_caches={"layer": warm_cache},
-        hot_to_warm_maps={"layer": hot_to_warm_map},
         hot_block_ids=(17,),
         warm_slot_ids=(0,),
         device=torch.device("cpu"),
     )
-    assert hot_to_warm_map[17].item() == 0
+    assert len(quantized_slots) == 1
+    assert quantized_slots[0][0].item() == 0  # slot 0 * 16 + 0 = 0
 
-    # 2. Turn 2: Exact same physical HOT block 17 is reused by another request
-    # and quantized to a different WARM slot 2.
-    # Must succeed without raising "HOT block 17 is already mapped to 0".
+    # 2. Turn 2: Exact same physical HOT block 17 is reused and quantized to WARM slot 2
     attn_utils.quantize_hkv_blocks_to_warm(
         hot_kv_caches={"layer": hot_cache},
         warm_kv_caches={"layer": warm_cache},
-        hot_to_warm_maps={"layer": hot_to_warm_map},
         hot_block_ids=(17,),
         warm_slot_ids=(2,),
         device=torch.device("cpu"),
     )
-    assert hot_to_warm_map[17].item() == 2
+    assert len(quantized_slots) == 2
+    assert quantized_slots[1][0].item() == 32  # slot 2 * 16 + 0 = 32

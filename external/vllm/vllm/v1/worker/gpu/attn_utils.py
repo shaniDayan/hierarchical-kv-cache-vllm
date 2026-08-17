@@ -340,12 +340,12 @@ def quantize_hkv_blocks_to_warm(
     *,
     hot_kv_caches: dict[str, torch.Tensor],
     warm_kv_caches: dict[str, torch.Tensor],
-    hot_to_warm_maps: dict[str, torch.Tensor],
     hot_block_ids: Sequence[int],
     warm_slot_ids: Sequence[int],
     device: torch.device,
+    hot_to_warm_maps: dict[str, torch.Tensor] | None = None,
 ) -> None:
-    """Quantize HOT blocks into WARM slots and publish their map entries."""
+    """Quantize HOT blocks into WARM slots."""
     if len(hot_block_ids) != len(warm_slot_ids):
         raise ValueError("HOT block and WARM slot counts must match")
     if not hot_block_ids:
@@ -353,22 +353,16 @@ def quantize_hkv_blocks_to_warm(
     if len(set(warm_slot_ids)) != len(warm_slot_ids):
         raise ValueError("WARM slot IDs must be unique")
 
-    layer_names = (
-        hot_kv_caches.keys()
-        & warm_kv_caches.keys()
-        & hot_to_warm_maps.keys()
-    )
+    layer_names = hot_kv_caches.keys() & warm_kv_caches.keys()
     if not layer_names:
-        raise ValueError("No HOT/WARM cache and map tensors are available")
+        raise ValueError("No matching HOT and WARM cache layers available")
 
     operations = []
-    maps: dict[int, torch.Tensor] = {}
     processed_pairs: set[tuple[int, int]] = set()
     block_size = None
     for layer_name in layer_names:
         hot_cache = hot_kv_caches[layer_name]
         warm_cache = warm_kv_caches[layer_name]
-        hot_to_warm_map = hot_to_warm_maps[layer_name]
         k_scales, v_scales, head_size = _get_hkv_per_token_head_scale_views(
             warm_cache
         )
@@ -392,7 +386,6 @@ def quantize_hkv_blocks_to_warm(
             processed_pairs.add(pair)
             warm_key, warm_value = warm_cache.unbind(1)
             operations.append((hot_cache, warm_key, warm_value, k_scales, v_scales))
-        maps[hot_to_warm_map.untyped_storage().data_ptr()] = hot_to_warm_map
         block_size = warm_cache.shape[2]
 
     assert block_size is not None
@@ -419,8 +412,13 @@ def quantize_hkv_blocks_to_warm(
             destination_slots,
         )
 
-    for hot_to_warm_map in maps.values():
-        hot_to_warm_map[hot_ids] = warm_ids.to(torch.int32)
+    if hot_to_warm_maps:
+        maps: dict[int, torch.Tensor] = {}
+        for layer_name in layer_names & hot_to_warm_maps.keys():
+            m = hot_to_warm_maps[layer_name]
+            maps[m.untyped_storage().data_ptr()] = m
+        for hot_to_warm_map in maps.values():
+            hot_to_warm_map[hot_ids] = warm_ids.to(torch.int32)
 
 
 def debug_demote_one_hkv_block(

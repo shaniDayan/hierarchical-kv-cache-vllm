@@ -285,13 +285,11 @@ class HKVWarmMigrationManager:
         warm_capacity: int,
         hot_kv_caches: dict[str, Any],
         warm_kv_caches: dict[str, Any],
-        hot_to_warm_maps: dict[str, Any],
         device: Any,
     ) -> None:
         self.allocator = HKVWarmSlotAllocator(warm_capacity)
         self.hot_kv_caches = hot_kv_caches
         self.warm_kv_caches = warm_kv_caches
-        self.hot_to_warm_maps = hot_to_warm_maps
         self.device = device
         self.warm_residency: dict[tuple[str, int, int], HKVWarmResidency] = {}
         self.warm_residency_revision = 0
@@ -383,23 +381,8 @@ class HKVWarmMigrationManager:
         new_warm_slot_ids = tuple(
             mappings[key] for key in reservation.newly_allocated
         )
-        projection_snapshots = []
         try:
             if new_hot_block_ids:
-                unique_maps = {
-                    (
-                        hot_to_warm_map.device,
-                        hot_to_warm_map.untyped_storage().data_ptr(),
-                    ): hot_to_warm_map
-                    for hot_to_warm_map in self.hot_to_warm_maps.values()
-                }
-                projection_snapshots = [
-                    (
-                        hot_to_warm_map,
-                        hot_to_warm_map[list(new_hot_block_ids)].clone(),
-                    )
-                    for hot_to_warm_map in unique_maps.values()
-                ]
                 from vllm.v1.worker.gpu.attn_utils import (
                     quantize_hkv_blocks_to_warm,
                 )
@@ -407,17 +390,12 @@ class HKVWarmMigrationManager:
                 quantize_hkv_blocks_to_warm(
                     hot_kv_caches=self.hot_kv_caches,
                     warm_kv_caches=self.warm_kv_caches,
-                    hot_to_warm_maps=self.hot_to_warm_maps,
                     hot_block_ids=new_hot_block_ids,
                     warm_slot_ids=new_warm_slot_ids,
                     device=self.device,
                 )
         except Exception:
-            try:
-                for hot_to_warm_map, previous in projection_snapshots:
-                    hot_to_warm_map[list(new_hot_block_ids)] = previous
-            finally:
-                self.allocator.rollback(reservation)
+            self.allocator.rollback(reservation)
             raise
         self.allocator.commit(reservation)
         for key, hot_block_id in new_entries.items():
