@@ -647,6 +647,13 @@ class KVCacheManager:
     ) -> None:
         """Commit exact planned blocks to target hierarchy state on SUCCESS."""
         request_blocks = self.get_blocks(transition.request_id).blocks
+        if len(transition.changed_blocks) > len(request_blocks):
+            raise ValueError(
+                f"Transition has {len(transition.changed_blocks)} groups but "
+                f"request {transition.request_id} has {len(request_blocks)} groups"
+            )
+
+        validated_reclaims: list[tuple[int, int, KVCacheBlock]] = []
         for group_idx, group_transitions in enumerate(transition.changed_blocks):
             if group_idx >= len(request_blocks):
                 raise ValueError(
@@ -663,6 +670,11 @@ class KVCacheManager:
                         f"during commit for request {transition.request_id}"
                     )
                 block = current_group[logical_idx]
+                if block.is_null:
+                    raise ValueError(
+                        f"Logical block index {logical_idx} is already a null block "
+                        f"during commit for request {transition.request_id}"
+                    )
                 if block.block_id != expected_hot_id:
                     raise ValueError(
                         f"Physical block ID mismatch during commit for "
@@ -670,7 +682,29 @@ class KVCacheManager:
                         f"logical block {logical_idx}: expected block_id "
                         f"{expected_hot_id}, found {block.block_id}"
                     )
+                if block.ref_cnt != 1:
+                    raise ValueError(
+                        f"Cannot reclaim shared or unreferenced block during commit "
+                        f"for request {transition.request_id} group {group_idx} "
+                        f"logical block {logical_idx}: ref_cnt={block.ref_cnt}"
+                    )
+                validated_reclaims.append((group_idx, logical_idx, block))
+
+        freed_blocks: list[KVCacheBlock] = []
+        null_block = self.block_pool.null_block
+
+        for group_idx, logical_idx, block in validated_reclaims:
+            if transition.new_state is KVBlockState.WARM:
+                if self.enable_caching and block.block_hash is not None:
+                    self.block_pool._maybe_evict_cached_block(block)
+                current_group = request_blocks[group_idx]
+                current_group[logical_idx] = null_block
+                freed_blocks.append(block)
+            else:
                 block.hierarchy_state = transition.new_state
+
+        if freed_blocks:
+            self.block_pool.free_blocks(reversed(freed_blocks))
 
     def apply_request_kv_state(
         self,

@@ -125,9 +125,6 @@ def test_logical_residency_is_idempotent_and_released(monkeypatch):
 
     assert manager.release_request("request-a") == (0, 1)
     assert manager.warm_residency_revision == 3
-    assert hot_to_warm_map[3].item() == -1
-    assert hot_to_warm_map[7].item() == -1
-    assert hot_to_warm_map[11].item() == 2
     assert not any(key[0] == "request-a" for key in manager.warm_residency)
     assert manager.allocator.lookup(key("request-b", 0, 0)) == 2
 
@@ -142,6 +139,78 @@ def test_logical_residency_is_idempotent_and_released(monkeypatch):
     assert manager.warm_residency[("request-c", 0, 0)].warm_slot_id == 0
     assert manager.warm_residency[("request-c", 0, 1)].warm_slot_id == 1
     manager.allocator.validate_invariants()
+
+
+def test_reused_hot_block_id_does_not_alias_or_corrupt_warm_residency(monkeypatch):
+    """Regression test: Physical HOT block ID X is reused across requests.
+
+    A: HOT X -> WARM slot 0
+    X is reclaimed
+    B receives the exact same HOT X
+    B -> WARM to a different WARM slot 1
+    => succeeds
+    => A's WARM residency/data remains unchanged
+    => releasing A does not corrupt B
+    """
+    hot_cache = torch.zeros((32, 2, 16, 4, 64), dtype=torch.float16)
+    # Fill HOT 17 with Request A's data
+    hot_cache[17, 0].fill_(1.0)
+    hot_cache[17, 1].fill_(2.0)
+
+    warm_cache = torch.zeros((4, 2, 16, 4, 68), dtype=torch.int8)
+    hot_to_warm_map = torch.full((32,), -1, dtype=torch.int32)
+
+    def mock_quantize(**kwargs):
+        for hot_id, warm_slot in zip(
+            kwargs["hot_block_ids"], kwargs["warm_slot_ids"], strict=True
+        ):
+            warm_cache[warm_slot, 0].fill_(int(hot_cache[hot_id, 0][0, 0, 0].item()))
+            warm_cache[warm_slot, 1].fill_(int(hot_cache[hot_id, 1][0, 0, 0].item()))
+            hot_to_warm_map[hot_id] = warm_slot
+
+    monkeypatch.setattr(attn_utils, "quantize_hkv_blocks_to_warm", mock_quantize)
+
+    manager = HKVWarmMigrationManager(
+        warm_capacity=4,
+        hot_kv_caches={"layer": hot_cache},
+        warm_kv_caches={"layer": warm_cache},
+        hot_to_warm_maps={"layer": hot_to_warm_map},
+        device="cpu",
+    )
+
+    # 1. Request A migrates HOT 17 -> WARM slot 0
+    changed_a = ([transition(0, 17)],)
+    assert manager.migrate("request-a", changed_a, ((17,),))
+    assert manager.warm_residency[key("request-a", 0, 0)].warm_slot_id == 0
+
+    # Save a copy of Request A's quantized data in WARM slot 0
+    slot_a_k = warm_cache[0, 0].clone()
+    slot_a_v = warm_cache[0, 1].clone()
+
+    # 2. HOT 17 is reclaimed by scheduler and reused by Request B
+    # Request B writes different data into HOT 17
+    hot_cache[17, 0].fill_(10.0)
+    hot_cache[17, 1].fill_(20.0)
+
+    # 3. Request B migrates HOT 17 -> WARM (allocated to WARM slot 1)
+    changed_b = ([transition(0, 17)],)
+    assert manager.migrate("request-b", changed_b, ((17,),))
+    assert manager.warm_residency[key("request-b", 0, 0)].warm_slot_id == 1
+
+    # Verify Request A's WARM slot 0 data was NOT overwritten
+    assert torch.equal(warm_cache[0, 0], slot_a_k)
+    assert torch.equal(warm_cache[0, 1], slot_a_v)
+
+    # Verify Request B's WARM slot 1 contains its own quantized data
+    assert not torch.equal(warm_cache[1, 0], slot_a_k)
+    assert not torch.equal(warm_cache[1, 1], slot_a_v)
+
+    # 4. Releasing Request A does NOT corrupt Request B
+    released_a = manager.release_request("request-a")
+    assert released_a == (0,)
+    assert key("request-a", 0, 0) not in manager.warm_residency
+    assert manager.warm_residency[key("request-b", 0, 0)].warm_slot_id == 1
+    assert manager.allocator.lookup(key("request-b", 0, 0)) == 1
 
 
 @pytest.mark.parametrize(
@@ -201,3 +270,46 @@ def test_population_failures_preserve_existing_residency(
     assert manager.allocator.lookup(key("request-a", 0, 0)) == 0
     assert manager.allocator.lookup(key("request-b", 0, 0)) is None
     manager.allocator.validate_invariants()
+
+
+def test_quantize_hkv_blocks_to_warm_accepts_reused_hot_block_id(monkeypatch):
+    """Direct test for production quantize_hkv_blocks_to_warm on HOT-ID reuse.
+
+    Verifies that calling quantize_hkv_blocks_to_warm with a physical HOT block
+    ID that was previously mapped to WARM slot A successfully overwrites and maps
+    to WARM slot B without raising a legacy mapping conflict error.
+    """
+    hot_cache = torch.zeros((32, 2, 16, 4, 64), dtype=torch.float16)
+    warm_cache = torch.zeros((4, 2, 16, 4, 68), dtype=torch.int8)
+    hot_to_warm_map = torch.full((32,), -1, dtype=torch.int32)
+
+    # Monkeypatch the low-level Triton GPU kernel to a CPU dummy
+    monkeypatch.setattr(
+        attn_utils,
+        "triton_reshape_and_cache_flash_per_token_head_quant",
+        lambda *args, **kwargs: None,
+    )
+
+    # 1. Turn 1: Physical HOT block 17 is quantized to WARM slot 0
+    attn_utils.quantize_hkv_blocks_to_warm(
+        hot_kv_caches={"layer": hot_cache},
+        warm_kv_caches={"layer": warm_cache},
+        hot_to_warm_maps={"layer": hot_to_warm_map},
+        hot_block_ids=(17,),
+        warm_slot_ids=(0,),
+        device=torch.device("cpu"),
+    )
+    assert hot_to_warm_map[17].item() == 0
+
+    # 2. Turn 2: Exact same physical HOT block 17 is reused by another request
+    # and quantized to a different WARM slot 2.
+    # Must succeed without raising "HOT block 17 is already mapped to 0".
+    attn_utils.quantize_hkv_blocks_to_warm(
+        hot_kv_caches={"layer": hot_cache},
+        warm_kv_caches={"layer": warm_cache},
+        hot_to_warm_maps={"layer": hot_to_warm_map},
+        hot_block_ids=(17,),
+        warm_slot_ids=(2,),
+        device=torch.device("cpu"),
+    )
+    assert hot_to_warm_map[17].item() == 2

@@ -976,7 +976,8 @@ def test_scheduler_resume_while_pending_is_deferred_and_proceeds_after_ack():
     block_groups = scheduler.kv_cache_manager.get_blocks(
         session.request_id
     ).blocks
-    assert block_groups[0][0].hierarchy_state is KVBlockState.WARM
+    assert block_groups[0][0].is_null is True
+    assert block_groups[0][1].hierarchy_state is KVBlockState.HOT
 
 
 def test_scheduler_abort_while_pending_is_deferred_and_propagates_worker_cleanup():

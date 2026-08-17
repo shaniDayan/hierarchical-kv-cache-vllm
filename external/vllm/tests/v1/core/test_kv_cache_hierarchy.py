@@ -13,10 +13,21 @@ from vllm.v1.kv_cache_state import KVBlockState, KVCacheBlockTransition
 def make_manager(
     block_groups: tuple[list[KVCacheBlock], ...],
     block_sizes: tuple[int, ...],
+    *,
+    num_gpu_blocks: int = 64,
+    enable_caching: bool = False,
 ) -> KVCacheManager:
+    from vllm.v1.core.block_pool import BlockPool
+
     manager = KVCacheManager.__new__(KVCacheManager)
     manager.get_blocks = Mock(return_value=KVCacheBlocks(block_groups))
     manager.block_sizes = block_sizes
+    manager.block_pool = BlockPool(
+        num_gpu_blocks=num_gpu_blocks,
+        enable_caching=enable_caching,
+        hash_block_size=block_sizes[0],
+    )
+    manager.enable_caching = enable_caching
     return manager
 
 
@@ -124,33 +135,147 @@ def test_plan_request_kv_state_non_mutating():
     assert unreferenced.hierarchy_state is KVBlockState.HOT
 
 
-def test_commit_request_kv_transition_success_and_fail_closed():
+def test_commit_request_kv_transition_success_reclaims_hot_blocks():
     from vllm.v1.kv_cache_state import KVCacheStateTransition
 
-    blk0 = make_block(10)
-    blk1 = make_block(20)
-    groups = ([blk0, blk1],)
-    manager = make_manager(groups, (4,))
+    manager = make_manager(([],), (4,), num_gpu_blocks=16)
+    pool = manager.block_pool
+    blk0, blk1, blk2 = pool.get_new_blocks(3)
+    groups = ([blk0, blk1, blk2],)
+    manager.get_blocks = Mock(return_value=KVCacheBlocks(groups))
+    free_before = pool.get_num_free_blocks()
 
     transition = KVCacheStateTransition(
         transition_id=1,
         request_id="request",
         previous_state=KVBlockState.HOT,
         new_state=KVBlockState.WARM,
-        changed_blocks=([KVCacheBlockTransition(0, 10)],),
+        changed_blocks=([
+            KVCacheBlockTransition(0, blk0.block_id),
+            KVCacheBlockTransition(1, blk1.block_id),
+        ],),
     )
 
     manager.commit_request_kv_transition(transition)
-    assert blk0.hierarchy_state is KVBlockState.WARM
-    assert blk1.hierarchy_state is KVBlockState.HOT
 
-    # Stale physical identity must fail closed
-    mismatched_transition = KVCacheStateTransition(
-        transition_id=2,
+    # Migrated logical entries become null_block placeholders
+    assert groups[0][0] is pool.null_block
+    assert groups[0][0].is_null is True
+    assert groups[0][1] is pool.null_block
+    assert groups[0][1].is_null is True
+
+    # Tail/unmigrated block remains untouched HOT block
+    assert groups[0][2] is blk2
+    assert blk2.is_null is False
+    assert blk2.ref_cnt == 1
+    assert blk2.hierarchy_state is KVBlockState.HOT
+
+    # Reclaimed physical blocks returned to pool
+    assert blk0.ref_cnt == 0
+    assert blk1.ref_cnt == 0
+    assert pool.get_num_free_blocks() == free_before + 2
+
+    # Physical blocks are immediately reusable
+    reused = pool.get_new_blocks(2)
+    assert {b.block_id for b in reused} == {blk0.block_id, blk1.block_id}
+    assert all(b.ref_cnt == 1 and b.hierarchy_state is KVBlockState.HOT for b in reused)
+
+
+def test_commit_request_kv_transition_fail_closed_validations():
+    from vllm.v1.kv_cache_state import KVCacheStateTransition
+
+    manager = make_manager(([],), (4,), num_gpu_blocks=16)
+    pool = manager.block_pool
+    blk0, blk1 = pool.get_new_blocks(2)
+    shared_blk = pool.get_new_blocks(1)[0]
+    shared_blk.ref_cnt = 2
+    groups = ([blk0, blk1, shared_blk],)
+    manager.get_blocks = Mock(return_value=KVCacheBlocks(groups))
+    free_before = pool.get_num_free_blocks()
+
+    # 1. Stale physical block ID mismatch
+    with pytest.raises(ValueError, match="Physical block ID mismatch"):
+        manager.commit_request_kv_transition(
+            KVCacheStateTransition(
+                transition_id=1,
+                request_id="request",
+                previous_state=KVBlockState.HOT,
+                new_state=KVBlockState.WARM,
+                changed_blocks=([KVCacheBlockTransition(0, 999)],),
+            )
+        )
+
+    # 2. Out of range logical block index
+    with pytest.raises(ValueError, match="Logical block index 5 out of range"):
+        manager.commit_request_kv_transition(
+            KVCacheStateTransition(
+                transition_id=2,
+                request_id="request",
+                previous_state=KVBlockState.HOT,
+                new_state=KVBlockState.WARM,
+                changed_blocks=([KVCacheBlockTransition(5, blk0.block_id)],),
+            )
+        )
+
+    # 3. Out of range cache group index
+    with pytest.raises(ValueError, match="Transition has 2 groups but request"):
+        manager.commit_request_kv_transition(
+            KVCacheStateTransition(
+                transition_id=3,
+                request_id="request",
+                previous_state=KVBlockState.HOT,
+                new_state=KVBlockState.WARM,
+                changed_blocks=([], [KVCacheBlockTransition(0, blk0.block_id)]),
+            )
+        )
+
+    # 4. Reclaiming a shared block (ref_cnt > 1) is rejected
+    with pytest.raises(ValueError, match="Cannot reclaim shared or unreferenced block"):
+        manager.commit_request_kv_transition(
+            KVCacheStateTransition(
+                transition_id=4,
+                request_id="request",
+                previous_state=KVBlockState.HOT,
+                new_state=KVBlockState.WARM,
+                changed_blocks=([KVCacheBlockTransition(2, shared_blk.block_id)],),
+            )
+        )
+
+    # All failures leave state completely unmodified
+    assert groups[0][0] is blk0 and blk0.ref_cnt == 1
+    assert groups[0][1] is blk1 and blk1.ref_cnt == 1
+    assert groups[0][2] is shared_blk and shared_blk.ref_cnt == 2
+    assert pool.get_num_free_blocks() == free_before
+
+
+def test_commit_request_kv_transition_evicts_prefix_cache_before_reclaim():
+    from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
+    from vllm.v1.kv_cache_state import KVCacheStateTransition
+
+    manager = make_manager(([],), (4,), num_gpu_blocks=16, enable_caching=True)
+    pool = manager.block_pool
+    blk0 = pool.get_new_blocks(1)[0]
+    groups = ([blk0],)
+    manager.get_blocks = Mock(return_value=KVCacheBlocks(groups))
+
+    # Set up a prefix-cache hash entry on the block
+    hash_key = make_block_hash_with_group_id(BlockHash(b"hkv_hash_key_1234"), 0)
+    pool._insert_block_hash(hash_key, blk0, num_tokens=4)
+    assert pool.cached_block_hash_to_block.contain(hash_key, blk0.block_id)
+    assert blk0.block_hash == hash_key
+
+    transition = KVCacheStateTransition(
+        transition_id=1,
         request_id="request",
         previous_state=KVBlockState.HOT,
         new_state=KVBlockState.WARM,
-        changed_blocks=([KVCacheBlockTransition(1, 999)],),
+        changed_blocks=([KVCacheBlockTransition(0, blk0.block_id)],),
     )
-    with pytest.raises(ValueError, match="Physical block ID mismatch"):
-        manager.commit_request_kv_transition(mismatched_transition)
+
+    manager.commit_request_kv_transition(transition)
+
+    # Hash entry is evicted from APC lookup table
+    assert not pool.cached_block_hash_to_block.contain(hash_key, blk0.block_id)
+    assert blk0.block_hash is None
+    assert groups[0][0] is pool.null_block
+    assert blk0.ref_cnt == 0

@@ -383,14 +383,6 @@ def quantize_hkv_blocks_to_warm(
             warm_cache.shape[0]
         ):
             raise ValueError("HOT block or WARM slot is out of range")
-        for hot_block_id, warm_slot_id in zip(
-            hot_block_ids, warm_slot_ids, strict=True
-        ):
-            previous = hot_to_warm_map[hot_block_id].item()
-            if previous not in (-1, warm_slot_id):
-                raise ValueError(
-                    f"HOT block {hot_block_id} is already mapped to {previous}"
-                )
 
         pair = (
             hot_cache.untyped_storage().data_ptr(),

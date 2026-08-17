@@ -437,25 +437,6 @@ class HKVWarmMigrationManager:
         ]
         if not request_entries:
             return ()
-        if any(key[1] != 0 for key, _ in request_entries):
-            raise ValueError("WARM migration cleanup supports only cache group 0")
-
-        hot_block_ids = list(
-            dict.fromkeys(
-                entry.temporary_shadow_hot_block_id
-                for _, entry in request_entries
-            )
-        )
-        unique_maps = {}
-        for hot_to_warm_map in self.hot_to_warm_maps.values():
-            storage_key = (
-                hot_to_warm_map.device,
-                hot_to_warm_map.untyped_storage().data_ptr(),
-            )
-            unique_maps[storage_key] = hot_to_warm_map
-        for hot_to_warm_map in unique_maps.values():
-            hot_to_warm_map[hot_block_ids] = -1
-
         released_slots = self.allocator.release_keys(
             key for key, _ in request_entries
         )
