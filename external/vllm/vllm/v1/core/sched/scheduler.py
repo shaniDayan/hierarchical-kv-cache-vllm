@@ -2249,9 +2249,6 @@ class Scheduler(SchedulerInterface):
             valid_requests.append(request)
             if req_id in self._pending_kv_transitions:
                 self._pending_finish_requests[req_id] = finished_status
-                if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-                    self.num_waiting_for_streaming_input -= 1
-                waiting_requests_to_remove.append(request)
                 continue
 
             if request.status == RequestStatus.RUNNING:
@@ -2654,6 +2651,8 @@ class Scheduler(SchedulerInterface):
             return True
 
         if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            if request.request_id in self._pending_kv_transitions:
+                return False
             assert not request.streaming_queue
             return False
 

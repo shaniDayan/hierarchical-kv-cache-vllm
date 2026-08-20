@@ -19,7 +19,7 @@ from vllm.v1.kv_cache_state import (
     KVCacheTransitionStatus,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.worker.gpu.hkv_migration import (
     HKVWarmCapacityError,
     HKVWarmMigrationManager,
@@ -1043,40 +1043,158 @@ def test_scheduler_success_fails_closed_on_physical_block_mismatch():
         )
 
 
-def test_scheduler_resume_while_pending_is_deferred_and_proceeds_after_ack():
+def _setup_waiting_streaming_session(
+    scheduler: Scheduler,
+    request_id: str = "session",
+    prompt_token_ids: list[int] | None = None,
+) -> Request:
+    from tests.v1.streaming_input.test_scheduler_streaming import (
+        STOP_TOKEN,
+        DummyRequest,
+    )
+
+    if prompt_token_ids is None:
+        prompt_token_ids = list(range(20))
+    session = DummyRequest(
+        request_id=request_id,
+        prompt_token_ids=prompt_token_ids,
+        arrival_time=100.0,
+    )
+    scheduler.add_request(session)
+    sched_out = scheduler.schedule()
+    mro = ModelRunnerOutput(
+        req_ids=[session.request_id],
+        req_id_to_index={session.request_id: 0},
+        sampled_token_ids=[[STOP_TOKEN]],
+        logprobs=None,
+        prompt_logprobs_dict={session.request_id: None},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(sched_out, mro)
+    assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert scheduler.num_waiting_for_streaming_input == 1
+    return session
+
+
+@pytest.mark.parametrize(
+    ("transition_status", "error_message", "expected_block_state"),
+    [
+        (KVCacheTransitionStatus.SUCCESS, None, None),
+        (
+            KVCacheTransitionStatus.RETRYABLE_CAPACITY,
+            "no warm slots",
+            KVBlockState.HOT,
+        ),
+        (
+            KVCacheTransitionStatus.STALE_VALIDATION,
+            "stale block mismatch",
+            KVBlockState.HOT,
+        ),
+    ],
+    ids=("success", "retryable-capacity", "stale-validation"),
+)
+def test_scheduler_resume_while_pending_transition_outcomes(
+    transition_status: KVCacheTransitionStatus,
+    error_message: str | None,
+    expected_block_state: KVBlockState | None,
+):
     from tests.v1.streaming_input.test_scheduler_streaming import (
         DummyRequest,
         create_scheduler,
     )
 
     scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
-    session = DummyRequest(
-        request_id="session",
-        prompt_token_ids=list(range(20)),
-        arrival_time=100.0,
-    )
-    scheduler.add_request(session)
-    scheduler.kv_cache_manager.allocate_slots(session, 20)
-    session.num_computed_tokens = 20
-    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session = _setup_waiting_streaming_session(scheduler)
 
-    # Step 1: Planning creates pending transition
-    transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+    transitions = scheduler._classify_idle_kv_sessions(current_time=115.0)
     assert len(transitions) == 1
     assert "session" in scheduler._pending_kv_transitions
 
-    # Step 2: Incoming prompt chunk arrives while transition is pending
-    # Must NOT raise RuntimeError; must queue into streaming_queue
     next_chunk = DummyRequest(
         request_id="session",
         prompt_token_ids=list(range(20, 30)),
-        arrival_time=111.0,
+        arrival_time=116.0,
     )
     scheduler.add_request(next_chunk)
     assert len(session.streaming_queue) == 1
     assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
 
-    # Step 3: Worker ACK arrives
+    # schedule() while pending does not assert or promote; update stays queued
+    sched_out_pending = scheduler.schedule()
+    assert session.request_id not in sched_out_pending.num_scheduled_tokens
+    assert len(session.streaming_queue) == 1
+    assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    # Worker ACK/NACK arrives
+    sched_out = SchedulerOutput.make_empty()
+    sched_out.kv_cache_state_transitions = transitions
+    mr_out = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_cache_transition_results=[
+            transitions[0].to_result(transition_status, error_message)
+        ],
+    )
+    scheduler._validate_kv_cache_transition_results(sched_out, mr_out)
+
+    assert "session" not in scheduler._pending_kv_transitions
+    assert len(session.streaming_queue) == 0
+    assert session.status == RequestStatus.WAITING
+    assert session.kv_cache_state is KVBlockState.HOT
+    assert session.num_computed_tokens == 20
+
+    block_groups = scheduler.kv_cache_manager.get_blocks(
+        session.request_id
+    ).blocks
+    if transition_status is KVCacheTransitionStatus.SUCCESS:
+        assert block_groups[0][0].is_null is True
+        assert block_groups[0][1].hierarchy_state is KVBlockState.HOT
+    else:
+        assert all(
+            b.hierarchy_state is expected_block_state
+            for group in block_groups
+            for b in group
+        )
+
+    # Next schedule() schedules the resumed session
+    sched_out_resumed = scheduler.schedule()
+    assert session.request_id in sched_out_resumed.num_scheduled_tokens
+    assert session.status == RequestStatus.RUNNING
+
+
+def test_scheduler_resume_multiple_queued_updates_while_pending():
+    from tests.v1.streaming_input.test_scheduler_streaming import (
+        STOP_TOKEN,
+        DummyRequest,
+        create_scheduler,
+    )
+
+    scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+    session = _setup_waiting_streaming_session(scheduler)
+
+    transitions = scheduler._classify_idle_kv_sessions(current_time=115.0)
+    assert len(transitions) == 1
+
+    chunk1 = DummyRequest(
+        request_id="session",
+        prompt_token_ids=list(range(20, 25)),
+        arrival_time=116.0,
+    )
+    chunk2 = DummyRequest(
+        request_id="session",
+        prompt_token_ids=list(range(25, 30)),
+        arrival_time=117.0,
+    )
+    scheduler.add_request(chunk1)
+    scheduler.add_request(chunk2)
+    assert len(session.streaming_queue) == 2
+
+    # schedule() while pending preserves FIFO queue without error
+    sched_out_pending = scheduler.schedule()
+    assert session.request_id not in sched_out_pending.num_scheduled_tokens
+    assert len(session.streaming_queue) == 2
+
+    # Worker ACK SUCCESS -> consumes first chunk; second remains queued
     sched_out = SchedulerOutput.make_empty()
     sched_out.kv_cache_state_transitions = transitions
     mr_out = ModelRunnerOutput(
@@ -1087,44 +1205,42 @@ def test_scheduler_resume_while_pending_is_deferred_and_proceeds_after_ack():
         ],
     )
     scheduler._validate_kv_cache_transition_results(sched_out, mr_out)
+    assert len(session.streaming_queue) == 1
+    assert session.status == RequestStatus.WAITING
+    assert session.prompt_token_ids == list(range(25))
 
-    # Transition committed, pending cleared, queued update processed
-    assert "session" not in scheduler._pending_kv_transitions
+    # Turn 1 schedules chunk1
+    sched_out1 = scheduler.schedule()
+    assert session.request_id in sched_out1.num_scheduled_tokens
+
+    # Turn 1 completes decode -> chunk2 is consumed from FIFO queue
+    session.append_output_token_ids([STOP_TOKEN])
+    mro_stop = ModelRunnerOutput(
+        req_ids=[session.request_id],
+        req_id_to_index={session.request_id: 0},
+        sampled_token_ids=[[STOP_TOKEN]],
+        logprobs=None,
+        prompt_logprobs_dict={session.request_id: None},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(sched_out1, mro_stop)
     assert len(session.streaming_queue) == 0
     assert session.status == RequestStatus.WAITING
-    assert session.kv_cache_state is KVBlockState.HOT
-    assert session.num_computed_tokens == 20
-    block_groups = scheduler.kv_cache_manager.get_blocks(
-        session.request_id
-    ).blocks
-    assert block_groups[0][0].is_null is True
-    assert block_groups[0][1].hierarchy_state is KVBlockState.HOT
+    assert session.prompt_token_ids == list(range(30))
 
 
-def test_scheduler_abort_while_pending_is_deferred_and_propagates_worker_cleanup():
+def test_scheduler_abort_while_pending_natural_waiting_lifecycle():
     from tests.v1.streaming_input.test_scheduler_streaming import (
-        DummyRequest,
         create_scheduler,
     )
 
     scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
-    session = DummyRequest(
-        request_id="session",
-        prompt_token_ids=list(range(20)),
-        arrival_time=100.0,
-    )
-    scheduler.add_request(session)
-    scheduler.kv_cache_manager.allocate_slots(session, 20)
-    session.num_computed_tokens = 20
-    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session = _setup_waiting_streaming_session(scheduler)
 
-    # Step 1: Planning creates pending transition
-    transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+    transitions = scheduler._classify_idle_kv_sessions(current_time=115.0)
     assert len(transitions) == 1
     assert "session" in scheduler._pending_kv_transitions
 
-    # Step 2: Client aborts while pending
-    # Must NOT raise RuntimeError; must record deferred abort
     aborted = scheduler.finish_requests(
         ["session"], RequestStatus.FINISHED_ABORTED
     )
@@ -1132,11 +1248,16 @@ def test_scheduler_abort_while_pending_is_deferred_and_propagates_worker_cleanup
     assert scheduler._pending_finish_requests.get("session") == (
         RequestStatus.FINISHED_ABORTED
     )
-    # Blocks must NOT be freed yet while migration is pending
+
+    # Counter remains 1 before ACK; schedule() skips session
+    assert scheduler.num_waiting_for_streaming_input == 1
     assert "session" in scheduler.requests
     assert "session" not in scheduler.finished_req_ids
+    sched_out_pending = scheduler.schedule()
+    assert session.request_id not in sched_out_pending.num_scheduled_tokens
+    assert scheduler.num_waiting_for_streaming_input == 1
 
-    # Step 3: Worker ACK arrives
+    # Worker ACK -> counter decrements exactly once to 0; session freed
     sched_out = SchedulerOutput.make_empty()
     sched_out.kv_cache_state_transitions = transitions
     mr_out = ModelRunnerOutput(
@@ -1148,23 +1269,20 @@ def test_scheduler_abort_while_pending_is_deferred_and_propagates_worker_cleanup
     )
     scheduler._validate_kv_cache_transition_results(sched_out, mr_out)
 
-    # Pending cleared, deferred abort executed, blocks freed
+    assert scheduler.num_waiting_for_streaming_input == 0
     assert "session" not in scheduler._pending_kv_transitions
     assert "session" not in scheduler._pending_finish_requests
     assert "session" not in scheduler.requests
     assert "session" in scheduler.finished_req_ids
 
-    # Step 4: Next schedule() produces finished_req_ids for worker cleanup
-    migration_manager = SimpleNamespace(
-        release_request=MagicMock(),
-    )
+    # Worker cleanup produced on next schedule()
+    migration_manager = SimpleNamespace(release_request=MagicMock())
     runner = SimpleNamespace(
         hkv_warm_migration_manager=migration_manager,
         _remove_request=MagicMock(),
     )
     next_sched_out = scheduler.schedule()
     assert "session" in next_sched_out.finished_req_ids
-
     GPUModelRunner.finish_requests(runner, next_sched_out)
     migration_manager.release_request.assert_called_once_with("session")
     runner._remove_request.assert_called_once_with("session")
@@ -1177,32 +1295,27 @@ def test_scheduler_queued_finish_sentinel_cleans_up_after_ack():
     )
 
     scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
-    session = DummyRequest(
-        request_id="session",
-        prompt_token_ids=list(range(20)),
-        arrival_time=100.0,
-    )
-    scheduler.add_request(session)
-    scheduler.kv_cache_manager.allocate_slots(session, 20)
-    session.num_computed_tokens = 20
-    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session = _setup_waiting_streaming_session(scheduler)
 
-    # Step 1: Planning creates pending transition
-    transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+    transitions = scheduler._classify_idle_kv_sessions(current_time=115.0)
     assert len(transitions) == 1
     assert "session" in scheduler._pending_kv_transitions
 
-    # Step 2: Streaming finished sentinel (None update) arrives via add_request
     finish_sentinel = DummyRequest(
         request_id="session",
         resumable=False,
-        arrival_time=111.0,
+        arrival_time=116.0,
     )
     scheduler.add_request(finish_sentinel)
     assert len(session.streaming_queue) == 1
     assert session.streaming_queue[0] is None
 
-    # Step 3: Worker ACK arrives
+    # schedule() while pending does not assert
+    sched_out_pending = scheduler.schedule()
+    assert session.request_id not in sched_out_pending.num_scheduled_tokens
+    assert len(session.streaming_queue) == 1
+
+    # Worker ACK -> sentinel popped and session freed
     sched_out = SchedulerOutput.make_empty()
     sched_out.kv_cache_state_transitions = transitions
     mr_out = ModelRunnerOutput(
@@ -1214,10 +1327,28 @@ def test_scheduler_queued_finish_sentinel_cleans_up_after_ack():
     )
     scheduler._validate_kv_cache_transition_results(sched_out, mr_out)
 
-    # Sentinel popped and finished_requests executed
     assert "session" not in scheduler._pending_kv_transitions
     assert "session" not in scheduler.requests
     assert "session" in scheduler.finished_req_ids
+
+
+def test_scheduler_waiting_for_streaming_req_non_pending_assertion_invariant():
+    from tests.v1.streaming_input.test_scheduler_streaming import (
+        DummyRequest,
+        create_scheduler,
+    )
+
+    scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+    session = _setup_waiting_streaming_session(scheduler)
+
+    # Empty queue without pending transition -> returns False without error
+    assert not scheduler._try_promote_blocked_waiting_request(session)
+
+    # Non-empty queue without pending transition -> raises AssertionError
+    dummy_req = DummyRequest(request_id="session", prompt_token_ids=[100])
+    session.streaming_queue.append(StreamingUpdate.from_request(dummy_req))
+    with pytest.raises(AssertionError):
+        scheduler._try_promote_blocked_waiting_request(session)
 
 
 def test_scheduler_lifecycle_guards_while_pending():
