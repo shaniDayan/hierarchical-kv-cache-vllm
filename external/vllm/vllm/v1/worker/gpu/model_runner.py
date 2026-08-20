@@ -619,11 +619,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "Physical migration requires blocks_per_kv_block == 1"
             )
 
-        results: list[KVCacheTransitionResult] = []
+        indexed_results: list[KVCacheTransitionResult | None] = [
+            None
+        ] * len(transitions)
         needs_cuda_sync = False
-        successful_transitions: list[KVCacheStateTransition] = []
+        successful_indices: list[int] = []
 
-        for transition in transitions:
+        for transition_idx, transition in enumerate(transitions):
             if (
                 transition.previous_state is not KVBlockState.HOT
                 or transition.new_state is not KVBlockState.WARM
@@ -640,12 +642,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             req_index = self.req_states.req_id_to_index.get(transition.request_id)
             if req_index is None:
-                results.append(
-                    transition.to_result(
-                        KVCacheTransitionStatus.STALE_VALIDATION,
-                        f"Request {transition.request_id} not found in "
-                        "model runner req_states",
-                    )
+                indexed_results[transition_idx] = transition.to_result(
+                    KVCacheTransitionStatus.STALE_VALIDATION,
+                    f"Request {transition.request_id} not found in "
+                    "model runner req_states",
                 )
                 continue
 
@@ -670,20 +670,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 if enqueued:
                     needs_cuda_sync = True
-                successful_transitions.append(transition)
+                successful_indices.append(transition_idx)
             except HKVWarmCapacityError as e:
-                results.append(
-                    transition.to_result(
-                        KVCacheTransitionStatus.RETRYABLE_CAPACITY,
-                        str(e),
-                    )
+                indexed_results[transition_idx] = transition.to_result(
+                    KVCacheTransitionStatus.RETRYABLE_CAPACITY,
+                    str(e),
                 )
             except HKVWarmStaleValidationError as e:
-                results.append(
-                    transition.to_result(
-                        KVCacheTransitionStatus.STALE_VALIDATION,
-                        str(e),
-                    )
+                indexed_results[transition_idx] = transition.to_result(
+                    KVCacheTransitionStatus.STALE_VALIDATION,
+                    str(e),
                 )
 
         if needs_cuda_sync:
@@ -695,10 +691,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if device.type == "cuda" and torch.cuda.is_available():
                 torch.cuda.current_stream(device).synchronize()
 
-        for transition in successful_transitions:
-            results.append(
-                transition.to_result(KVCacheTransitionStatus.SUCCESS)
+        for transition_idx in successful_indices:
+            indexed_results[transition_idx] = transitions[transition_idx].to_result(
+                KVCacheTransitionStatus.SUCCESS
             )
+
+        if any(result is None for result in indexed_results):
+            raise RuntimeError(
+                "KV transition result assembly failed: "
+                "missing result for at least one transition"
+            )
+
+        results = [
+            result for result in indexed_results if result is not None
+        ]
 
         self._pending_kv_transition_results.extend(results)
         return results

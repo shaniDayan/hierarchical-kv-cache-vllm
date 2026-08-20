@@ -432,6 +432,130 @@ def test_cuda_stream_synchronize_not_called_for_stale_validation(monkeypatch):
     assert results[0].transition_id == 12
 
 
+@pytest.mark.parametrize(
+    ("first_outcome", "second_outcome", "expected_statuses"),
+    [
+        (
+            "success",
+            "capacity",
+            [
+                KVCacheTransitionStatus.SUCCESS,
+                KVCacheTransitionStatus.RETRYABLE_CAPACITY,
+            ],
+        ),
+        (
+            "capacity",
+            "success",
+            [
+                KVCacheTransitionStatus.RETRYABLE_CAPACITY,
+                KVCacheTransitionStatus.SUCCESS,
+            ],
+        ),
+        (
+            "success",
+            "stale",
+            [
+                KVCacheTransitionStatus.SUCCESS,
+                KVCacheTransitionStatus.STALE_VALIDATION,
+            ],
+        ),
+    ],
+    ids=(
+        "success-then-retryable-capacity",
+        "retryable-capacity-then-success",
+        "success-then-stale-validation",
+    ),
+)
+def test_mixed_transition_results_preserve_input_order(
+    monkeypatch,
+    first_outcome: str,
+    second_outcome: str,
+    expected_statuses: list[KVCacheTransitionStatus],
+):
+    sync_mock = MagicMock()
+    mock_stream = SimpleNamespace(synchronize=sync_mock)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _dev: mock_stream)
+
+    outcomes = {
+        "request-a": first_outcome,
+        "request-b": second_outcome,
+    }
+
+    def migrate(request_id, _changed_blocks, _request_block_table):
+        outcome = outcomes[request_id]
+        if outcome == "success":
+            return True
+        if outcome == "capacity":
+            raise HKVWarmCapacityError("cannot fit in WARM pool")
+        if outcome == "stale":
+            raise HKVWarmStaleValidationError("source HOT block mismatch")
+        raise AssertionError(f"unexpected migration outcome: {outcome}")
+
+    migration_manager = SimpleNamespace(migrate=migrate)
+    target = make_mock_model_runner(
+        migration_manager=migration_manager, device="cuda:0"
+    )
+
+    t1 = make_transition(transition_id=100, request_id="request-a")
+    t2 = make_transition(transition_id=101, request_id="request-b")
+    transitions = [t1, t2]
+
+    results = GPUModelRunner.handle_kv_cache_state_transitions(target, transitions)
+
+    assert [result.transition_id for result in results] == [100, 101]
+    assert [result.status for result in results] == expected_statuses
+
+    if first_outcome == "capacity":
+        assert "cannot fit" in (results[0].error_message or "")
+    if second_outcome == "capacity":
+        assert "cannot fit" in (results[1].error_message or "")
+    if first_outcome == "stale":
+        assert "source HOT" in (results[0].error_message or "")
+    if second_outcome == "stale":
+        assert "source HOT" in (results[1].error_message or "")
+
+    assert sync_mock.call_count == 1
+
+
+def test_scheduler_accepts_ordered_mixed_status_results():
+    sched = Scheduler.__new__(Scheduler)
+    t1 = make_transition(transition_id=30, request_id="request-a")
+    t2 = make_transition(transition_id=31, request_id="request-b")
+    sched._pending_kv_transitions = {
+        "request-a": t1,
+        "request-b": t2,
+    }
+    sched.requests = {
+        "request-a": SimpleNamespace(kv_cache_state=KVBlockState.HOT),
+        "request-b": SimpleNamespace(kv_cache_state=KVBlockState.HOT),
+    }
+    sched.kv_cache_manager = SimpleNamespace(
+        commit_request_kv_transition=MagicMock()
+    )
+    sched_out = SchedulerOutput.make_empty()
+    sched_out.kv_cache_state_transitions = [t1, t2]
+
+    mr_out = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_cache_transition_results=[
+            t1.to_result(
+                KVCacheTransitionStatus.RETRYABLE_CAPACITY,
+                "cannot fit in WARM pool",
+            ),
+            t2.to_result(KVCacheTransitionStatus.SUCCESS),
+        ],
+    )
+
+    Scheduler._validate_kv_cache_transition_results(sched, sched_out, mr_out)
+
+    sched.kv_cache_manager.commit_request_kv_transition.assert_called_once_with(t2)
+    assert sched.requests["request-a"].kv_cache_state is KVBlockState.HOT
+    assert sched.requests["request-b"].kv_cache_state is KVBlockState.WARM
+    assert sched._pending_kv_transitions == {}
+
+
 def test_success_appears_only_after_fence(monkeypatch):
     state_at_sync = {}
 
