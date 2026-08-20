@@ -1392,7 +1392,16 @@ def test_scheduler_config_init():
         print(SchedulerConfig.default_factory().max_model_len)
 
 
-def test_valid_kv_cache_idle_thresholds():
+def test_valid_kv_cache_idle_thresholds(monkeypatch):
+    for env_name, env_value in (
+        ("VLLM_USE_V2_MODEL_RUNNER", "1"),
+        ("HKV_ENABLE_PHYSICAL_TIERS", "1"),
+        ("HKV_WARM_POOL_BLOCKS", "16"),
+        ("HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION", "1"),
+        ("HKV_DEBUG_MIXED_READ", "1"),
+    ):
+        monkeypatch.setenv(env_name, env_value)
+
     config = SchedulerConfig.default_factory(
         kv_cache_hot_idle_threshold_seconds=10.0,
         kv_cache_cold_idle_threshold_seconds=20.0,
@@ -1421,6 +1430,62 @@ def test_invalid_kv_cache_idle_thresholds(hot_threshold, cold_threshold):
             kv_cache_hot_idle_threshold_seconds=hot_threshold,
             kv_cache_cold_idle_threshold_seconds=cold_threshold,
         )
+
+
+def _set_full_hkv_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("HKV_ENABLE_PHYSICAL_TIERS", "1")
+    monkeypatch.setenv("HKV_WARM_POOL_BLOCKS", "16")
+    monkeypatch.setenv("HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION", "1")
+    monkeypatch.setenv("HKV_DEBUG_MIXED_READ", "1")
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    [
+        "VLLM_USE_V2_MODEL_RUNNER",
+        "HKV_ENABLE_PHYSICAL_TIERS",
+        "HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION",
+        "HKV_DEBUG_MIXED_READ",
+    ],
+)
+def test_kv_cache_idle_thresholds_reject_missing_required_flag(monkeypatch, env_name):
+    _set_full_hkv_env(monkeypatch)
+    monkeypatch.delenv(env_name, raising=False)
+
+    with pytest.raises(ValidationError, match=env_name):
+        SchedulerConfig.default_factory(
+            kv_cache_hot_idle_threshold_seconds=10.0,
+            kv_cache_cold_idle_threshold_seconds=20.0,
+        )
+
+
+@pytest.mark.parametrize("warm_pool_blocks", [None, "0", "not-an-int"])
+def test_kv_cache_idle_thresholds_reject_invalid_warm_pool_blocks(
+    monkeypatch, warm_pool_blocks
+):
+    _set_full_hkv_env(monkeypatch)
+    if warm_pool_blocks is None:
+        monkeypatch.delenv("HKV_WARM_POOL_BLOCKS", raising=False)
+    else:
+        monkeypatch.setenv("HKV_WARM_POOL_BLOCKS", warm_pool_blocks)
+
+    with pytest.raises(ValidationError, match="HKV_WARM_POOL_BLOCKS"):
+        SchedulerConfig.default_factory(
+            kv_cache_hot_idle_threshold_seconds=10.0,
+            kv_cache_cold_idle_threshold_seconds=20.0,
+        )
+
+def test_kv_cache_idle_thresholds_unset_keeps_default_behavior(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    monkeypatch.setenv("HKV_ENABLE_PHYSICAL_TIERS", "0")
+    monkeypatch.setenv("HKV_WARM_POOL_BLOCKS", "0")
+    monkeypatch.setenv("HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION", "0")
+    monkeypatch.setenv("HKV_DEBUG_MIXED_READ", "0")
+
+    config = SchedulerConfig.default_factory()
+    assert config.kv_cache_hot_idle_threshold_seconds is None
+    assert config.kv_cache_cold_idle_threshold_seconds is None
 
 
 @pytest.mark.parametrize(

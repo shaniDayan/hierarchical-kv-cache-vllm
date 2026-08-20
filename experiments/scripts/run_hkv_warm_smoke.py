@@ -121,8 +121,8 @@ async def run(args):
     from vllm.sampling_params import RequestOutputKind
     from vllm.v1.engine.async_llm import AsyncLLM
 
-    hot_idle_threshold = 0.05 if args.mode == "mixed" else 3600.0
-    cold_idle_threshold = 3600.0 if args.mode == "mixed" else 7200.0
+    hot_idle_threshold = 0.05 if args.mode == "mixed" else None
+    cold_idle_threshold = 3600.0 if args.mode == "mixed" else None
 
     engine_args = AsyncEngineArgs(
         model=args.model,
@@ -511,8 +511,8 @@ def main():
     os.environ.update({
         "VLLM_USE_V2_MODEL_RUNNER": "1",
         "VLLM_DISABLE_REQUEST_ID_RANDOMIZATION": "1",
-        "HKV_ENABLE_PHYSICAL_TIERS": "1",
-        "HKV_WARM_POOL_BLOCKS": "16",
+        "HKV_ENABLE_PHYSICAL_TIERS": "1" if args.mode == "mixed" else "0",
+        "HKV_WARM_POOL_BLOCKS": "16" if args.mode == "mixed" else "0",
         "HKV_DEBUG_DEMOTE_ONE_BLOCK": "0",
         "HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION": (
             "1" if args.mode == "mixed" else "0"

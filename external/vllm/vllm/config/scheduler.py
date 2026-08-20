@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import os
 from collections.abc import Callable
 from dataclasses import InitVar
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
@@ -258,6 +259,36 @@ class SchedulerConfig:
                 raise ValueError(
                     "KV cache COLD idle threshold must be greater than the HOT "
                     "idle threshold"
+                )
+
+            required_true_envs = (
+                "VLLM_USE_V2_MODEL_RUNNER",
+                "HKV_ENABLE_PHYSICAL_TIERS",
+                "HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION",
+                "HKV_DEBUG_MIXED_READ",
+            )
+            for env_name in required_true_envs:
+                env_value = os.getenv(env_name)
+                if env_value != "1":
+                    raise ValueError(
+                        "KV cache idle thresholds require full HOT/WARM mode: "
+                        f"{env_name} must be '1'; got {env_value!r}"
+                    )
+
+            warm_pool_blocks_value = os.getenv("HKV_WARM_POOL_BLOCKS")
+            try:
+                warm_pool_blocks = int(warm_pool_blocks_value or "")
+            except ValueError as exc:
+                raise ValueError(
+                    "KV cache idle thresholds require full HOT/WARM mode: "
+                    "HKV_WARM_POOL_BLOCKS must be an integer greater than zero; "
+                    f"got {warm_pool_blocks_value!r}"
+                ) from exc
+            if warm_pool_blocks <= 0:
+                raise ValueError(
+                    "KV cache idle thresholds require full HOT/WARM mode: "
+                    "HKV_WARM_POOL_BLOCKS must be greater than zero; "
+                    f"got {warm_pool_blocks}"
                 )
 
         if is_encoder_decoder:
