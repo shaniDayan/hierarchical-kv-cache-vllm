@@ -1,0 +1,221 @@
+{
+  "mode": "mixed",
+  "trace": "datasets/qwen_bailian/subsets/qwen_traceA_multiturn_v0.jsonl",
+  "model": "Qwen/Qwen3-0.6B",
+  "time_scale": 0.01,
+  "output_tokens_mode": "one_per_turn_for_prefix_correctness",
+  "selected_sessions": 9,
+  "selected_requests": 25,
+  "scheduled_duration_seconds": 16.31105,
+  "replay_elapsed_seconds": 17.5169492457062,
+  "total_final_input_tokens": 4897,
+  "total_trace_output_tokens": 5677,
+  "total_generated_tokens": 25,
+  "requests_per_second": 1.4271891554477196,
+  "generated_tokens_per_second": 1.4271891554477196,
+  "send_lateness_seconds": {
+    "p50": 0.0006456272676587105,
+    "p95": 0.026970859616994858,
+    "max": 0.07296799588948488
+  },
+  "hkv_observation": {
+    "samples": 297,
+    "warm_observed": true,
+    "peak_warm_blocks": 73,
+    "peak_warm_requests": 6,
+    "peak_owned_warm_slots": 73,
+    "allocator_consistent": true,
+    "max_gpu_allocated_bytes": 5093446144,
+    "max_gpu_reserved_bytes": 5190451200,
+    "final_warm_blocks": 0,
+    "cleanup_complete": true
+  },
+  "sessions": [
+    {
+      "root_chat_id": 11,
+      "session_id": "bailian-11",
+      "turns": 3,
+      "final_input_tokens": 907,
+      "trace_output_tokens": 1132,
+      "scheduled_first_seconds": 0.0,
+      "scheduled_last_seconds": 3.11886,
+      "generated_tokens": 3,
+      "completed_turns": 3,
+      "first_output_seconds": 0.19512245897203684,
+      "finished_seconds": 3.290661357343197,
+      "max_send_lateness_seconds": 0.07296799588948488,
+      "generated_token_sha256": "9ab4861a186f1395c5835e03f298ab9553c44df9a97fc687cb0deb276c22e45e",
+      "generated_token_sample": [
+        13,
+        25,
+        13
+      ]
+    },
+    {
+      "root_chat_id": 18,
+      "session_id": "bailian-18",
+      "turns": 3,
+      "final_input_tokens": 481,
+      "trace_output_tokens": 809,
+      "scheduled_first_seconds": 0.03214,
+      "scheduled_last_seconds": 0.82344,
+      "generated_tokens": 3,
+      "completed_turns": 3,
+      "first_output_seconds": 0.23341869469732046,
+      "finished_seconds": 0.8751853546127677,
+      "max_send_lateness_seconds": 0.04120429791510105,
+      "generated_token_sha256": "2d4b86abfc052b6f944d49cdf2eb8099f7a094f768eed7fcdf20bddadb94182c",
+      "generated_token_sample": [
+        551,
+        287,
+        287
+      ]
+    },
+    {
+      "root_chat_id": 25,
+      "session_id": "bailian-25",
+      "turns": 2,
+      "final_input_tokens": 875,
+      "trace_output_tokens": 880,
+      "scheduled_first_seconds": 0.04686,
+      "scheduled_last_seconds": 4.6256200000000005,
+      "generated_tokens": 2,
+      "completed_turns": 2,
+      "first_output_seconds": 0.23343807831406593,
+      "finished_seconds": 4.776458948850632,
+      "max_send_lateness_seconds": 0.026970859616994858,
+      "generated_token_sha256": "29ea0cda72eb0c319b6ca2fc569e0d237d7fab8faa51db199853997c5a1e3b7e",
+      "generated_token_sample": [
+        220,
+        261
+      ]
+    },
+    {
+      "root_chat_id": 45,
+      "session_id": "bailian-45",
+      "turns": 6,
+      "final_input_tokens": 298,
+      "trace_output_tokens": 184,
+      "scheduled_first_seconds": 0.13532,
+      "scheduled_last_seconds": 4.23688,
+      "generated_tokens": 6,
+      "completed_turns": 6,
+      "first_output_seconds": 0.3524106787517667,
+      "finished_seconds": 4.321417914703488,
+      "max_send_lateness_seconds": 0.000886404886841774,
+      "generated_token_sha256": "ddd3959e6a63a935afcf8b35c5226f624415e5499d2f0c6ead9c0a6cf7429253",
+      "generated_token_sample": [
+        300,
+        59,
+        198,
+        261,
+        32379,
+        8
+      ]
+    },
+    {
+      "root_chat_id": 63,
+      "session_id": "bailian-63",
+      "turns": 2,
+      "final_input_tokens": 947,
+      "trace_output_tokens": 536,
+      "scheduled_first_seconds": 0.17825000000000002,
+      "scheduled_last_seconds": 5.518400000000001,
+      "generated_tokens": 2,
+      "completed_turns": 2,
+      "first_output_seconds": 0.3524315394461155,
+      "finished_seconds": 5.610350656323135,
+      "max_send_lateness_seconds": 0.0008705509826540947,
+      "generated_token_sha256": "d20ba2cfdb4e864ad92f3909fd4c5035ac38c2de7ac85d8c0b4b7490def6a97d",
+      "generated_token_sample": [
+        82,
+        220
+      ]
+    },
+    {
+      "root_chat_id": 83,
+      "session_id": "bailian-83",
+      "turns": 2,
+      "final_input_tokens": 234,
+      "trace_output_tokens": 344,
+      "scheduled_first_seconds": 0.26046,
+      "scheduled_last_seconds": 1.3015700000000001,
+      "generated_tokens": 2,
+      "completed_turns": 2,
+      "first_output_seconds": 0.38905169907957315,
+      "finished_seconds": 1.498123837634921,
+      "max_send_lateness_seconds": 0.001157066784799099,
+      "generated_token_sha256": "d4583f18d05fce0065d5cdab98d33eee4a6878052a3d68c59a2b7e22c03cd4ef",
+      "generated_token_sample": [
+        13,
+        640
+      ]
+    },
+    {
+      "root_chat_id": 132,
+      "session_id": "bailian-132",
+      "turns": 3,
+      "final_input_tokens": 612,
+      "trace_output_tokens": 738,
+      "scheduled_first_seconds": 0.47442999999999996,
+      "scheduled_last_seconds": 7.9546,
+      "generated_tokens": 3,
+      "completed_turns": 3,
+      "first_output_seconds": 0.5549918562173843,
+      "finished_seconds": 8.05855037458241,
+      "max_send_lateness_seconds": 0.0013883765786886215,
+      "generated_token_sha256": "59ae89e7c6bb6252fd638c3474e99bb6f2d7818dac8b147e351bfdbe930b0946",
+      "generated_token_sample": [
+        88,
+        220,
+        300
+      ]
+    },
+    {
+      "root_chat_id": 134,
+      "session_id": "bailian-134",
+      "turns": 2,
+      "final_input_tokens": 281,
+      "trace_output_tokens": 235,
+      "scheduled_first_seconds": 0.48271000000000003,
+      "scheduled_last_seconds": 16.31105,
+      "generated_tokens": 2,
+      "completed_turns": 2,
+      "first_output_seconds": 0.5557438628748059,
+      "finished_seconds": 16.39528111089021,
+      "max_send_lateness_seconds": 0.0006456272676587105,
+      "generated_token_sha256": "cd160e940246d53c1700fe5deb198d316ca6dc6a721bba04fad4f93db049a240",
+      "generated_token_sample": [
+        59,
+        198
+      ]
+    },
+    {
+      "root_chat_id": 139,
+      "session_id": "bailian-139",
+      "turns": 2,
+      "final_input_tokens": 262,
+      "trace_output_tokens": 819,
+      "scheduled_first_seconds": 0.48747,
+      "scheduled_last_seconds": 0.55834,
+      "generated_tokens": 2,
+      "completed_turns": 2,
+      "first_output_seconds": 0.5557554205879569,
+      "finished_seconds": 0.5984581420198083,
+      "max_send_lateness_seconds": 0.0006184065714478493,
+      "generated_token_sha256": "66f452aa5b3eee53312e87695c19b997ca3b957ed36044e583934659a597eb5f",
+      "generated_token_sample": [
+        13,
+        220
+      ]
+    }
+  ],
+  "baseline_comparison": {
+    "exact_session_output_match": true,
+    "mismatched_root_chat_ids": []
+  },
+  "validation": {
+    "passed": true,
+    "errors": []
+  }
+}
