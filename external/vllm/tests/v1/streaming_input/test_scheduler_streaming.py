@@ -157,7 +157,7 @@ class TestStreamingScheduler(unittest.TestCase):
 
         assert session.kv_cache_state is KVBlockState.WARM
         assert all(
-            group[0].hierarchy_state is KVBlockState.WARM
+            group[0].is_null
             and group[1].hierarchy_state is KVBlockState.HOT
             for group in block_groups
         )
