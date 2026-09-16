@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_state import (
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.worker.gpu import model_runner as model_runner_module
 from vllm.v1.worker.gpu.hkv_migration import (
     HKVWarmCapacityError,
     HKVWarmMigrationManager,
@@ -335,6 +336,96 @@ def test_request_releases_warm_state_before_runner_removal(
         ("release", "request"),
         ("remove", "request"),
     ]
+
+
+def test_shutdown_releases_hkv_containers_and_layer_bindings(monkeypatch):
+    synchronize = MagicMock()
+    empty_cache = MagicMock()
+    free_before_shutdown = MagicMock()
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", empty_cache)
+    monkeypatch.setattr(
+        model_runner_module,
+        "free_before_shutdown",
+        free_before_shutdown,
+    )
+    monkeypatch.setattr(model_runner_module.gc, "collect", MagicMock())
+
+    hot_tensor = torch.zeros(1)
+    warm_tensor = torch.zeros(1)
+    warm_map = torch.zeros(1)
+    warm_slot_table = torch.zeros(1)
+    layer = SimpleNamespace(
+        _hkv_warm_kv_cache=warm_tensor,
+        _hkv_hot_to_warm_map=warm_map,
+        _hkv_warm_slot_table=warm_slot_table,
+    )
+    allocator = SimpleNamespace(clear=MagicMock())
+    manager = SimpleNamespace(
+        allocator=allocator,
+        warm_residency={("request", 0, 0): object()},
+    )
+    target = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={"layer": layer}
+        ),
+        hkv_hot_kv_caches={"layer": hot_tensor},
+        hkv_warm_kv_caches={"layer": warm_tensor},
+        hkv_hot_to_warm_maps={"layer": warm_map},
+        hkv_warm_slot_table=warm_slot_table,
+        hkv_warm_migration_manager=manager,
+        kv_caches=[hot_tensor],
+        attn_groups=[object()],
+        kv_cache_config=object(),
+        vllm_config=object(),
+        model=object(),
+    )
+
+    GPUModelRunner.shutdown(target)
+
+    assert not hasattr(layer, "_hkv_warm_kv_cache")
+    assert not hasattr(layer, "_hkv_hot_to_warm_map")
+    assert not hasattr(layer, "_hkv_warm_slot_table")
+    allocator.clear.assert_called_once_with()
+    assert manager.warm_residency == {}
+    assert target.hkv_warm_migration_manager is None
+    assert target.hkv_warm_slot_table is None
+    assert target.hkv_hot_kv_caches == {}
+    assert target.hkv_warm_kv_caches == {}
+    assert target.hkv_hot_to_warm_maps == {}
+    assert target.kv_caches == []
+    assert target.attn_groups == []
+    free_before_shutdown.assert_called_once_with(target.vllm_config)
+    synchronize.assert_called_once_with()
+    empty_cache.assert_called_once_with()
+
+
+def test_shutdown_without_hkv_state_preserves_normal_cleanup(monkeypatch):
+    monkeypatch.setattr(torch.accelerator, "synchronize", MagicMock())
+    monkeypatch.setattr(torch.accelerator, "empty_cache", MagicMock())
+    free_before_shutdown = MagicMock()
+    monkeypatch.setattr(
+        model_runner_module,
+        "free_before_shutdown",
+        free_before_shutdown,
+    )
+    monkeypatch.setattr(model_runner_module.gc, "collect", MagicMock())
+    target = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        kv_caches=[object()],
+        attn_groups=[object()],
+        kv_cache_config=object(),
+        vllm_config=object(),
+        model=object(),
+    )
+
+    GPUModelRunner.shutdown(target)
+
+    assert target.kv_caches == []
+    assert target.attn_groups == []
+    assert not hasattr(target, "kv_cache_config")
+    assert not hasattr(target, "model")
+    free_before_shutdown.assert_called_once_with(target.vllm_config)
 
 
 # ==============================================================================

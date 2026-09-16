@@ -98,6 +98,12 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_cold_idle_threshold_seconds = (
             self.scheduler_config.kv_cache_cold_idle_threshold_seconds
         )
+        self.kv_cache_demotion_start_utilization = (
+            self.scheduler_config.kv_cache_demotion_start_utilization
+        )
+        self.kv_cache_demotion_stop_utilization = (
+            self.scheduler_config.kv_cache_demotion_stop_utilization
+        )
         self._next_kv_transition_id: int = 0
         self._pending_kv_transitions: dict[str, KVCacheStateTransition] = {}
         self._pending_finish_requests: dict[str, RequestStatus] = {}
@@ -1276,6 +1282,9 @@ class Scheduler(SchedulerInterface):
         current_time: float | None = None,
     ) -> list[KVCacheStateTransition]:
         """Classify inactive resumable sessions into colder KV states."""
+        if self.kv_cache_demotion_start_utilization is not None:
+            return self._demote_kv_sessions_under_pressure()
+
         hot_threshold = self.kv_cache_hot_idle_threshold_seconds
         cold_threshold = self.kv_cache_cold_idle_threshold_seconds
         if hot_threshold is None or cold_threshold is None:
@@ -1310,27 +1319,98 @@ class Scheduler(SchedulerInterface):
             if _KV_STATE_COLDNESS[new_state] <= _KV_STATE_COLDNESS[previous_state]:
                 continue
 
-            changed_blocks = self.kv_cache_manager.plan_request_kv_state(
-                request.request_id,
-                new_state,
-                num_computed_tokens=request.num_computed_tokens,
-            )
-            if not any(changed_blocks):
-                continue
-
-            transition_id = self._next_kv_transition_id
-            self._next_kv_transition_id += 1
-            transition = KVCacheStateTransition(
-                transition_id=transition_id,
-                request_id=request.request_id,
-                previous_state=previous_state,
-                new_state=new_state,
-                changed_blocks=changed_blocks,
-            )
-            self._pending_kv_transitions[request.request_id] = transition
-            transitions.append(transition)
+            transition = self._plan_kv_state_transition(request, new_state)
+            if transition is not None:
+                transitions.append(transition)
 
         return transitions
+
+    def _demote_kv_sessions_under_pressure(
+        self,
+    ) -> list[KVCacheStateTransition]:
+        start = self.kv_cache_demotion_start_utilization
+        stop = self.kv_cache_demotion_stop_utilization
+        assert start is not None and stop is not None
+
+        block_pool = self.kv_cache_manager.block_pool
+        usable_hot_blocks = block_pool.num_gpu_blocks - 1
+        if usable_hot_blocks <= 0:
+            return []
+
+        free_hot_blocks = block_pool.get_num_free_blocks()
+        used_hot_blocks = usable_hot_blocks - free_hot_blocks
+        if used_hot_blocks / usable_hot_blocks < start:
+            return []
+
+        projected_released_blocks = sum(
+            len(group)
+            for transition in self._pending_kv_transitions.values()
+            if transition.previous_state is KVBlockState.HOT
+            and transition.new_state is KVBlockState.WARM
+            for group in transition.changed_blocks
+        )
+        projected_used_blocks = used_hot_blocks - projected_released_blocks
+        if projected_used_blocks / usable_hot_blocks <= stop:
+            return []
+
+        candidates = sorted(
+            (
+                request
+                for request in self.requests.values()
+                if request.resumable
+                and request.status is RequestStatus.WAITING_FOR_STREAMING_REQ
+                and request.kv_cache_state is KVBlockState.HOT
+                and request.request_id not in self._pending_kv_transitions
+            ),
+            key=lambda request: (
+                request.last_activity_time,
+                request.arrival_time,
+                request.request_id,
+            ),
+        )
+
+        transitions = []
+        for request in candidates:
+            transition = self._plan_kv_state_transition(
+                request,
+                KVBlockState.WARM,
+            )
+            if transition is None:
+                continue
+
+            transitions.append(transition)
+            projected_released_blocks += sum(
+                len(group) for group in transition.changed_blocks
+            )
+            projected_used_blocks = used_hot_blocks - projected_released_blocks
+            if projected_used_blocks / usable_hot_blocks <= stop:
+                break
+
+        return transitions
+
+    def _plan_kv_state_transition(
+        self,
+        request: Request,
+        new_state: KVBlockState,
+    ) -> KVCacheStateTransition | None:
+        changed_blocks = self.kv_cache_manager.plan_request_kv_state(
+            request.request_id,
+            new_state,
+            num_computed_tokens=request.num_computed_tokens,
+        )
+        if not any(changed_blocks):
+            return None
+
+        transition = KVCacheStateTransition(
+            transition_id=self._next_kv_transition_id,
+            request_id=request.request_id,
+            previous_state=request.kv_cache_state,
+            new_state=new_state,
+            changed_blocks=changed_blocks,
+        )
+        self._next_kv_transition_id += 1
+        self._pending_kv_transitions[request.request_id] = transition
+        return transition
 
     def _make_cached_request_data(
         self,

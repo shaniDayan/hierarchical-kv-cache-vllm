@@ -60,10 +60,15 @@ class DummyRequest(Request):
 def create_scheduler(
     hot_threshold: float | None = None,
     cold_threshold: float | None = None,
+    demotion_start: float | None = None,
+    demotion_stop: float | None = None,
+    num_blocks: int = 1000,
 ) -> Scheduler:
     vllm_config = VllmConfig(device_config=DeviceConfig("cpu"))
     vllm_config.scheduler_config.kv_cache_hot_idle_threshold_seconds = hot_threshold
     vllm_config.scheduler_config.kv_cache_cold_idle_threshold_seconds = cold_threshold
+    vllm_config.scheduler_config.kv_cache_demotion_start_utilization = demotion_start
+    vllm_config.scheduler_config.kv_cache_demotion_stop_utilization = demotion_stop
     vllm_config.model_config = MagicMock()
     vllm_config.model_config.skip_tokenizer_init = True
     vllm_config.model_config.is_multimodal_model = False
@@ -71,10 +76,10 @@ def create_scheduler(
     vllm_config.model_config.max_model_len = 1024
     vllm_config.model_config.enable_return_routed_experts = False
     vllm_config.cache_config = MagicMock()
-    vllm_config.cache_config.num_gpu_blocks = 1000
+    vllm_config.cache_config.num_gpu_blocks = num_blocks
     vllm_config.cache_config.enable_prefix_caching = False
     kv_cache_config = KVCacheConfig(
-        num_blocks=1000,
+        num_blocks=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -93,6 +98,26 @@ def create_scheduler(
         block_size=16,
         hash_block_size=16,
     )
+
+
+def _add_waiting_session(
+    scheduler: Scheduler,
+    request_id: str,
+    *,
+    last_activity_time: float,
+    arrival_time: float,
+) -> DummyRequest:
+    session = DummyRequest(
+        request_id=request_id,
+        prompt_token_ids=list(range(16)),
+        arrival_time=arrival_time,
+    )
+    scheduler.add_request(session)
+    assert scheduler.kv_cache_manager.allocate_slots(session, 16) is not None
+    session.num_computed_tokens = 16
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.last_activity_time = last_activity_time
+    return session
 
 
 class TestStreamingScheduler(unittest.TestCase):
@@ -162,6 +187,225 @@ class TestStreamingScheduler(unittest.TestCase):
             for group in block_groups
         )
         assert session.request_id not in scheduler._pending_kv_transitions
+
+    def test_pressure_demotion_does_not_start_below_threshold(self):
+        scheduler = create_scheduler(
+            hot_threshold=1.0,
+            cold_threshold=2.0,
+            demotion_start=0.8,
+            demotion_stop=0.6,
+            num_blocks=11,
+        )
+        for index in range(7):
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=float(index),
+                arrival_time=float(index),
+            )
+
+        assert scheduler._classify_idle_kv_sessions(current_time=1000.0) == []
+
+    def test_pressure_demotion_starts_at_threshold(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.7,
+            num_blocks=11,
+        )
+        for index in range(8):
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=float(index),
+                arrival_time=float(index),
+            )
+
+        transitions = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in transitions] == ["session-0"]
+
+    def test_pressure_demotion_selects_oldest_eligible_session_first(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.7,
+            num_blocks=11,
+        )
+        activity_times = [30.0, 10.0, 20.0, 40.0, 50.0, 60.0, 70.0, 80.0]
+        for index, activity_time in enumerate(activity_times):
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=activity_time,
+                arrival_time=float(index),
+            )
+
+        transitions = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in transitions] == ["session-1"]
+
+    def test_pressure_demotion_uses_deterministic_tie_breaking(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.5,
+            num_blocks=11,
+        )
+        session_keys = [
+            ("session-c", 10.0, 2.0),
+            ("session-b", 10.0, 1.0),
+            ("session-a", 10.0, 1.0),
+            ("session-d", 20.0, 0.0),
+            ("session-e", 30.0, 0.0),
+            ("session-f", 40.0, 0.0),
+            ("session-g", 50.0, 0.0),
+            ("session-h", 60.0, 0.0),
+        ]
+        for request_id, last_activity_time, arrival_time in session_keys:
+            _add_waiting_session(
+                scheduler,
+                request_id,
+                last_activity_time=last_activity_time,
+                arrival_time=arrival_time,
+            )
+
+        transitions = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in transitions] == [
+            "session-a",
+            "session-b",
+            "session-c",
+        ]
+
+    def test_pressure_demotion_stops_after_projected_target(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.6,
+            num_blocks=11,
+        )
+        for index in range(8):
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=float(index),
+                arrival_time=float(index),
+            )
+
+        transitions = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in transitions] == [
+            "session-0",
+            "session-1",
+        ]
+
+    def test_pressure_demotion_counts_pending_releases_before_replanning(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.6,
+            num_blocks=11,
+        )
+        for index in range(8):
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=float(index),
+                arrival_time=float(index),
+            )
+
+        first = scheduler._classify_idle_kv_sessions()
+        second = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in first] == [
+            "session-0",
+            "session-1",
+        ]
+        assert second == []
+
+    def test_pressure_demotion_plans_only_remainder_after_pending_releases(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.5,
+            num_blocks=11,
+        )
+        sessions = [
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=float(index),
+                arrival_time=float(index),
+            )
+            for index in range(8)
+        ]
+        for session in sessions[1:]:
+            session.resumable = False
+
+        first = scheduler._classify_idle_kv_sessions()
+        for session in sessions[1:]:
+            session.resumable = True
+        second = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in first] == ["session-0"]
+        assert [transition.request_id for transition in second] == [
+            "session-1",
+            "session-2",
+        ]
+
+    def test_pressure_demotion_skips_pending_transition(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.7,
+            num_blocks=11,
+        )
+        sessions = [
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=float(index),
+                arrival_time=float(index),
+            )
+            for index in range(8)
+        ]
+        scheduler._pending_kv_transitions[sessions[0].request_id] = MagicMock()
+
+        transitions = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in transitions] == ["session-1"]
+
+    def test_pressure_demotion_skips_warm_session(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.7,
+            num_blocks=11,
+        )
+        sessions = [
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=float(index),
+                arrival_time=float(index),
+            )
+            for index in range(8)
+        ]
+        sessions[0].kv_cache_state = KVBlockState.WARM
+
+        transitions = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in transitions] == ["session-1"]
+
+    def test_unset_pressure_thresholds_preserve_time_based_demotion(self):
+        scheduler = create_scheduler(
+            hot_threshold=10.0,
+            cold_threshold=20.0,
+            num_blocks=11,
+        )
+        _add_waiting_session(
+            scheduler,
+            "session",
+            last_activity_time=100.0,
+            arrival_time=100.0,
+        )
+
+        transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+
+        assert [transition.request_id for transition in transitions] == ["session"]
 
     def test_add_request(self):
         scheduler = create_scheduler()

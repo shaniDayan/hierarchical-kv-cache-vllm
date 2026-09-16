@@ -1814,6 +1814,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
+        compilation_config = getattr(self, "compilation_config", None)
+        forward_context = getattr(compilation_config, "static_forward_context", {})
+        for layer in forward_context.values():
+            for attr_name in (
+                "_hkv_warm_kv_cache",
+                "_hkv_hot_to_warm_map",
+                "_hkv_warm_slot_table",
+            ):
+                if hasattr(layer, attr_name):
+                    delattr(layer, attr_name)
+
+        manager = getattr(self, "hkv_warm_migration_manager", None)
+        if manager is not None:
+            manager.allocator.clear()
+            manager.warm_residency.clear()
+        self.hkv_warm_migration_manager = None
+        self.hkv_warm_slot_table = None
+        for attr_name in (
+            "hkv_hot_kv_caches",
+            "hkv_warm_kv_caches",
+            "hkv_hot_to_warm_maps",
+        ):
+            container = getattr(self, attr_name, None)
+            if container is not None:
+                container.clear()
+
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
         if hasattr(self, "attn_groups"):
