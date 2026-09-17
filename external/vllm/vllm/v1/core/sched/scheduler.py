@@ -77,6 +77,9 @@ _KV_STATE_COLDNESS = {
     KVBlockState.COLD: 2,
 }
 
+_KV_DEMOTION_CAPACITY_INITIAL_COOLDOWN_STEPS = 1
+_KV_DEMOTION_CAPACITY_MAX_COOLDOWN_STEPS = 16
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -107,6 +110,10 @@ class Scheduler(SchedulerInterface):
         self._next_kv_transition_id: int = 0
         self._pending_kv_transitions: dict[str, KVCacheStateTransition] = {}
         self._pending_finish_requests: dict[str, RequestStatus] = {}
+        self._kv_demotion_capacity_failure_count = 0
+        self._kv_demotion_capacity_cooldown_steps_remaining = 0
+        self._kv_demotion_capacity_probe_required = False
+        self._kv_demotion_capacity_probe_transition_id: int | None = None
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.kv_cache_config = kv_cache_config
@@ -1332,6 +1339,12 @@ class Scheduler(SchedulerInterface):
         stop = self.kv_cache_demotion_stop_utilization
         assert start is not None and stop is not None
 
+        if self._kv_demotion_capacity_cooldown_steps_remaining > 0:
+            self._kv_demotion_capacity_cooldown_steps_remaining -= 1
+            return []
+        if self._kv_demotion_capacity_probe_transition_id is not None:
+            return []
+
         block_pool = self.kv_cache_manager.block_pool
         usable_hot_blocks = block_pool.num_gpu_blocks - 1
         if usable_hot_blocks <= 0:
@@ -1379,6 +1392,13 @@ class Scheduler(SchedulerInterface):
                 continue
 
             transitions.append(transition)
+            if self._kv_demotion_capacity_probe_required:
+                self._kv_demotion_capacity_probe_required = False
+                self._kv_demotion_capacity_probe_transition_id = (
+                    transition.transition_id
+                )
+                break
+
             projected_released_blocks += sum(
                 len(group) for group in transition.changed_blocks
             )
@@ -1680,6 +1700,7 @@ class Scheduler(SchedulerInterface):
             )
 
         seen_transition_ids: set[int] = set()
+        pressure_capacity_failure = False
         for expected, actual in zip(expected_transitions, actual_results, strict=True):
             if not isinstance(actual, KVCacheTransitionResult):
                 raise TypeError(
@@ -1719,6 +1740,18 @@ class Scheduler(SchedulerInterface):
                 if request is not None:
                     request.kv_cache_state = expected.new_state
                 del self._pending_kv_transitions[expected.request_id]
+                if (
+                    expected.transition_id
+                    == getattr(
+                        self,
+                        "_kv_demotion_capacity_probe_transition_id",
+                        None,
+                    )
+                ):
+                    self._kv_demotion_capacity_failure_count = 0
+                    self._kv_demotion_capacity_cooldown_steps_remaining = 0
+                    self._kv_demotion_capacity_probe_required = False
+                    self._kv_demotion_capacity_probe_transition_id = None
             elif actual.status in (
                 KVCacheTransitionStatus.RETRYABLE_CAPACITY,
                 KVCacheTransitionStatus.STALE_VALIDATION,
@@ -1733,6 +1766,32 @@ class Scheduler(SchedulerInterface):
                     expected.previous_state.value,
                 )
                 del self._pending_kv_transitions[expected.request_id]
+                is_pressure_demotion = (
+                    getattr(
+                        self,
+                        "kv_cache_demotion_start_utilization",
+                        None,
+                    )
+                    is not None
+                    and expected.previous_state is KVBlockState.HOT
+                    and expected.new_state is KVBlockState.WARM
+                )
+                if (
+                    actual.status is KVCacheTransitionStatus.RETRYABLE_CAPACITY
+                    and is_pressure_demotion
+                ):
+                    pressure_capacity_failure = True
+                elif (
+                    actual.status is KVCacheTransitionStatus.STALE_VALIDATION
+                    and expected.transition_id
+                    == getattr(
+                        self,
+                        "_kv_demotion_capacity_probe_transition_id",
+                        None,
+                    )
+                ):
+                    self._kv_demotion_capacity_probe_required = True
+                    self._kv_demotion_capacity_probe_transition_id = None
             else:
                 raise ValueError(
                     f"Unexpected KV transition status: {actual.status}"
@@ -1760,6 +1819,20 @@ class Scheduler(SchedulerInterface):
                     self.finish_requests(
                         [request.request_id], RequestStatus.FINISHED_ABORTED
                     )
+
+        if pressure_capacity_failure:
+            self._kv_demotion_capacity_failure_count += 1
+            cooldown_steps = _KV_DEMOTION_CAPACITY_INITIAL_COOLDOWN_STEPS
+            for _ in range(self._kv_demotion_capacity_failure_count - 1):
+                cooldown_steps = min(
+                    cooldown_steps * 2,
+                    _KV_DEMOTION_CAPACITY_MAX_COOLDOWN_STEPS,
+                )
+                if cooldown_steps == _KV_DEMOTION_CAPACITY_MAX_COOLDOWN_STEPS:
+                    break
+            self._kv_demotion_capacity_cooldown_steps_remaining = cooldown_steps
+            self._kv_demotion_capacity_probe_required = True
+            self._kv_demotion_capacity_probe_transition_id = None
 
     def update_from_output(
         self,
