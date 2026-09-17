@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -12,6 +14,258 @@ from vllm.v1.worker.gpu.hkv_migration import (
     HKVWarmSlotAllocator,
     HKVWarmStaleValidationError,
 )
+
+
+class _TritonBackend:
+    @staticmethod
+    def get_name() -> str:
+        return "TRITON_ATTN"
+
+
+class _OtherBackend:
+    @staticmethod
+    def get_name() -> str:
+        return "FLASH_ATTN"
+
+
+def _set_physical_hkv_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HKV_ENABLE_PHYSICAL_TIERS", "1")
+    monkeypatch.setenv("HKV_DEBUG_MIXED_READ", "1")
+    monkeypatch.setenv("HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION", "1")
+    monkeypatch.setenv("HKV_WARM_POOL_BLOCKS", "16")
+
+
+def _hkv_validation_inputs() -> dict:
+    return {
+        "kv_cache_config": SimpleNamespace(kv_cache_groups=[object()]),
+        "attn_groups": [
+            [SimpleNamespace(backend=_TritonBackend, layer_names=["layer"])]
+        ],
+        "vllm_config": SimpleNamespace(
+            use_v2_model_runner=True,
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
+                data_parallel_size=1,
+            ),
+        ),
+        "hot_kv_dtype": torch.float16,
+        "blocks_per_kv_block": [1],
+    }
+
+
+def test_supported_physical_hkv_configuration_passes(monkeypatch):
+    _set_physical_hkv_env(monkeypatch)
+
+    warm_pool_blocks = attn_utils.validate_hkv_physical_configuration(
+        **_hkv_validation_inputs()
+    )
+
+    assert warm_pool_blocks == 16
+
+
+def test_disabled_physical_hkv_skips_validation(monkeypatch):
+    monkeypatch.delenv("HKV_ENABLE_PHYSICAL_TIERS", raising=False)
+
+    assert (
+        attn_utils.validate_hkv_physical_configuration(
+            kv_cache_config=None,
+            attn_groups=None,
+            vllm_config=None,
+            hot_kv_dtype=None,
+            blocks_per_kv_block=None,
+        )
+        is None
+    )
+
+
+def test_disabled_physical_hkv_initialize_skips_allocation(monkeypatch):
+    monkeypatch.delenv("HKV_ENABLE_PHYSICAL_TIERS", raising=False)
+    allocation_called = False
+
+    def unexpected_allocation(*args, **kwargs):
+        nonlocal allocation_called
+        allocation_called = True
+        raise AssertionError("WARM allocation must not be called")
+
+    monkeypatch.setattr(torch, "zeros", unexpected_allocation)
+
+    caches = attn_utils.initialize_hkv_warm_kv_caches(
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[object(), object()]),
+        attn_groups=[
+            [SimpleNamespace(backend=_OtherBackend, layer_names=["layer"])]
+        ],
+        kernel_block_sizes=[16],
+        device=torch.device("cpu"),
+        vllm_config=SimpleNamespace(
+            use_v2_model_runner=False,
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=2,
+                pipeline_parallel_size=2,
+                data_parallel_size=2,
+            ),
+        ),
+        hot_kv_dtype=torch.bfloat16,
+        blocks_per_kv_block=[2],
+    )
+
+    assert caches == {}
+    assert not allocation_called
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_field"),
+    [
+        (
+            lambda values: values.update(
+                attn_groups=[
+                    [SimpleNamespace(backend=_OtherBackend, layer_names=["layer"])]
+                ]
+            ),
+            "attention_backends",
+        ),
+        (
+            lambda values: values.update(hot_kv_dtype=torch.bfloat16),
+            "hot_kv_dtype",
+        ),
+        (
+            lambda values: setattr(
+                values["vllm_config"].parallel_config,
+                "tensor_parallel_size",
+                2,
+            ),
+            "tensor_parallel_size",
+        ),
+        (
+            lambda values: setattr(
+                values["vllm_config"].parallel_config,
+                "pipeline_parallel_size",
+                2,
+            ),
+            "pipeline_parallel_size",
+        ),
+        (
+            lambda values: setattr(
+                values["vllm_config"].parallel_config,
+                "data_parallel_size",
+                2,
+            ),
+            "data_parallel_size",
+        ),
+        (
+            lambda values: values.update(
+                kv_cache_config=SimpleNamespace(
+                    kv_cache_groups=[object(), object()]
+                )
+            ),
+            "num_kv_cache_groups",
+        ),
+        (
+            lambda values: values.update(blocks_per_kv_block=[2]),
+            "blocks_per_kv_block",
+        ),
+        (
+            lambda values: setattr(
+                values["vllm_config"], "use_v2_model_runner", False
+            ),
+            "v2_model_runner",
+        ),
+    ],
+)
+def test_unsupported_physical_hkv_resolved_fields_fail(
+    monkeypatch,
+    mutate,
+    expected_field,
+):
+    _set_physical_hkv_env(monkeypatch)
+    values = _hkv_validation_inputs()
+    mutate(values)
+
+    with pytest.raises(ValueError, match=expected_field):
+        attn_utils.validate_hkv_physical_configuration(**values)
+
+
+@pytest.mark.parametrize(
+    ("env_name", "expected_field"),
+    [
+        ("HKV_DEBUG_MIXED_READ", "mixed_hot_warm_read"),
+        (
+            "HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION",
+            "multi_block_warm_migration",
+        ),
+    ],
+)
+def test_physical_hkv_required_flags_fail(
+    monkeypatch,
+    env_name,
+    expected_field,
+):
+    _set_physical_hkv_env(monkeypatch)
+    monkeypatch.delenv(env_name)
+
+    with pytest.raises(ValueError, match=expected_field):
+        attn_utils.validate_hkv_physical_configuration(
+            **_hkv_validation_inputs()
+        )
+
+
+@pytest.mark.parametrize("warm_pool_blocks", ["0", "-1", "invalid", ""])
+def test_physical_hkv_invalid_warm_pool_fails(monkeypatch, warm_pool_blocks):
+    _set_physical_hkv_env(monkeypatch)
+    monkeypatch.setenv("HKV_WARM_POOL_BLOCKS", warm_pool_blocks)
+
+    with pytest.raises(ValueError, match="warm_pool_blocks"):
+        attn_utils.validate_hkv_physical_configuration(
+            **_hkv_validation_inputs()
+        )
+
+
+def test_physical_hkv_reports_multiple_violations(monkeypatch):
+    _set_physical_hkv_env(monkeypatch)
+    monkeypatch.delenv("HKV_DEBUG_MIXED_READ")
+    monkeypatch.delenv("HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION")
+    monkeypatch.setenv("HKV_WARM_POOL_BLOCKS", "invalid")
+    values = _hkv_validation_inputs()
+    values["hot_kv_dtype"] = torch.bfloat16
+    values["vllm_config"].parallel_config.tensor_parallel_size = 2
+
+    with pytest.raises(ValueError) as exc_info:
+        attn_utils.validate_hkv_physical_configuration(**values)
+
+    message = str(exc_info.value)
+    for field_name in (
+        "mixed_hot_warm_read",
+        "multi_block_warm_migration",
+        "hot_kv_dtype",
+        "tensor_parallel_size",
+        "warm_pool_blocks",
+    ):
+        assert field_name in message
+
+
+def test_physical_hkv_validation_fails_before_warm_allocation(monkeypatch):
+    _set_physical_hkv_env(monkeypatch)
+    values = _hkv_validation_inputs()
+    values["attn_groups"] = [
+        [SimpleNamespace(backend=_OtherBackend, layer_names=["layer"])]
+    ]
+    allocation_called = False
+
+    def unexpected_allocation(*args, **kwargs):
+        nonlocal allocation_called
+        allocation_called = True
+        raise AssertionError("WARM allocation must not be called")
+
+    monkeypatch.setattr(torch, "zeros", unexpected_allocation)
+
+    with pytest.raises(ValueError, match="attention_backends"):
+        attn_utils.initialize_hkv_warm_kv_caches(
+            kernel_block_sizes=[16],
+            device=torch.device("cpu"),
+            **values,
+        )
+
+    assert not allocation_called
 
 
 def key(request_id: str, group: int, logical_block: int) -> tuple[str, int, int]:

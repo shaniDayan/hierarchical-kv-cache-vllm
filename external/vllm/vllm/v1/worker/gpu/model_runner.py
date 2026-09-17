@@ -529,6 +529,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kernel_block_sizes=self.kernel_block_sizes,
             device=self.device,
             vllm_config=self.vllm_config,
+            hot_kv_dtype=self.kv_cache_dtype,
+            blocks_per_kv_block=self.block_tables.blocks_per_kv_block,
         )
         self.hkv_hot_to_warm_maps = initialize_hkv_hot_to_warm_maps(
             hot_kv_caches=self.hkv_hot_kv_caches,

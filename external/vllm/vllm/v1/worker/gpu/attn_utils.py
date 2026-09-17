@@ -31,6 +31,9 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.worker.gpu.hkv_migration import (
+    is_hkv_multi_block_warm_migration_enabled,
+)
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import (
     AttentionGroup,
@@ -40,6 +43,116 @@ from vllm.v1.worker.utils import (
 )
 
 logger = init_logger(__name__)
+
+_HKV_TRUE_VALUES = {"1", "true", "yes", "on"}
+_HKV_TRITON_BACKEND_NAME = "TRITON_ATTN"
+
+
+def is_hkv_physical_tiers_enabled() -> bool:
+    return (
+        os.getenv("HKV_ENABLE_PHYSICAL_TIERS", "").strip().lower()
+        in _HKV_TRUE_VALUES
+    )
+
+
+def is_hkv_mixed_read_enabled() -> bool:
+    return (
+        os.getenv("HKV_DEBUG_MIXED_READ", "").strip().lower()
+        in _HKV_TRUE_VALUES
+    )
+
+
+def _hkv_backend_name(backend: Any) -> str:
+    get_name = getattr(backend, "get_name", None)
+    if get_name is None:
+        return type(backend).__name__
+    name = get_name()
+    if isinstance(name, str):
+        return name
+    # Attention backends currently return a string from get_name().
+    # Never compare the AttentionBackendEnum value/path to "TRITON_ATTN".
+    return str(name)
+
+
+def validate_hkv_physical_configuration(
+    *,
+    kv_cache_config: KVCacheConfig,
+    attn_groups: list[list[AttentionGroup]],
+    vllm_config: VllmConfig,
+    hot_kv_dtype: torch.dtype | None,
+    blocks_per_kv_block: list[int] | None,
+) -> int | None:
+    """Validate the currently supported physical HOT/WARM configuration."""
+    if not is_hkv_physical_tiers_enabled():
+        return None
+
+    violations: list[str] = []
+    if not vllm_config.use_v2_model_runner:
+        violations.append("v2_model_runner=False (expected True)")
+
+    if not is_hkv_mixed_read_enabled():
+        violations.append("mixed_hot_warm_read=False (expected True)")
+
+    multi_block_enabled = is_hkv_multi_block_warm_migration_enabled()
+    if not multi_block_enabled:
+        violations.append("multi_block_warm_migration=False (expected True)")
+
+    backend_names = sorted(
+        {
+            _hkv_backend_name(group.backend)
+            for groups in attn_groups
+            for group in groups
+        }
+    )
+    if backend_names != [_HKV_TRITON_BACKEND_NAME]:
+        violations.append(
+            f"attention_backends={backend_names!r} "
+            f"(expected [{_HKV_TRITON_BACKEND_NAME!r}])"
+        )
+
+    if hot_kv_dtype != torch.float16:
+        violations.append(
+            f"hot_kv_dtype={hot_kv_dtype!r} (expected {torch.float16!r})"
+        )
+
+    parallel_config = vllm_config.parallel_config
+    topology = (
+        ("tensor_parallel_size", parallel_config.tensor_parallel_size),
+        ("pipeline_parallel_size", parallel_config.pipeline_parallel_size),
+        ("data_parallel_size", parallel_config.data_parallel_size),
+    )
+    for field_name, actual in topology:
+        if actual != 1:
+            violations.append(f"{field_name}={actual!r} (expected 1)")
+
+    num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+    if num_kv_cache_groups != 1:
+        violations.append(
+            f"num_kv_cache_groups={num_kv_cache_groups} (expected 1)"
+        )
+
+    if blocks_per_kv_block != [1]:
+        violations.append(
+            f"blocks_per_kv_block={blocks_per_kv_block!r} (expected [1])"
+        )
+
+    warm_pool_blocks_str = os.getenv("HKV_WARM_POOL_BLOCKS", "0")
+    try:
+        warm_pool_blocks = int(warm_pool_blocks_str)
+    except ValueError:
+        warm_pool_blocks = None
+    if warm_pool_blocks is None or warm_pool_blocks <= 0:
+        violations.append(
+            f"warm_pool_blocks={warm_pool_blocks_str!r} "
+            "(expected a positive integer)"
+        )
+
+    if violations:
+        raise ValueError(
+            "Unsupported physical HOT/WARM HKV configuration: "
+            + "; ".join(violations)
+        )
+    return warm_pool_blocks
 
 
 @dataclass(frozen=True)
@@ -85,27 +198,19 @@ def initialize_hkv_warm_kv_caches(
     device: torch.device,
     vllm_config: VllmConfig,
     runner_only_attn_layers: set[str] | None = None,
+    hot_kv_dtype: torch.dtype | None = None,
+    blocks_per_kv_block: list[int] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Allocate the experimental, allocation-only physical WARM KV tier."""
-    enabled = os.getenv("HKV_ENABLE_PHYSICAL_TIERS", "").strip().lower()
-    if enabled not in {"1", "true", "yes", "on"}:
+    warm_pool_blocks = validate_hkv_physical_configuration(
+        kv_cache_config=kv_cache_config,
+        attn_groups=attn_groups,
+        vllm_config=vllm_config,
+        hot_kv_dtype=hot_kv_dtype,
+        blocks_per_kv_block=blocks_per_kv_block,
+    )
+    if warm_pool_blocks is None:
         return {}
-
-    warm_pool_blocks_str = os.getenv("HKV_WARM_POOL_BLOCKS", "0")
-    try:
-        warm_pool_blocks = int(warm_pool_blocks_str)
-    except ValueError as exc:
-        raise ValueError(
-            "HKV_WARM_POOL_BLOCKS must be an integer greater than zero "
-            "when HKV_ENABLE_PHYSICAL_TIERS is enabled; got "
-            f"{warm_pool_blocks_str!r}"
-        ) from exc
-    if warm_pool_blocks <= 0:
-        raise ValueError(
-            "HKV_WARM_POOL_BLOCKS must be greater than zero when "
-            "HKV_ENABLE_PHYSICAL_TIERS is enabled; got "
-            f"{warm_pool_blocks}"
-        )
 
     runner_only_attn_layers = runner_only_attn_layers or set()
     shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
