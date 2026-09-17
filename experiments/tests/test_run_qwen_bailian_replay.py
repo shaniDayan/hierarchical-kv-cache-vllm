@@ -31,6 +31,7 @@ from experiments.scripts.run_qwen_bailian_replay import (
     token_comparison_validation_errors,
     tokenizer_vocab_size,
     validate_baseline_schema,
+    validate_final_turn_generation_limits,
     validate_runtime_memory_accounting,
     validate_timing_and_turns,
     warm_bytes_per_slot,
@@ -77,6 +78,7 @@ def make_turn_result(
     configured_max_tokens_per_turn: int = 1,
     effective_max_tokens: int = 1,
     is_resume: bool | None = None,
+    finish_reason: str | None = None,
 ) -> TurnResult:
     return TurnResult(
         chat_id=chat_id,
@@ -95,6 +97,7 @@ def make_turn_result(
         configured_max_tokens_per_turn=configured_max_tokens_per_turn,
         effective_max_tokens=effective_max_tokens,
         is_resume=turn > 1 if is_resume is None else is_resume,
+        finish_reason=finish_reason,
     )
 
 
@@ -717,6 +720,7 @@ def test_turn_result_serialization():
         "configured_max_tokens_per_turn": 1,
         "effective_max_tokens": 1,
         "is_resume": True,
+        "finish_reason": None,
     }
     loaded = json.loads(json.dumps(serialized))
     assert loaded["is_resume"] is True
@@ -1206,7 +1210,7 @@ def test_run_session_with_fake_engine():
         )
 
         assert len(engine.received_inputs) == 2
-        assert engine.base_max_tokens == 1
+        assert engine.base_max_tokens == 2
         assert engine.received_inputs[0].sampling_params.max_tokens == 1
         assert engine.received_inputs[1].sampling_params.max_tokens == 2
         assert session_result.completed_turns == 2
@@ -1225,6 +1229,7 @@ def test_run_session_with_fake_engine():
         assert t1.ttft_seconds >= 0.0
         assert t1.latency_seconds >= t1.ttft_seconds
         assert t1.first_output_seconds <= t1.finished_seconds
+        assert t1.finish_reason == "length"
 
         # FIFO turn 2 mapping
         t2 = session_result.turn_results[1]
@@ -1238,6 +1243,7 @@ def test_run_session_with_fake_engine():
         assert t2.ttft_seconds >= 0.0
         assert t2.latency_seconds >= t2.ttft_seconds
         assert t2.first_output_seconds <= t2.finished_seconds
+        assert t2.finish_reason == "length"
 
         # Validate overall session timing
         assert validate_timing_and_turns([session_result]) == []
@@ -1294,3 +1300,222 @@ def test_single_turn_uses_configured_multi_token_limit():
         )
 
     asyncio.run(_test())
+
+
+def test_run_session_final_turn_uses_configured_multi_token_limit():
+    async def _test():
+        class FakeEngine:
+            def __init__(self):
+                self.received_inputs = []
+                self.base_max_tokens = None
+
+            async def generate(self, input_gen, base_params, session_id):
+                self.base_max_tokens = base_params.max_tokens
+                collected = []
+                for _ in range(3):
+                    collected.append(await anext(input_gen))
+                self.received_inputs.extend(collected)
+                next_id = 101
+                for inp in collected:
+                    count = inp.sampling_params.max_tokens
+                    token_ids = list(range(next_id, next_id + count))
+                    next_id += 100
+                    yield SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(
+                                token_ids=token_ids,
+                                finish_reason=None,
+                            )
+                        ]
+                    )
+                    await asyncio.sleep(0.01)
+                    yield SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(
+                                token_ids=[],
+                                finish_reason="length",
+                            )
+                        ]
+                    )
+
+        turns = [
+            ReplayTurn(
+                session_id="bailian-10",
+                root_chat_id=10,
+                chat_id=10,
+                parent_chat_id=-1,
+                turn=1,
+                send_at_seconds=0.0,
+                input_length=4,
+                trace_output_length=2,
+                delta_token_ids=(10, 11, 12, 13),
+            ),
+            ReplayTurn(
+                session_id="bailian-10",
+                root_chat_id=10,
+                chat_id=11,
+                parent_chat_id=10,
+                turn=2,
+                send_at_seconds=0.0,
+                input_length=8,
+                trace_output_length=2,
+                delta_token_ids=(20, 21, 22, 23),
+            ),
+            ReplayTurn(
+                session_id="bailian-10",
+                root_chat_id=10,
+                chat_id=12,
+                parent_chat_id=11,
+                turn=3,
+                send_at_seconds=0.0,
+                input_length=12,
+                trace_output_length=2,
+                delta_token_ids=(30, 31, 32, 33),
+            ),
+        ]
+        engine = FakeEngine()
+        session_result, _ = await run_session(
+            engine,
+            turns,
+            time.perf_counter(),
+            seed=42,
+            max_tokens_per_turn=16,
+        )
+
+        assert engine.base_max_tokens == 16
+        assert engine.base_max_tokens != 1
+        assert [
+            inp.sampling_params.max_tokens for inp in engine.received_inputs
+        ] == [1, 1, 16]
+        assert [
+            turn.effective_max_tokens for turn in session_result.turn_results
+        ] == [1, 1, 16]
+        assert session_result.generated_tokens == 18
+        assert session_result.completed_turns == 3
+
+        t1, t2, t3 = session_result.turn_results
+        assert t1.generated_tokens == 1
+        assert t1.generated_token_ids == [101]
+        assert t1.effective_max_tokens == 1
+        assert t1.is_resume is False
+        assert t1.finish_reason == "length"
+
+        assert t2.generated_tokens == 1
+        assert t2.generated_token_ids == [201]
+        assert t2.effective_max_tokens == 1
+        assert t2.is_resume is True
+        assert t2.finish_reason == "length"
+
+        assert t3.generated_tokens == 16
+        assert t3.generated_token_ids == list(range(301, 317))
+        assert t3.effective_max_tokens == 16
+        assert t3.configured_max_tokens_per_turn == 16
+        assert t3.is_resume is True
+        assert t3.finish_reason == "length"
+
+        assert validate_timing_and_turns([session_result]) == []
+        assert validate_final_turn_generation_limits([session_result]) == []
+
+    asyncio.run(_test())
+
+
+def _three_turn_session(
+    *,
+    final_generated_tokens: int,
+    final_finish_reason: str | None,
+    final_effective_max_tokens: int = 16,
+) -> SessionResult:
+    return SessionResult(
+        root_chat_id=10,
+        session_id="bailian-10",
+        turns=3,
+        final_input_tokens=12,
+        trace_output_tokens=6,
+        scheduled_first_seconds=0.0,
+        scheduled_last_seconds=1.0,
+        generated_tokens=2 + final_generated_tokens,
+        completed_turns=3,
+        turn_results=[
+            make_turn_result(
+                chat_id=10,
+                turn=1,
+                generated_tokens=1,
+                generated_token_ids=[101],
+                configured_max_tokens_per_turn=16,
+                effective_max_tokens=1,
+                finish_reason="length",
+            ),
+            make_turn_result(
+                chat_id=11,
+                turn=2,
+                generated_tokens=1,
+                generated_token_ids=[201],
+                configured_max_tokens_per_turn=16,
+                effective_max_tokens=1,
+                finish_reason="length",
+            ),
+            make_turn_result(
+                chat_id=12,
+                turn=3,
+                generated_tokens=final_generated_tokens,
+                generated_token_ids=list(range(301, 301 + final_generated_tokens)),
+                configured_max_tokens_per_turn=16,
+                effective_max_tokens=final_effective_max_tokens,
+                finish_reason=final_finish_reason,
+            ),
+        ],
+    )
+
+
+def test_validate_rejects_silently_capped_final_turns():
+    errors = validate_final_turn_generation_limits(
+        [
+            _three_turn_session(
+                final_generated_tokens=1,
+                final_finish_reason="length",
+            )
+        ]
+    )
+    assert errors
+    assert "silently limited to one token" in errors[0]
+
+
+def test_validate_rejects_silently_capped_final_turns_without_finish_reason():
+    errors = validate_final_turn_generation_limits(
+        [
+            _three_turn_session(
+                final_generated_tokens=1,
+                final_finish_reason=None,
+            )
+        ]
+    )
+    assert errors
+    assert "silently limited to one token" in errors[0]
+
+
+def test_validate_allows_final_turn_that_reaches_configured_maximum():
+    assert (
+        validate_final_turn_generation_limits(
+            [
+                _three_turn_session(
+                    final_generated_tokens=16,
+                    final_finish_reason="length",
+                )
+            ]
+        )
+        == []
+    )
+
+
+def test_validate_allows_legitimate_early_stop_on_final_turn():
+    assert (
+        validate_final_turn_generation_limits(
+            [
+                _three_turn_session(
+                    final_generated_tokens=1,
+                    final_finish_reason="abort",
+                )
+            ]
+        )
+        == []
+    )

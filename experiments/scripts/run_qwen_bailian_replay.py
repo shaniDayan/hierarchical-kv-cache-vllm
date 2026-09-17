@@ -336,6 +336,7 @@ class TurnResult:
     configured_max_tokens_per_turn: int
     effective_max_tokens: int
     is_resume: bool
+    finish_reason: str | None = None
 
 
 @dataclass(slots=True)
@@ -681,7 +682,10 @@ async def run_session(
         1 if index < len(turns) - 1 else max_tokens_per_turn
         for index in range(len(turns))
     ]
-    base_params = SamplingParams(max_tokens=effective_max_tokens[0], **common)
+    # Per-turn StreamingInput sampling params keep non-final turns at 1 token.
+    # The base request must not impose a smaller lifetime cap than the final
+    # turn: effective_max_tokens[0] is 1 on every multi-turn session.
+    base_params = SamplingParams(max_tokens=max(effective_max_tokens), **common)
     turn_finished = [asyncio.Event() for _ in turns]
     lateness_values: list[float] = []
 
@@ -690,6 +694,7 @@ async def run_session(
     turn_finished_times: list[float | None] = [None] * len(turns)
     turn_generated_tokens: list[int] = [0] * len(turns)
     turn_generated_token_ids: list[list[int]] = [[] for _ in turns]
+    turn_finish_reasons: list[str | None] = [None] * len(turns)
 
     async def inputs():
         for i, turn in enumerate(turns):
@@ -742,6 +747,7 @@ async def run_session(
         if completion.finish_reason and finish_index < len(turn_finished):
             finished_now = time.perf_counter() - replay_started
             turn_finished_times[finish_index] = finished_now
+            turn_finish_reasons[finish_index] = completion.finish_reason
             if turn_first_output_times[finish_index] is None:
                 turn_first_output_times[finish_index] = finished_now
             turn_finished[finish_index].set()
@@ -784,6 +790,7 @@ async def run_session(
                 configured_max_tokens_per_turn=max_tokens_per_turn,
                 effective_max_tokens=effective_max_tokens[i],
                 is_resume=turn.turn > 1,
+                finish_reason=turn_finish_reasons[i],
             )
         )
 
@@ -904,6 +911,47 @@ def validate_timing_and_turns(sessions: list[SessionResult]) -> list[str]:
                         f"has invalid/negative {tf}: {val}"
                     )
     return errors
+
+
+LEGITIMATE_EARLY_STOP_REASONS = frozenset({"abort"})
+SILENT_ONE_TOKEN_FINISH_REASONS = frozenset({None, "length"})
+
+
+def validate_final_turn_generation_limits(
+    sessions: list[SessionResult],
+) -> list[str]:
+    """Reject runs where every multi-token final turn is silently capped at 1.
+
+    ignore_eos=True is used, so a normal final turn should reach its configured
+    maximum unless the runtime reports a legitimate early termination reason.
+    """
+    multi_token_finals: list[TurnResult] = []
+    silently_limited: list[TurnResult] = []
+    for session in sessions:
+        if not session.turn_results:
+            continue
+        final = session.turn_results[-1]
+        if final.effective_max_tokens <= 1:
+            continue
+        multi_token_finals.append(final)
+        if final.generated_tokens >= final.effective_max_tokens:
+            continue
+        reason = final.finish_reason
+        if reason in LEGITIMATE_EARLY_STOP_REASONS:
+            continue
+        if (
+            final.generated_tokens == 1
+            and reason in SILENT_ONE_TOKEN_FINISH_REASONS
+        ):
+            silently_limited.append(final)
+    if multi_token_finals and len(silently_limited) == len(multi_token_finals):
+        return [
+            "final turns were silently limited to one token despite "
+            "effective_max_tokens > 1; ignore_eos=True so a normal final "
+            "turn should reach its configured maximum unless the runtime "
+            "reports a legitimate early termination reason"
+        ]
+    return []
 
 
 def build_experiment_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -1444,6 +1492,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     validation_errors.extend(validate_timing_and_turns(session_results))
+    validation_errors.extend(
+        validate_final_turn_generation_limits(session_results)
+    )
 
     if baseline is not None:
         result["baseline_comparison"] = compare_baseline(result, baseline)
