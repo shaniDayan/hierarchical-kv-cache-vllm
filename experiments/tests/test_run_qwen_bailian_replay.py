@@ -8,15 +8,21 @@ import pytest
 
 from experiments.scripts.qwen_bailian_trace import BailianRecord, ReplayTurn
 from experiments.scripts.run_qwen_bailian_replay import (
+    HKVReplayWorkerExtension,
+    KV_MEMORY_FORMULA_VERSION,
+    RESULT_SCHEMA_VERSION,
     SessionResult,
     TurnResult,
     build_engine_args_kwargs,
     build_experiment_config,
     build_experiment_fingerprint,
     build_reproducibility_metadata,
+    build_runtime_memory_accounting,
     compare_baseline,
     compute_run_metrics,
     compute_turn_metrics_summary,
+    derive_persistent_kv_budget,
+    hot_bytes_per_block,
     parse_args,
     percentile,
     run_session,
@@ -24,7 +30,12 @@ from experiments.scripts.run_qwen_bailian_replay import (
     select_sessions,
     token_comparison_validation_errors,
     tokenizer_vocab_size,
+    validate_baseline_schema,
+    validate_runtime_memory_accounting,
     validate_timing_and_turns,
+    warm_bytes_per_slot,
+    warm_pool_storage_bytes,
+    warm_slot_table_storage_bytes,
 )
 
 
@@ -129,9 +140,16 @@ def make_replay_args(**overrides):
         "min_turns": 2,
         "max_input_length": 1024,
         "max_model_len": 2048,
+        "max_num_seqs": 128,
         "gpu_memory_utilization": 0.6,
+        "total_kv_budget_bytes": None,
     }
     values.update(overrides)
+    if (
+        values["experiment_mode"] == "performance"
+        and "total_kv_budget_bytes" not in overrides
+    ):
+        values["total_kv_budget_bytes"] = 4 * 1024**3
     return SimpleNamespace(**values)
 
 
@@ -146,6 +164,7 @@ def make_comparison_result(**overrides):
     }
     session = make_session_result(1, "digest")
     return {
+        "schema_version": RESULT_SCHEMA_VERSION,
         "experiment_mode": args.experiment_mode,
         "experiment_config": build_experiment_config(args),
         "experiment_fingerprint": build_experiment_fingerprint(
@@ -301,6 +320,221 @@ def test_tokenizer_vocab_size_supports_property_and_len_fallback():
     assert tokenizer_vocab_size(LengthOnlyTokenizer()) == 70000
 
 
+def test_qwen_persistent_kv_byte_constants():
+    assert hot_bytes_per_block() == 1_835_008
+    assert warm_bytes_per_slot() == 946_176
+    assert warm_pool_storage_bytes(128) == 121_110_528
+    assert warm_slot_table_storage_bytes(2048, 128) == 65_536
+
+
+def test_all_hot_explicit_budget_derivation():
+    total = 4 * 1024**3
+    budget = derive_persistent_kv_budget(
+        make_replay_args(total_kv_budget_bytes=total)
+    )
+    expected_blocks = total // 1_835_008
+
+    assert budget["derived_num_gpu_blocks"] == expected_blocks
+    assert (
+        budget["derived_hot_kv_budget_bytes"]
+        == expected_blocks * 1_835_008
+    )
+    assert budget["derived_warm_kv_storage_bytes"] == 0
+    assert budget["derived_hot_to_warm_map_storage_bytes"] == 0
+    assert budget["derived_warm_slot_table_storage_bytes"] == 0
+    assert budget["derived_actual_persistent_kv_bytes"] <= total
+
+
+def test_mixed_explicit_budget_derivation_and_rounding():
+    total = 4 * 1024**3
+    args = make_replay_args(
+        kv_mode="mixed",
+        warm_pool_blocks=128,
+        demotion_start_utilization=0.8,
+        demotion_stop_utilization=0.65,
+        total_kv_budget_bytes=total,
+    )
+    budget = derive_persistent_kv_budget(args)
+    fixed_bytes = 121_110_528 + 65_536
+    expected_blocks = (total - fixed_bytes) // (1_835_008 + 28 * 4)
+    expected_maps = expected_blocks * 28 * 4
+    expected_total = (
+        expected_blocks * 1_835_008
+        + expected_maps
+        + fixed_bytes
+    )
+
+    assert budget["derived_num_gpu_blocks"] == expected_blocks
+    assert budget["derived_hot_to_warm_map_storage_bytes"] == expected_maps
+    assert budget["derived_actual_persistent_kv_bytes"] == expected_total
+    assert expected_total <= total
+
+    all_hot = derive_persistent_kv_budget(
+        make_replay_args(total_kv_budget_bytes=total)
+    )
+    difference = abs(
+        all_hot["derived_actual_persistent_kv_bytes"] - expected_total
+    )
+    assert difference <= max(
+        all_hot["block_rounding_tolerance_bytes"],
+        budget["block_rounding_tolerance_bytes"],
+    )
+
+
+def test_explicit_budget_engine_args_use_only_derived_hot_bytes():
+    args = make_replay_args(
+        experiment_mode="performance",
+        max_tokens_per_turn=16,
+        total_kv_budget_bytes=4 * 1024**3,
+        gpu_memory_utilization=0.73,
+        max_num_seqs=64,
+    )
+    budget = derive_persistent_kv_budget(args)
+
+    kwargs = build_engine_args_kwargs(args)
+
+    assert (
+        kwargs["kv_cache_memory_bytes"]
+        == budget["derived_hot_kv_budget_bytes"]
+    )
+    assert kwargs["gpu_memory_utilization"] == 0.73
+    assert kwargs["max_num_seqs"] == 64
+
+
+def test_correctness_without_explicit_budget_preserves_auto_sizing():
+    args = make_replay_args()
+    budget = derive_persistent_kv_budget(args)
+    kwargs = build_engine_args_kwargs(args)
+
+    assert budget["total_kv_budget_bytes"] is None
+    assert budget["derived_num_gpu_blocks"] is None
+    assert kwargs["kv_cache_memory_bytes"] is None
+    assert kwargs["gpu_memory_utilization"] == args.gpu_memory_utilization
+
+
+@pytest.mark.parametrize("total", [0, -1])
+def test_non_positive_explicit_budget_is_rejected(total):
+    with pytest.raises(ValueError, match="must be positive"):
+        derive_persistent_kv_budget(
+            make_replay_args(total_kv_budget_bytes=total)
+        )
+
+
+def test_too_small_mixed_budget_is_rejected():
+    with pytest.raises(ValueError, match="must be less than"):
+        derive_persistent_kv_budget(
+            make_replay_args(
+                kv_mode="mixed",
+                warm_pool_blocks=128,
+                total_kv_budget_bytes=121_176_064,
+            )
+        )
+
+
+def test_unsupported_model_is_rejected_for_explicit_budget():
+    with pytest.raises(ValueError, match="supports only"):
+        derive_persistent_kv_budget(
+            make_replay_args(
+                model="other/model",
+                total_kv_budget_bytes=4 * 1024**3,
+            )
+        )
+
+
+def test_unique_storage_accounting_does_not_double_count_views():
+    torch = pytest.importorskip("torch")
+    hot = torch.zeros(32, dtype=torch.uint8)
+    warm = torch.zeros(24, dtype=torch.uint8)
+    mapping = torch.zeros(8, dtype=torch.int32)
+    slot_table = torch.zeros(4, dtype=torch.int32)
+    extension = HKVReplayWorkerExtension()
+    extension.model_runner = SimpleNamespace(
+        hkv_hot_kv_caches={"a": hot, "alias": hot.view(8, 4)},
+        hkv_warm_kv_caches={"a": warm, "alias": warm.view(6, 4)},
+        hkv_hot_to_warm_maps={"a": mapping, "alias": mapping.view(2, 4)},
+        hkv_warm_slot_table=slot_table,
+        hkv_warm_migration_manager=None,
+        kv_cache_config=SimpleNamespace(num_blocks=8),
+    )
+
+    state = extension.inspect_hkv_replay()
+
+    assert state["num_gpu_blocks"] == 8
+    assert state["hot_kv_storage_bytes"] == 32
+    assert state["warm_kv_storage_bytes"] == 24
+    assert state["hot_to_warm_map_storage_bytes"] == 32
+    assert state["warm_slot_table_storage_bytes"] == 16
+    assert state["actual_persistent_kv_bytes"] == 104
+
+
+def test_all_hot_runtime_accounting_uses_ordinary_kv_caches():
+    torch = pytest.importorskip("torch")
+    hot = torch.zeros(32, dtype=torch.uint8)
+    extension = HKVReplayWorkerExtension()
+    extension.model_runner = SimpleNamespace(
+        kv_caches={
+            "layers": [hot, hot.view(8, 4)],
+            "nested": {"alias": hot.view(4, 8), "ignored": None},
+            "scalars": {"count": 7, "label": "hot"},
+        },
+        kv_cache_config=SimpleNamespace(num_blocks=1),
+        hkv_warm_migration_manager=None,
+    )
+
+    assert not hasattr(extension.model_runner, "hkv_hot_kv_caches")
+    assert not hasattr(extension.model_runner, "hkv_warm_kv_caches")
+    assert not hasattr(extension.model_runner, "hkv_hot_to_warm_maps")
+    assert not hasattr(extension.model_runner, "hkv_warm_slot_table")
+
+    state = extension.inspect_hkv_replay()
+
+    assert state["hot_kv_storage_bytes"] == 32
+    assert state["warm_kv_storage_bytes"] == 0
+    assert state["hot_to_warm_map_storage_bytes"] == 0
+    assert state["warm_slot_table_storage_bytes"] == 0
+    assert state["actual_persistent_kv_bytes"] == 32
+
+
+def test_empty_hkv_hot_kv_caches_falls_back_to_ordinary_kv_caches():
+    torch = pytest.importorskip("torch")
+    hot = torch.zeros(32, dtype=torch.uint8)
+    extension = HKVReplayWorkerExtension()
+    extension.model_runner = SimpleNamespace(
+        hkv_hot_kv_caches={},
+        kv_caches={"layer": hot},
+        kv_cache_config=SimpleNamespace(num_blocks=1),
+        hkv_warm_migration_manager=None,
+    )
+
+    state = extension.inspect_hkv_replay()
+
+    assert state["hot_kv_storage_bytes"] == 32
+    assert state["warm_kv_storage_bytes"] == 0
+    assert state["hot_to_warm_map_storage_bytes"] == 0
+    assert state["warm_slot_table_storage_bytes"] == 0
+    assert state["actual_persistent_kv_bytes"] == 32
+
+
+def test_hot_accounting_does_not_sum_aliased_hkv_and_kv_caches():
+    torch = pytest.importorskip("torch")
+    hot = torch.zeros(32, dtype=torch.uint8)
+    extension = HKVReplayWorkerExtension()
+    extension.model_runner = SimpleNamespace(
+        hkv_hot_kv_caches={"a": hot, "alias": hot.view(8, 4)},
+        kv_caches=[hot, hot.view(4, 8)],
+        kv_cache_config=SimpleNamespace(num_blocks=1),
+        hkv_warm_migration_manager=None,
+    )
+
+    state = extension.inspect_hkv_replay()
+
+    assert state["hot_kv_storage_bytes"] == 32
+    assert state["warm_kv_storage_bytes"] == 0
+    assert state["hot_to_warm_map_storage_bytes"] == 0
+    assert state["warm_slot_table_storage_bytes"] == 0
+    assert state["actual_persistent_kv_bytes"] == 32
+
+
 def test_compare_with_equivalent_baseline_accepts_ordered_tokens():
     result = make_comparison_result(kv_mode="mixed", warm_pool_blocks=128)
     baseline = make_comparison_result()
@@ -382,6 +616,77 @@ def test_fingerprint_mismatch_is_rejected_in_both_modes(experiment_mode):
 
     with pytest.raises(ValueError, match="seed"):
         compare_baseline(result, baseline)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "difference"),
+    [
+        ("total_kv_budget_bytes", 3 * 1024**3, "total_kv_budget_bytes"),
+        ("max_num_seqs", 64, "max_num_seqs"),
+    ],
+)
+def test_fingerprint_rejects_mismatched_memory_budget(field, value, difference):
+    result = make_comparison_result(
+        experiment_mode="performance",
+        max_tokens_per_turn=16,
+    )
+    baseline = make_comparison_result(
+        experiment_mode="performance",
+        max_tokens_per_turn=16,
+        **{field: value},
+    )
+
+    with pytest.raises(ValueError, match=difference):
+        compare_baseline(result, baseline)
+
+
+def test_fingerprint_records_memory_formula_version():
+    result = make_comparison_result()
+    memory = result["experiment_fingerprint"]["fields"][
+        "gpu_memory_configuration"
+    ]
+
+    assert memory["max_num_seqs"] == 128
+    assert memory["kv_memory_formula_version"] == KV_MEMORY_FORMULA_VERSION
+
+
+def test_legacy_baseline_is_rejected_clearly():
+    with pytest.raises(ValueError, match="legacy baseline unsupported"):
+        validate_baseline_schema(
+            "performance",
+            {"mode": "all-hot", "experiment_config": {}},
+        )
+
+
+def test_runtime_memory_validation_reports_exact_components():
+    budget = derive_persistent_kv_budget(
+        make_replay_args(total_kv_budget_bytes=4 * 1024**3)
+    )
+    runtime_state = {
+        "num_gpu_blocks": budget["derived_num_gpu_blocks"],
+        "hot_kv_storage_bytes": budget["derived_hot_kv_budget_bytes"] - 16,
+        "warm_kv_storage_bytes": 0,
+        "hot_to_warm_map_storage_bytes": 0,
+        "warm_slot_table_storage_bytes": 0,
+        "actual_persistent_kv_bytes": (
+            budget["derived_actual_persistent_kv_bytes"] - 16
+        ),
+        "configured_total_kv_budget_bytes": budget[
+            "total_kv_budget_bytes"
+        ],
+        "derived_hot_kv_budget_bytes": budget[
+            "derived_hot_kv_budget_bytes"
+        ],
+        "budget_slack_bytes": budget["derived_budget_slack_bytes"] + 16,
+    }
+    runtime = build_runtime_memory_accounting(budget, runtime_state)
+
+    errors = validate_runtime_memory_accounting(budget, runtime)
+
+    assert len(errors) == 1
+    assert "hot_kv_storage_bytes" in errors[0]
+    assert "'expected':" in errors[0]
+    assert "'actual':" in errors[0]
 
 
 def test_turn_result_serialization():
@@ -658,6 +963,22 @@ def test_performance_mode_rejects_one_token():
         )
 
 
+def test_performance_mode_rejects_missing_total_kv_budget():
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--experiment-mode",
+                "performance",
+                "--kv-mode",
+                "all-hot",
+                "--result-json",
+                "result.json",
+                "--max-tokens-per-turn",
+                "16",
+            ]
+        )
+
+
 def test_pressure_mixed_mode_passes_thresholds_without_idle_thresholds():
     args = parse_args(
         [
@@ -677,6 +998,8 @@ def test_pressure_mixed_mode_passes_thresholds_without_idle_thresholds():
             "0.65",
             "--warm-pool-blocks",
             "128",
+            "--total-kv-budget-bytes",
+            str(4 * 1024**3),
         ]
     )
 
@@ -686,6 +1009,8 @@ def test_pressure_mixed_mode_passes_thresholds_without_idle_thresholds():
     assert kwargs["kv_cache_demotion_stop_utilization"] == 0.65
     assert kwargs["kv_cache_hot_idle_threshold_seconds"] is None
     assert kwargs["kv_cache_cold_idle_threshold_seconds"] is None
+    assert kwargs["kv_cache_memory_bytes"] > 0
+    assert kwargs["max_num_seqs"] == 128
 
 
 @pytest.mark.parametrize(
@@ -791,6 +1116,8 @@ def test_reproducibility_metadata_contains_required_fields():
         "generation_parameters",
         "generation_policy",
         "gpu_memory_utilization",
+        "max_num_seqs",
+        "persistent_kv_memory_budget",
         "configured_hkv",
         "warm_pool_blocks",
         "thresholds",

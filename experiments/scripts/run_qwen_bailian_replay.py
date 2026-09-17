@@ -23,10 +23,22 @@ from experiments.scripts.qwen_bailian_trace import (
     load_bailian_records,
 )
 
-RESULT_SCHEMA_VERSION = "2.0"
+RESULT_SCHEMA_VERSION = "3.0"
 ATTENTION_BACKEND = "TRITON_ATTN"
 MODEL_DTYPE = "float16"
 BLOCK_SIZE = 16
+DEFAULT_MAX_NUM_SEQS = 128
+KV_MEMORY_FORMULA_VERSION = "qwen3-0.6b-hkv-persistent-v1"
+SUPPORTED_BUDGET_MODEL = "Qwen/Qwen3-0.6B"
+QWEN_ATTENTION_LAYERS = 28
+QWEN_KV_HEADS = 8
+QWEN_HEAD_DIM = 128
+HOT_DTYPE_BYTES = 2
+WARM_DTYPE_BYTES = 1
+WARM_INLINE_SCALE_BYTES = 4
+INT32_BYTES = 4
+BLOCK_TABLE_ALIGNMENT_TOKENS = 128
+TOTAL_KV_BUDGET_ENV = "HKV_TOTAL_KV_BUDGET_BYTES"
 TOPOLOGY_ASSUMPTIONS = {
     "tensor_parallel_size": 1,
     "pipeline_parallel_size": 1,
@@ -34,6 +46,209 @@ TOPOLOGY_ASSUMPTIONS = {
     "kv_cache_groups": 1,
     "blocks_per_kv_block": 1,
 }
+
+
+def hot_bytes_per_block() -> int:
+    return (
+        QWEN_ATTENTION_LAYERS
+        * 2
+        * BLOCK_SIZE
+        * QWEN_KV_HEADS
+        * QWEN_HEAD_DIM
+        * HOT_DTYPE_BYTES
+    )
+
+
+def warm_bytes_per_slot() -> int:
+    return (
+        QWEN_ATTENTION_LAYERS
+        * 2
+        * BLOCK_SIZE
+        * QWEN_KV_HEADS
+        * (QWEN_HEAD_DIM + WARM_INLINE_SCALE_BYTES)
+        * WARM_DTYPE_BYTES
+    )
+
+
+def warm_pool_storage_bytes(warm_pool_blocks: int) -> int:
+    return warm_pool_blocks * warm_bytes_per_slot()
+
+
+def warm_slot_table_storage_bytes(
+    max_model_len: int,
+    max_num_seqs: int,
+) -> int:
+    logical_blocks = (max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    block_alignment = BLOCK_TABLE_ALIGNMENT_TOKENS // BLOCK_SIZE
+    aligned_blocks = (
+        (logical_blocks + block_alignment - 1) // block_alignment
+    ) * block_alignment
+    return max_num_seqs * aligned_blocks * INT32_BYTES
+
+
+def _validate_explicit_budget_layout(args: argparse.Namespace) -> None:
+    if args.model != SUPPORTED_BUDGET_MODEL:
+        raise ValueError(
+            "explicit persistent KV budgeting supports only "
+            f"{SUPPORTED_BUDGET_MODEL}; got {args.model}"
+        )
+    if (
+        MODEL_DTYPE != "float16"
+        or BLOCK_SIZE != 16
+        or ATTENTION_BACKEND != "TRITON_ATTN"
+        or TOPOLOGY_ASSUMPTIONS
+        != {
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "data_parallel_size": 1,
+            "kv_cache_groups": 1,
+            "blocks_per_kv_block": 1,
+        }
+    ):
+        raise ValueError(
+            "explicit persistent KV budgeting requires float16 HOT, block "
+            "size 16, Triton attention, TP=PP=DP=1, one KV-cache group, "
+            "and blocks_per_kv_block=1"
+        )
+
+
+def derive_persistent_kv_budget(args: argparse.Namespace) -> dict[str, Any]:
+    total_budget = args.total_kv_budget_bytes
+    layout = {
+        "formula_version": KV_MEMORY_FORMULA_VERSION,
+        "model": SUPPORTED_BUDGET_MODEL,
+        "attention_layers": QWEN_ATTENTION_LAYERS,
+        "kv_heads": QWEN_KV_HEADS,
+        "head_dimension": QWEN_HEAD_DIM,
+        "hot_dtype": MODEL_DTYPE,
+        "hot_dtype_bytes": HOT_DTYPE_BYTES,
+        "warm_dtype": "int8",
+        "warm_dtype_bytes": WARM_DTYPE_BYTES,
+        "warm_inline_scale_bytes_per_token_head": WARM_INLINE_SCALE_BYTES,
+        "block_size": BLOCK_SIZE,
+        "block_table_alignment_tokens": BLOCK_TABLE_ALIGNMENT_TOKENS,
+        "attention_backend": ATTENTION_BACKEND,
+        "enforce_eager": True,
+        "topology": TOPOLOGY_ASSUMPTIONS,
+    }
+    hot_block_bytes = hot_bytes_per_block()
+    warm_slot_bytes = warm_bytes_per_slot()
+    common = {
+        "total_kv_budget_bytes": total_budget,
+        "max_num_seqs": args.max_num_seqs,
+        "hot_bytes_per_block": hot_block_bytes,
+        "warm_bytes_per_slot": warm_slot_bytes,
+        "layout": layout,
+    }
+    if total_budget is None:
+        return {
+            **common,
+            "derived_num_gpu_blocks": None,
+            "derived_hot_kv_budget_bytes": None,
+            "derived_warm_kv_storage_bytes": None,
+            "derived_hot_to_warm_map_storage_bytes": None,
+            "derived_warm_slot_table_storage_bytes": None,
+            "derived_actual_persistent_kv_bytes": None,
+            "derived_budget_slack_bytes": None,
+            "block_rounding_tolerance_bytes": None,
+        }
+
+    _validate_explicit_budget_layout(args)
+    if total_budget <= 0:
+        raise ValueError("--total-kv-budget-bytes must be positive")
+    if args.max_model_len <= 0:
+        raise ValueError("--max-model-len must be positive")
+    if args.max_num_seqs <= 0:
+        raise ValueError("--max-num-seqs must be positive")
+
+    mixed = args.kv_mode == "mixed"
+    if mixed and (
+        args.warm_pool_blocks is None or args.warm_pool_blocks <= 0
+    ):
+        raise ValueError(
+            "mixed explicit budgeting requires positive --warm-pool-blocks"
+        )
+    warm_bytes = (
+        warm_pool_storage_bytes(args.warm_pool_blocks) if mixed else 0
+    )
+    slot_table_bytes = (
+        warm_slot_table_storage_bytes(args.max_model_len, args.max_num_seqs)
+        if mixed
+        else 0
+    )
+    fixed_mixed_bytes = warm_bytes + slot_table_bytes
+    if mixed and fixed_mixed_bytes >= total_budget:
+        raise ValueError(
+            "mixed WARM pool and slot table require "
+            f"{fixed_mixed_bytes} bytes, which must be less than the "
+            f"configured total KV budget {total_budget}"
+        )
+
+    map_bytes_per_hot_block = (
+        QWEN_ATTENTION_LAYERS * INT32_BYTES if mixed else 0
+    )
+    bytes_per_budgeted_block = hot_block_bytes + map_bytes_per_hot_block
+    num_gpu_blocks = (
+        total_budget - fixed_mixed_bytes
+    ) // bytes_per_budgeted_block
+    if num_gpu_blocks <= 0:
+        raise ValueError(
+            "configured total KV budget derives no usable HOT blocks: "
+            f"total={total_budget}, fixed_mixed={fixed_mixed_bytes}, "
+            f"bytes_per_budgeted_block={bytes_per_budgeted_block}"
+        )
+
+    hot_budget_bytes = num_gpu_blocks * hot_block_bytes
+    map_bytes = num_gpu_blocks * map_bytes_per_hot_block
+    actual_total = hot_budget_bytes + map_bytes + fixed_mixed_bytes
+    return {
+        **common,
+        "derived_num_gpu_blocks": num_gpu_blocks,
+        "derived_hot_kv_budget_bytes": hot_budget_bytes,
+        "derived_warm_kv_storage_bytes": warm_bytes,
+        "derived_hot_to_warm_map_storage_bytes": map_bytes,
+        "derived_warm_slot_table_storage_bytes": slot_table_bytes,
+        "derived_actual_persistent_kv_bytes": actual_total,
+        "derived_budget_slack_bytes": total_budget - actual_total,
+        "block_rounding_tolerance_bytes": bytes_per_budgeted_block - 1,
+    }
+
+
+def unique_storage_bytes(value: Any) -> int:
+    """Count unique underlying tensor storage, including nested containers."""
+    import torch
+
+    seen: set[tuple[str, int, int]] = set()
+
+    def visit(node: Any) -> int:
+        if node is None:
+            return 0
+        if isinstance(node, torch.Tensor):
+            storage = node.untyped_storage()
+            key = (
+                str(node.device),
+                storage.data_ptr(),
+                storage.nbytes(),
+            )
+            if key in seen:
+                return 0
+            seen.add(key)
+            return int(storage.nbytes())
+        if isinstance(node, dict):
+            return sum(visit(item) for item in node.values())
+        if isinstance(node, (list, tuple, set)):
+            return sum(visit(item) for item in node)
+        return 0
+
+    return visit(value)
+
+
+def hot_kv_storage_source(model_runner: Any) -> Any:
+    """Prefer HKV HOT tensors; otherwise use ordinary runner KV caches."""
+    hot_caches = getattr(model_runner, "hkv_hot_kv_caches", None)
+    if unique_storage_bytes(hot_caches) > 0:
+        return hot_caches
+    return getattr(model_runner, "kv_caches", None)
 
 
 class HKVReplayWorkerExtension:
@@ -47,6 +262,29 @@ class HKVReplayWorkerExtension:
         )
         residency = manager.warm_residency if manager is not None else {}
         allocator = manager.allocator if manager is not None else None
+        hot_bytes = unique_storage_bytes(hot_kv_storage_source(self.model_runner))
+        warm_bytes = unique_storage_bytes(
+            getattr(self.model_runner, "hkv_warm_kv_caches", None)
+        )
+        map_bytes = unique_storage_bytes(
+            getattr(self.model_runner, "hkv_hot_to_warm_maps", None)
+        )
+        slot_table_bytes = unique_storage_bytes(
+            getattr(self.model_runner, "hkv_warm_slot_table", None)
+        )
+        kv_cache_config = getattr(self.model_runner, "kv_cache_config", None)
+        num_gpu_blocks = getattr(kv_cache_config, "num_blocks", 0)
+        cache_config = getattr(self.model_runner, "cache_config", None)
+        derived_hot_budget = getattr(
+            cache_config, "kv_cache_memory_bytes", None
+        )
+        configured_total_str = os.getenv(TOTAL_KV_BUDGET_ENV)
+        configured_total = (
+            int(configured_total_str) if configured_total_str else None
+        )
+        actual_persistent = (
+            hot_bytes + warm_bytes + map_bytes + slot_table_bytes
+        )
         return {
             "warm_blocks": len(residency),
             "warm_requests": len({key[0] for key in residency}),
@@ -65,6 +303,19 @@ class HKVReplayWorkerExtension:
                 torch.cuda.max_memory_reserved()
                 if torch.cuda.is_available()
                 else 0
+            ),
+            "num_gpu_blocks": num_gpu_blocks,
+            "hot_kv_storage_bytes": hot_bytes,
+            "warm_kv_storage_bytes": warm_bytes,
+            "hot_to_warm_map_storage_bytes": map_bytes,
+            "warm_slot_table_storage_bytes": slot_table_bytes,
+            "actual_persistent_kv_bytes": actual_persistent,
+            "configured_total_kv_budget_bytes": configured_total,
+            "derived_hot_kv_budget_bytes": derived_hot_budget,
+            "budget_slack_bytes": (
+                configured_total - actual_persistent
+                if configured_total is not None
+                else None
             ),
         }
 
@@ -243,7 +494,7 @@ async def inspect_worker(engine: Any) -> dict[str, Any]:
     states = await engine.engine_core.collective_rpc_async("inspect_hkv_replay")
     if not states:
         raise RuntimeError("HKV worker inspection returned no states")
-    return {
+    result = {
         "warm_blocks": sum(state["warm_blocks"] for state in states),
         "warm_requests": sum(state["warm_requests"] for state in states),
         "owned_warm_slots": sum(
@@ -259,6 +510,28 @@ async def inspect_worker(engine: Any) -> dict[str, Any]:
             state["max_gpu_reserved_bytes"] for state in states
         ),
     }
+    for field_name in (
+        "num_gpu_blocks",
+        "hot_kv_storage_bytes",
+        "warm_kv_storage_bytes",
+        "hot_to_warm_map_storage_bytes",
+        "warm_slot_table_storage_bytes",
+        "actual_persistent_kv_bytes",
+    ):
+        result[field_name] = sum(state[field_name] for state in states)
+    for field_name in (
+        "configured_total_kv_budget_bytes",
+        "derived_hot_kv_budget_bytes",
+        "budget_slack_bytes",
+    ):
+        values = {state[field_name] for state in states}
+        if len(values) != 1:
+            raise RuntimeError(
+                f"HKV workers disagree on {field_name}: "
+                f"{sorted(values, key=repr)}"
+            )
+        result[field_name] = values.pop()
+    return result
 
 
 def update_observation(summary: dict[str, Any], state: dict[str, Any]) -> None:
@@ -273,6 +546,94 @@ def update_observation(summary: dict[str, Any], state: dict[str, Any]) -> None:
     ):
         summary[target] = max(summary[target], state[source])
     summary["allocator_consistent"] &= state["allocator_consistent"]
+    for field_name in (
+        "num_gpu_blocks",
+        "hot_kv_storage_bytes",
+        "warm_kv_storage_bytes",
+        "hot_to_warm_map_storage_bytes",
+        "warm_slot_table_storage_bytes",
+        "actual_persistent_kv_bytes",
+        "configured_total_kv_budget_bytes",
+        "derived_hot_kv_budget_bytes",
+        "budget_slack_bytes",
+    ):
+        summary[field_name] = state[field_name]
+
+
+def build_runtime_memory_accounting(
+    budget: dict[str, Any],
+    runtime_state: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "num_gpu_blocks": runtime_state["num_gpu_blocks"],
+        "hot_kv_storage_bytes": runtime_state["hot_kv_storage_bytes"],
+        "warm_kv_storage_bytes": runtime_state["warm_kv_storage_bytes"],
+        "hot_to_warm_map_storage_bytes": runtime_state[
+            "hot_to_warm_map_storage_bytes"
+        ],
+        "warm_slot_table_storage_bytes": runtime_state[
+            "warm_slot_table_storage_bytes"
+        ],
+        "actual_persistent_kv_bytes": runtime_state[
+            "actual_persistent_kv_bytes"
+        ],
+        "configured_total_kv_budget_bytes": runtime_state[
+            "configured_total_kv_budget_bytes"
+        ],
+        "derived_hot_kv_budget_bytes": runtime_state[
+            "derived_hot_kv_budget_bytes"
+        ],
+        "budget_slack_bytes": runtime_state["budget_slack_bytes"],
+    }
+
+
+def validate_runtime_memory_accounting(
+    budget: dict[str, Any],
+    runtime: dict[str, Any],
+) -> list[str]:
+    if budget["total_kv_budget_bytes"] is None:
+        return []
+    expected = {
+        "num_gpu_blocks": budget["derived_num_gpu_blocks"],
+        "hot_kv_storage_bytes": budget["derived_hot_kv_budget_bytes"],
+        "warm_kv_storage_bytes": budget["derived_warm_kv_storage_bytes"],
+        "hot_to_warm_map_storage_bytes": budget[
+            "derived_hot_to_warm_map_storage_bytes"
+        ],
+        "warm_slot_table_storage_bytes": budget[
+            "derived_warm_slot_table_storage_bytes"
+        ],
+        "actual_persistent_kv_bytes": budget[
+            "derived_actual_persistent_kv_bytes"
+        ],
+        "configured_total_kv_budget_bytes": budget[
+            "total_kv_budget_bytes"
+        ],
+        "derived_hot_kv_budget_bytes": budget[
+            "derived_hot_kv_budget_bytes"
+        ],
+        "budget_slack_bytes": budget["derived_budget_slack_bytes"],
+    }
+    differences = {
+        field_name: {
+            "expected": expected_value,
+            "actual": runtime[field_name],
+        }
+        for field_name, expected_value in expected.items()
+        if runtime[field_name] != expected_value
+    }
+    total_budget = budget["total_kv_budget_bytes"]
+    if runtime["actual_persistent_kv_bytes"] > total_budget:
+        differences["configured_total_kv_budget_bytes"] = {
+            "expected_maximum": total_budget,
+            "actual": runtime["actual_persistent_kv_bytes"],
+        }
+    if differences:
+        return [
+            "persistent KV runtime accounting differs from the explicit "
+            f"budget derivation: {differences}"
+        ]
+    return []
 
 
 async def observe_hkv(
@@ -547,6 +908,7 @@ def validate_timing_and_turns(sessions: list[SessionResult]) -> list[str]:
 
 def build_experiment_config(args: argparse.Namespace) -> dict[str, Any]:
     mixed = args.kv_mode == "mixed"
+    memory_budget = derive_persistent_kv_budget(args)
     return {
         "experiment_mode": args.experiment_mode,
         "kv_mode": args.kv_mode,
@@ -576,7 +938,9 @@ def build_experiment_config(args: argparse.Namespace) -> dict[str, Any]:
         "min_turns": args.min_turns,
         "max_input_length": args.max_input_length,
         "max_model_len": args.max_model_len,
+        "max_num_seqs": args.max_num_seqs,
         "gpu_memory_utilization": args.gpu_memory_utilization,
+        "persistent_kv_memory_budget": memory_budget,
         "attention_backend": ATTENTION_BACKEND,
         "dtype": MODEL_DTYPE,
         "topology_assumptions": TOPOLOGY_ASSUMPTIONS,
@@ -588,6 +952,7 @@ def build_experiment_fingerprint(
     trace: dict[str, str],
     selection: dict[str, Any],
 ) -> dict[str, Any]:
+    memory_budget = derive_persistent_kv_budget(args)
     fields = {
         "experiment_mode": args.experiment_mode,
         "model": args.model,
@@ -604,6 +969,11 @@ def build_experiment_fingerprint(
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "max_model_len": args.max_model_len,
             "block_size": BLOCK_SIZE,
+            "total_kv_budget_bytes": memory_budget[
+                "total_kv_budget_bytes"
+            ],
+            "max_num_seqs": args.max_num_seqs,
+            "kv_memory_formula_version": KV_MEMORY_FORMULA_VERSION,
         },
         "attention_backend": ATTENTION_BACKEND,
         "dtype": MODEL_DTYPE,
@@ -614,13 +984,18 @@ def build_experiment_fingerprint(
 
 def build_engine_args_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     mixed = args.kv_mode == "mixed"
+    memory_budget = derive_persistent_kv_budget(args)
     return {
         "model": args.model,
         "dtype": MODEL_DTYPE,
         "enforce_eager": True,
         "seed": args.seed,
         "max_model_len": args.max_model_len,
+        "max_num_seqs": args.max_num_seqs,
         "gpu_memory_utilization": args.gpu_memory_utilization,
+        "kv_cache_memory_bytes": memory_budget[
+            "derived_hot_kv_budget_bytes"
+        ],
         "block_size": BLOCK_SIZE,
         "attention_backend": ATTENTION_BACKEND,
         "worker_extension_cls": (
@@ -645,6 +1020,7 @@ def build_reproducibility_metadata(
     timing: dict[str, Any],
 ) -> dict[str, Any]:
     experiment_config = build_experiment_config(args)
+    memory_budget = experiment_config["persistent_kv_memory_budget"]
     return {
         "schema_version": RESULT_SCHEMA_VERSION,
         "experiment_mode": args.experiment_mode,
@@ -658,6 +1034,8 @@ def build_reproducibility_metadata(
         "generation_parameters": generation_parameters(args),
         "generation_policy": generation_parameters(args)["generation_policy"],
         "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_num_seqs": args.max_num_seqs,
+        "persistent_kv_memory_budget": memory_budget,
         "configured_hkv": experiment_config["hkv_settings"],
         "warm_pool_blocks": experiment_config["warm_pool_blocks"],
         "thresholds": experiment_config["thresholds"],
@@ -688,10 +1066,37 @@ def _fingerprint_differences(
     return [] if current == baseline else [prefix]
 
 
+def validate_baseline_schema(
+    experiment_mode: str,
+    baseline: dict[str, Any],
+) -> None:
+    if "experiment_fingerprint" not in baseline:
+        raise ValueError(
+            "legacy baseline unsupported: baseline is missing the experiment "
+            "fingerprint and persistent KV-budget metadata"
+        )
+    if experiment_mode == "performance":
+        baseline_budget = (
+            baseline.get("experiment_config", {})
+            .get("persistent_kv_memory_budget", {})
+            .get("total_kv_budget_bytes")
+        )
+        if (
+            baseline.get("schema_version") != RESULT_SCHEMA_VERSION
+            or baseline_budget is None
+        ):
+            raise ValueError(
+                "legacy baseline unsupported for performance comparison: "
+                f"schema {RESULT_SCHEMA_VERSION} with an explicit persistent "
+                "KV-memory budget is required"
+            )
+
+
 def compare_baseline(
     result: dict[str, Any],
     baseline: dict[str, Any],
 ) -> dict[str, Any]:
+    validate_baseline_schema(result["experiment_mode"], baseline)
     current_fingerprint = result["experiment_fingerprint"]["fields"]
     baseline_fingerprint = baseline["experiment_fingerprint"]["fields"]
     fingerprint_differences = _fingerprint_differences(
@@ -774,6 +1179,10 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     from vllm.v1.engine.async_llm import AsyncLLM
 
     run_started_at = utc_now()
+    baseline = None
+    if args.baseline_json:
+        baseline = json.loads(args.baseline_json.read_text(encoding="utf-8"))
+        validate_baseline_schema(args.experiment_mode, baseline)
     selected = select_sessions(
         load_bailian_records(args.trace),
         request_type=None if args.request_type == "all" else args.request_type,
@@ -784,6 +1193,13 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     trace_metadata = trace_identifier(args.trace)
     selection = selection_metadata(selected)
     mixed = args.kv_mode == "mixed"
+    memory_budget = derive_persistent_kv_budget(args)
+    if memory_budget["total_kv_budget_bytes"] is None:
+        os.environ.pop(TOTAL_KV_BUDGET_ENV, None)
+    else:
+        os.environ[TOTAL_KV_BUDGET_ENV] = str(
+            memory_budget["total_kv_budget_bytes"]
+        )
     engine = AsyncLLM.from_engine_args(
         AsyncEngineArgs(**build_engine_args_kwargs(args))
     )
@@ -796,6 +1212,15 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "allocator_consistent": True,
         "max_gpu_allocated_bytes": 0,
         "max_gpu_reserved_bytes": 0,
+        "num_gpu_blocks": 0,
+        "hot_kv_storage_bytes": 0,
+        "warm_kv_storage_bytes": 0,
+        "hot_to_warm_map_storage_bytes": 0,
+        "warm_slot_table_storage_bytes": 0,
+        "actual_persistent_kv_bytes": 0,
+        "configured_total_kv_budget_bytes": None,
+        "derived_hot_kv_budget_bytes": None,
+        "budget_slack_bytes": None,
         "final_warm_blocks": None,
         "cleanup_complete": None,
     }
@@ -926,6 +1351,10 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         selection,
         timing_metadata,
     )
+    runtime_memory = build_runtime_memory_accounting(
+        memory_budget,
+        final_state,
+    )
     result: dict[str, Any] = {
         "schema_version": RESULT_SCHEMA_VERSION,
         "experiment_mode": args.experiment_mode,
@@ -935,6 +1364,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "seed": args.seed,
         "time_scale": args.time_scale,
         "max_tokens_per_turn": args.max_tokens_per_turn,
+        "max_num_seqs": args.max_num_seqs,
         "generation_parameters": generation_parameters(args),
         "generation_policy": generation_parameters(args)["generation_policy"],
         "selected_sessions": len(session_results),
@@ -978,6 +1408,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         ],
         "experiment_config": experiment_config,
         "experiment_fingerprint": fingerprint,
+        "persistent_kv_memory_budget": memory_budget,
+        "runtime_persistent_kv_memory": runtime_memory,
         "git": reproducibility["git"],
         "reproducibility": reproducibility,
         "hkv_observation": observation,
@@ -988,15 +1420,32 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         validation_errors.append("mixed mode never observed WARM residency")
     if not mixed and observation["warm_observed"]:
         validation_errors.append("all-hot mode unexpectedly observed WARM residency")
+    if not mixed:
+        unexpected_mixed_storage = {
+            field_name: runtime_memory[field_name]
+            for field_name in (
+                "warm_kv_storage_bytes",
+                "hot_to_warm_map_storage_bytes",
+                "warm_slot_table_storage_bytes",
+            )
+            if runtime_memory[field_name] != 0
+        }
+        if unexpected_mixed_storage:
+            validation_errors.append(
+                "all-hot mode allocated mixed-only persistent storage: "
+                f"{unexpected_mixed_storage}"
+            )
     if not observation["allocator_consistent"]:
         validation_errors.append("WARM allocator ownership became inconsistent")
     if not observation["cleanup_complete"]:
         validation_errors.append("WARM residency was not released after replay")
+    validation_errors.extend(
+        validate_runtime_memory_accounting(memory_budget, runtime_memory)
+    )
 
     validation_errors.extend(validate_timing_and_turns(session_results))
 
-    if args.baseline_json:
-        baseline = json.loads(args.baseline_json.read_text(encoding="utf-8"))
+    if baseline is not None:
         result["baseline_comparison"] = compare_baseline(result, baseline)
         validation_errors.extend(
             token_comparison_validation_errors(
@@ -1044,7 +1493,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-input-length", type=int, default=1024)
     parser.add_argument("--max-sessions", type=int, default=0)
     parser.add_argument("--max-model-len", type=int, default=2048)
+    parser.add_argument("--max-num-seqs", type=int, default=DEFAULT_MAX_NUM_SEQS)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
+    parser.add_argument("--total-kv-budget-bytes", type=int)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-tokens-per-turn", type=int)
     parser.add_argument("--demotion-start-utilization", type=float)
@@ -1065,6 +1516,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ):
         parser.error(
             "performance mode requires --max-tokens-per-turn greater than 1"
+        )
+    if (
+        args.experiment_mode == "performance"
+        and args.total_kv_budget_bytes is None
+    ):
+        parser.error(
+            "performance mode requires positive --total-kv-budget-bytes"
         )
 
     mixed = args.kv_mode == "mixed"
@@ -1101,8 +1559,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     if args.time_scale <= 0 or args.min_turns <= 0:
         parser.error("time scale and minimum turns must be positive")
+    if args.max_model_len <= 0:
+        parser.error("--max-model-len must be positive")
+    if args.max_num_seqs <= 0:
+        parser.error("--max-num-seqs must be positive")
     if args.max_input_length < 0 or args.max_sessions < 0:
         parser.error("session limits must be non-negative")
+    if args.total_kv_budget_bytes is not None:
+        try:
+            derive_persistent_kv_budget(args)
+        except ValueError as exc:
+            parser.error(str(exc))
     return args
 
 
@@ -1137,6 +1604,8 @@ def main() -> None:
             "all_turn_latency_seconds",
             "resumed_turn_latency_seconds",
             "experiment_config",
+            "persistent_kv_memory_budget",
+            "runtime_persistent_kv_memory",
             "hkv_observation",
             "validation",
         )
