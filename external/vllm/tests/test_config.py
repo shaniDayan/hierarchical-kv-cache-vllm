@@ -1411,6 +1411,18 @@ def test_valid_kv_cache_idle_thresholds(monkeypatch):
     assert config.kv_cache_cold_idle_threshold_seconds == 20.0
 
 
+def test_valid_kv_cache_demotion_utilizations(monkeypatch):
+    _set_full_hkv_env(monkeypatch)
+
+    config = SchedulerConfig.default_factory(
+        kv_cache_demotion_start_utilization=0.8,
+        kv_cache_demotion_stop_utilization=0.65,
+    )
+
+    assert config.kv_cache_demotion_start_utilization == 0.8
+    assert config.kv_cache_demotion_stop_utilization == 0.65
+
+
 @pytest.mark.parametrize(
     ("hot_threshold", "cold_threshold"),
     [
@@ -1429,6 +1441,33 @@ def test_invalid_kv_cache_idle_thresholds(hot_threshold, cold_threshold):
         SchedulerConfig.default_factory(
             kv_cache_hot_idle_threshold_seconds=hot_threshold,
             kv_cache_cold_idle_threshold_seconds=cold_threshold,
+        )
+
+
+@pytest.mark.parametrize(
+    ("start", "stop"),
+    [
+        (0.8, None),
+        (None, 0.65),
+        (-0.1, 0.0),
+        (1.1, 0.65),
+        (0.8, -0.1),
+        (0.8, 1.1),
+        (0.8, 0.8),
+        (0.7, 0.8),
+        (float("nan"), 0.65),
+        (0.8, float("nan")),
+        (float("inf"), 0.65),
+        (0.8, float("inf")),
+        (float("-inf"), 0.65),
+        (0.8, float("-inf")),
+    ],
+)
+def test_invalid_kv_cache_demotion_utilizations(start, stop):
+    with pytest.raises(ValidationError):
+        SchedulerConfig.default_factory(
+            kv_cache_demotion_start_utilization=start,
+            kv_cache_demotion_stop_utilization=stop,
         )
 
 

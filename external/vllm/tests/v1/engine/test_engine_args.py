@@ -6,10 +6,23 @@ from argparse import ArgumentError
 import pytest
 
 from vllm.config import VllmConfig
-from vllm.engine.arg_utils import EngineArgs
+from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.hashing import _xxhash
+
+
+def _set_hkv_test_environment(monkeypatch):
+    from vllm.config import vllm as vllm_config_module
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    monkeypatch.setattr(vllm_config_module, "HAS_TRITON", True)
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("HKV_ENABLE_PHYSICAL_TIERS", "1")
+    monkeypatch.setenv("HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION", "1")
+    monkeypatch.setenv("HKV_DEBUG_MIXED_READ", "1")
+    monkeypatch.setenv("HKV_WARM_POOL_BLOCKS", "128")
 
 
 def test_prefix_caching_from_cli():
@@ -49,7 +62,8 @@ def test_prefix_caching_from_cli():
         args = parser.parse_args(["--prefix-caching-hash-algo", "invalid"])
 
 
-def test_kv_cache_idle_thresholds_from_cli():
+def test_kv_cache_idle_thresholds_from_cli(monkeypatch):
+    _set_hkv_test_environment(monkeypatch)
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args(
         [
@@ -67,6 +81,33 @@ def test_kv_cache_idle_thresholds_from_cli():
     assert engine_args.kv_cache_cold_idle_threshold_seconds == 30.0
     assert vllm_config.scheduler_config.kv_cache_hot_idle_threshold_seconds == 10.5
     assert vllm_config.scheduler_config.kv_cache_cold_idle_threshold_seconds == 30.0
+
+
+def test_kv_cache_demotion_utilizations_from_cli(monkeypatch):
+    _set_hkv_test_environment(monkeypatch)
+    parser = AsyncEngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--kv-cache-demotion-start-utilization",
+            "0.8",
+            "--kv-cache-demotion-stop-utilization",
+            "0.65",
+        ]
+    )
+
+    engine_args = AsyncEngineArgs.from_cli_args(args=args)
+    vllm_config = engine_args.create_engine_config()
+
+    assert engine_args.kv_cache_demotion_start_utilization == 0.8
+    assert engine_args.kv_cache_demotion_stop_utilization == 0.65
+    assert (
+        vllm_config.scheduler_config.kv_cache_demotion_start_utilization
+        == 0.8
+    )
+    assert (
+        vllm_config.scheduler_config.kv_cache_demotion_stop_utilization
+        == 0.65
+    )
 
 
 @pytest.mark.skipif(_xxhash is None, reason="xxhash not installed")
