@@ -1245,13 +1245,17 @@ class Scheduler(SchedulerInterface):
                 "state transition is pending"
             )
 
-        # Current streaming input behaviour: Keep only computed output tokens
-        # (discard final sampled output token).
+        # Keep computed output tokens and discard only the extra sampled
+        # token. Never truncate tokens that already belong to the prompt;
+        # a new turn can arrive while the previous prompt is still being
+        # chunked-prefilled (num_computed_tokens < num_prompt_tokens).
         num_computed_tokens = session.num_computed_tokens
+        num_prompt_tokens = session.num_prompt_tokens
         kept_output_tokens = session._all_token_ids[
-            session.num_prompt_tokens : num_computed_tokens
+            num_prompt_tokens : num_computed_tokens
         ]
-        del session._all_token_ids[num_computed_tokens:]
+        truncate_at = max(num_computed_tokens, num_prompt_tokens)
+        del session._all_token_ids[truncate_at:]
         session._output_token_ids.clear()
         assert session.prompt_token_ids is not None
         # Extend prompt with kept output tokens.
@@ -1270,6 +1274,10 @@ class Scheduler(SchedulerInterface):
         # Update block hashes for the new tokens.
         session.update_block_hashes()
         session.num_prompt_tokens = len(session.prompt_token_ids)
+        # This path folds retained outputs into the prompt, then appends the
+        # same delta to both lists, so equality is expected. The worker
+        # invariant is the weaker prefill_len >= prompt_len.
+        assert len(session._all_token_ids) >= len(session.prompt_token_ids)
         session.arrival_time = update.arrival_time
         session.mark_activity(update.arrival_time)
         # The request is active again, but historical residency is preserved

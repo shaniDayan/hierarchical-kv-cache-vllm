@@ -13,7 +13,7 @@ from vllm.multimodal.inputs import (
     PlaceholderRange,
 )
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
@@ -1159,3 +1159,108 @@ class TestStreamingScheduler(unittest.TestCase):
             cached_state_cycle1["prompt_token_ids"]
             is not cached_state_cycle3["prompt_token_ids"]
         ), "Cached states from different cycles should be independent objects."
+
+    def test_update_request_as_session_partial_prefill_keeps_prompt_suffix(self):
+        scheduler = create_scheduler()
+        previous_prompt = list(range(540))
+        delta = list(range(1000, 1100))
+        session = DummyRequest(
+            request_id="session",
+            prompt_token_ids=list(previous_prompt),
+        )
+        session.num_computed_tokens = 440
+
+        update = StreamingUpdate.from_request(
+            DummyRequest(request_id="session", prompt_token_ids=list(delta))
+        )
+        scheduler._update_request_as_session(session, update)
+
+        expected = previous_prompt + delta
+        assert session.prompt_token_ids == expected
+        assert session._all_token_ids == expected
+        assert session.num_prompt_tokens == 640
+        assert session.num_computed_tokens == 440
+
+    def test_preempted_session_queued_streaming_update_keeps_prompt_tokens(self):
+        scheduler = create_scheduler()
+        previous_prompt = list(range(540))
+        delta = list(range(1000, 1100))
+        session = DummyRequest(
+            request_id="session",
+            prompt_token_ids=list(previous_prompt),
+        )
+        scheduler.add_request(session)
+        assert scheduler.kv_cache_manager.allocate_slots(session, 440) is not None
+        session.num_computed_tokens = 440
+        session.status = RequestStatus.RUNNING
+        scheduler.waiting.remove_requests([session])
+        scheduler.running.append(session)
+
+        scheduler.add_request(
+            DummyRequest(request_id="session", prompt_token_ids=list(delta))
+        )
+        assert len(session.streaming_queue) == 1
+
+        scheduler.running.remove(session)
+        scheduler._preempt_request(session, timestamp=0.0)
+        assert session.status is RequestStatus.PREEMPTED
+        assert session.num_computed_tokens == 0
+
+        queued = session.streaming_queue.popleft()
+        scheduler._update_request_as_session(session, queued)
+
+        expected = previous_prompt + delta
+        assert session.prompt_token_ids == expected
+        assert session._all_token_ids == expected
+        assert len(session._all_token_ids) >= len(session.prompt_token_ids)
+
+    def test_v2_new_request_data_prefill_covers_prompt_after_streaming_update(self):
+        scheduler = create_scheduler()
+        previous_prompt = list(range(540))
+        delta = list(range(1000, 1100))
+        session = DummyRequest(
+            request_id="session",
+            prompt_token_ids=list(previous_prompt),
+        )
+        session.num_computed_tokens = 440
+        scheduler._update_request_as_session(
+            session,
+            StreamingUpdate.from_request(
+                DummyRequest(request_id="session", prompt_token_ids=list(delta))
+            ),
+        )
+
+        new_req = NewRequestData.from_request(
+            session,
+            block_ids=([],),
+            prefill_token_ids=session._all_token_ids,
+        )
+        assert new_req.prompt_token_ids is not None
+        assert new_req.prefill_token_ids is not None
+        assert len(new_req.prefill_token_ids) >= len(new_req.prompt_token_ids)
+        assert new_req.prefill_token_ids == new_req.prompt_token_ids
+        assert len(new_req.prefill_token_ids) == 640
+
+    def test_update_request_as_session_keeps_computed_output_once(self):
+        scheduler = create_scheduler()
+        session = DummyRequest(
+            request_id="session",
+            prompt_token_ids=[1, 2, 3],
+        )
+        session.append_output_token_ids([10, 11])
+        session.num_computed_tokens = 4
+
+        scheduler._update_request_as_session(
+            session,
+            StreamingUpdate.from_request(
+                DummyRequest(request_id="session", prompt_token_ids=[4, 5])
+            ),
+        )
+
+        assert session._all_token_ids == [1, 2, 3, 10, 4, 5]
+        assert session.prompt_token_ids == [1, 2, 3, 10, 4, 5]
+        assert session._all_token_ids.count(10) == 1
+        assert 11 not in session._all_token_ids
+        assert 11 not in session.prompt_token_ids
+        assert session._output_token_ids == []
+        assert session.max_tokens == 16
