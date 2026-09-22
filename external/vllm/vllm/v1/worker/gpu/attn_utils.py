@@ -62,6 +62,57 @@ def is_hkv_mixed_read_enabled() -> bool:
     )
 
 
+def is_hkv_mixed_read_stats_enabled() -> bool:
+    """Debug-only per-request mixed-read counters. Off unless explicitly set."""
+    return (
+        os.getenv("HKV_DEBUG_MIXED_READ_STATS", "").strip().lower()
+        in _HKV_TRUE_VALUES
+    )
+
+
+def record_hkv_mixed_read_stats(
+    runner: Any,
+    active_req_ids: Sequence[str],
+) -> None:
+    """Record WARM slot-table occupancy for the current attention batch.
+
+    Read-only: does not change scheduling, residency, or the slot table.
+    Enabled only when HKV_DEBUG_MIXED_READ_STATS is set.
+    """
+    if not is_hkv_mixed_read_stats_enabled():
+        return
+
+    stats = getattr(runner, "hkv_mixed_read_stats", None)
+    if stats is None:
+        stats = {}
+        runner.hkv_mixed_read_stats = stats
+
+    counts: dict[str, int] = {}
+    manager = getattr(runner, "hkv_warm_migration_manager", None)
+    residency = getattr(manager, "warm_residency", None) if manager else None
+    if residency:
+        for key in residency:
+            request_id = key[0]
+            counts[request_id] = counts.get(request_id, 0) + 1
+
+    for request_id in active_req_ids:
+        warm_blocks = counts.get(request_id, 0)
+        entry = stats.get(request_id)
+        if entry is None:
+            entry = {
+                "mixed_read_steps": 0,
+                "attention_had_warm_slots": False,
+                "warm_logical_blocks_observed": 0,
+            }
+            stats[request_id] = entry
+        if warm_blocks <= 0:
+            continue
+        entry["mixed_read_steps"] += 1
+        entry["attention_had_warm_slots"] = True
+        if warm_blocks > entry["warm_logical_blocks_observed"]:
+            entry["warm_logical_blocks_observed"] = warm_blocks
+
+
 def _hkv_backend_name(backend: Any) -> str:
     get_name = getattr(backend, "get_name", None)
     if get_name is None:

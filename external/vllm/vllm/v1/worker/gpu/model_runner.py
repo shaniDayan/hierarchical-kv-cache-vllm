@@ -71,6 +71,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_kv_cache,
     initialize_hkv_hot_to_warm_maps,
     initialize_hkv_warm_kv_caches,
+    record_hkv_mixed_read_stats,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import (
@@ -1284,6 +1285,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._hkv_warm_slot_table_num_reqs_after_padding = (
                     input_batch.num_reqs_after_padding
                 )
+        record_hkv_mixed_read_stats(self, input_batch.req_ids)
         # Block tables: num_kv_cache_groups x [num_reqs_padded, max_num_blocks].
         block_tables = self.block_tables.gather_block_tables(
             input_batch.idx_mapping,

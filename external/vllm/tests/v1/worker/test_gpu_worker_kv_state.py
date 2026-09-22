@@ -287,6 +287,101 @@ def test_logical_warm_table_rebuild_clears_reused_request_row():
     assert residency_items.call_count == 4
 
 
+def test_prepare_attn_records_mixed_read_stats_when_debug_enabled(monkeypatch):
+    monkeypatch.setenv("HKV_DEBUG_MIXED_READ_STATS", "1")
+    warm_slot_table = torch.full((2, 4), -1, dtype=torch.int32)
+    warm_residency = {
+        ("gsm8k-0000", 0, 0): HKVWarmResidency(
+            warm_slot_id=1,
+            temporary_shadow_hot_block_id=3,
+        ),
+        ("gsm8k-0000", 0, 1): HKVWarmResidency(
+            warm_slot_id=2,
+            temporary_shadow_hot_block_id=4,
+        ),
+    }
+    migration_manager = SimpleNamespace(
+        warm_residency=warm_residency,
+        warm_residency_revision=1,
+    )
+    block_tables = SimpleNamespace(
+        gather_block_tables=MagicMock(
+            return_value=(torch.zeros((2, 4), dtype=torch.int32),)
+        ),
+        compute_slot_mappings=MagicMock(return_value=torch.zeros((1, 1))),
+    )
+    target = SimpleNamespace(
+        hkv_warm_slot_table=warm_slot_table,
+        hkv_warm_migration_manager=migration_manager,
+        _hkv_warm_slot_table_req_ids=None,
+        _hkv_warm_slot_table_revision=-1,
+        _hkv_warm_slot_table_num_reqs_after_padding=-1,
+        block_tables=block_tables,
+    )
+    input_batch = SimpleNamespace(
+        req_ids=["gsm8k-0000", "ballast"],
+        num_reqs_after_padding=2,
+        idx_mapping=torch.tensor([0, 1]),
+        query_start_loc=torch.tensor([0, 1, 2]),
+        positions=torch.tensor([0, 0]),
+        num_tokens_after_padding=2,
+    )
+
+    GPUModelRunner.prepare_attn(target, input_batch)
+    GPUModelRunner.prepare_attn(target, input_batch)
+
+    stats = target.hkv_mixed_read_stats
+    assert stats["gsm8k-0000"] == {
+        "mixed_read_steps": 2,
+        "attention_had_warm_slots": True,
+        "warm_logical_blocks_observed": 2,
+    }
+    assert stats["ballast"] == {
+        "mixed_read_steps": 0,
+        "attention_had_warm_slots": False,
+        "warm_logical_blocks_observed": 0,
+    }
+
+
+def test_prepare_attn_skips_mixed_read_stats_when_debug_disabled(monkeypatch):
+    monkeypatch.delenv("HKV_DEBUG_MIXED_READ_STATS", raising=False)
+    warm_slot_table = torch.full((1, 2), -1, dtype=torch.int32)
+    migration_manager = SimpleNamespace(
+        warm_residency={
+            ("gsm8k-0000", 0, 0): HKVWarmResidency(
+                warm_slot_id=1,
+                temporary_shadow_hot_block_id=2,
+            )
+        },
+        warm_residency_revision=1,
+    )
+    target = SimpleNamespace(
+        hkv_warm_slot_table=warm_slot_table,
+        hkv_warm_migration_manager=migration_manager,
+        _hkv_warm_slot_table_req_ids=None,
+        _hkv_warm_slot_table_revision=-1,
+        _hkv_warm_slot_table_num_reqs_after_padding=-1,
+        block_tables=SimpleNamespace(
+            gather_block_tables=MagicMock(
+                return_value=(torch.zeros((1, 2), dtype=torch.int32),)
+            ),
+            compute_slot_mappings=MagicMock(return_value=torch.zeros((1, 1))),
+        ),
+    )
+    input_batch = SimpleNamespace(
+        req_ids=["gsm8k-0000"],
+        num_reqs_after_padding=1,
+        idx_mapping=torch.tensor([0]),
+        query_start_loc=torch.tensor([0, 1]),
+        positions=torch.tensor([0]),
+        num_tokens_after_padding=1,
+    )
+
+    GPUModelRunner.prepare_attn(target, input_batch)
+
+    assert not hasattr(target, "hkv_mixed_read_stats")
+
+
 def test_insufficient_warm_capacity_leaves_state_unchanged():
     manager = HKVWarmMigrationManager(
         warm_capacity=1,
