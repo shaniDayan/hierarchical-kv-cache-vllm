@@ -491,6 +491,200 @@ def percentile(values: list[float], fraction: float) -> float | None:
     return ordered[index]
 
 
+UNAVAILABLE_RUNTIME_REASON = (
+    "not exposed by the existing HKV worker inspector"
+)
+
+
+def unavailable_runtime_field(
+    reason: str = UNAVAILABLE_RUNTIME_REASON,
+) -> dict[str, Any]:
+    return {"available": False, "reason": reason}
+
+
+def create_engine(args: argparse.Namespace) -> Any:
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    return AsyncLLM.from_engine_args(
+        AsyncEngineArgs(**build_engine_args_kwargs(args))
+    )
+
+
+def collect_session_progress(
+    sessions: list[SessionResult],
+    *,
+    selected_session_count: int,
+    selected_request_count: int,
+) -> dict[str, int]:
+    completed_session_count = sum(
+        1 for session in sessions if session.completed_turns == session.turns
+    )
+    completed_request_count = sum(
+        session.completed_turns for session in sessions
+    )
+    return {
+        "selected_session_count": selected_session_count,
+        "completed_session_count": completed_session_count,
+        "incomplete_session_count": (
+            selected_session_count - completed_session_count
+        ),
+        "selected_request_count": selected_request_count,
+        "completed_request_count": completed_request_count,
+        "incomplete_request_count": (
+            selected_request_count - completed_request_count
+        ),
+        "total_generated_tokens": sum(
+            session.generated_tokens for session in sessions
+        ),
+    }
+
+
+def build_termination(
+    *,
+    timed_out: bool,
+    configured_timeout_seconds: float,
+    service_window_duration_seconds: float | None,
+    last_output_received_seconds: float | None,
+    progress: dict[str, int],
+    runtime_at_timeout: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    seconds_since_last_completed_turn = None
+    if (
+        last_output_received_seconds is not None
+        and service_window_duration_seconds is not None
+    ):
+        seconds_since_last_completed_turn = max(
+            0.0,
+            service_window_duration_seconds - last_output_received_seconds,
+        )
+    termination: dict[str, Any] = {
+        "status": "timeout" if timed_out else "completed",
+        "configured_timeout_seconds": configured_timeout_seconds,
+        "timed_out": timed_out,
+        "service_window_duration_seconds": service_window_duration_seconds,
+        "seconds_since_last_completed_turn": seconds_since_last_completed_turn,
+        **progress,
+    }
+    if timed_out:
+        termination["runtime_at_timeout"] = runtime_at_timeout
+    return termination
+
+
+def build_timeout_runtime_snapshot(
+    observation: dict[str, Any],
+    inspect_state: dict[str, Any] | None,
+    *,
+    warm_pool_blocks: int,
+) -> dict[str, Any]:
+    state = inspect_state if inspect_state is not None else observation
+    unavailable = [
+        "hot_utilization",
+        "hot_allocated_blocks",
+        "hot_free_blocks",
+        "pending_transitions",
+        "successful_transitions",
+        "retryable_capacity_transitions",
+        "stale_transitions",
+        "preemption_count",
+        "num_running_reqs",
+        "num_waiting_reqs",
+    ]
+    snapshot: dict[str, Any] = {
+        field_name: unavailable_runtime_field() for field_name in unavailable
+    }
+    snapshot.update(
+        {
+            "num_gpu_blocks": state.get("num_gpu_blocks"),
+            "hot_kv_storage_bytes": state.get("hot_kv_storage_bytes"),
+            "warm_occupied_slots": state.get("warm_blocks"),
+            "warm_occupied_requests": state.get("warm_requests"),
+            "owned_warm_slots": state.get("owned_warm_slots"),
+            "warm_capacity_blocks": warm_pool_blocks,
+            "allocator_consistent": state.get("allocator_consistent"),
+            "unavailable_fields": unavailable,
+        }
+    )
+    return snapshot
+
+
+def print_replay_progress(
+    *,
+    elapsed_seconds: float,
+    progress: dict[str, int],
+    hot_utilization: float | None,
+) -> None:
+    extra = ""
+    if hot_utilization is not None:
+        extra = f" hot_util={hot_utilization:.3f}"
+    print(
+        f"[replay] elapsed={elapsed_seconds:.1f}s "
+        f"turns={progress['completed_request_count']}/"
+        f"{progress['selected_request_count']} "
+        f"sessions={progress['completed_session_count']}/"
+        f"{progress['selected_session_count']} "
+        f"tokens={progress['total_generated_tokens']}"
+        f"{extra}",
+        flush=True,
+    )
+
+
+def session_results_from_outcomes(
+    outcomes: list[Any],
+) -> tuple[list[SessionResult], list[float]]:
+    sessions: list[SessionResult] = []
+    lateness: list[float] = []
+    for outcome in outcomes:
+        if isinstance(outcome, tuple) and len(outcome) == 2:
+            session, values = outcome
+            if isinstance(session, SessionResult):
+                sessions.append(session)
+                lateness.extend(values)
+    return sessions, lateness
+
+
+def record_available_turn_results(
+    result: SessionResult,
+    turns: list[ReplayTurn],
+    *,
+    actual_send_times: list[float | None],
+    turn_first_output_times: list[float | None],
+    turn_finished_times: list[float | None],
+    turn_generated_tokens: list[int],
+    turn_generated_token_ids: list[list[int]],
+    turn_finish_reasons: list[str | None],
+    max_tokens_per_turn: int,
+    effective_max_tokens: list[int],
+) -> None:
+    result.turn_results.clear()
+    for i, turn in enumerate(turns):
+        actual_send = actual_send_times[i]
+        first_out = turn_first_output_times[i]
+        finished = turn_finished_times[i]
+        if actual_send is None or first_out is None or finished is None:
+            continue
+        send_lateness = max(0.0, actual_send - turn.send_at_seconds)
+        result.turn_results.append(
+            TurnResult(
+                chat_id=turn.chat_id,
+                turn=turn.turn,
+                scheduled_send_seconds=turn.send_at_seconds,
+                actual_send_seconds=actual_send,
+                send_lateness_seconds=send_lateness,
+                first_output_seconds=first_out,
+                finished_seconds=finished,
+                ttft_seconds=first_out - actual_send,
+                latency_seconds=finished - actual_send,
+                generated_tokens=turn_generated_tokens[i],
+                generated_token_ids=turn_generated_token_ids[i],
+                configured_max_tokens_per_turn=max_tokens_per_turn,
+                effective_max_tokens=effective_max_tokens[i],
+                is_resume=turn.turn > 1,
+                finish_reason=turn_finish_reasons[i],
+            )
+        )
+
+
 async def inspect_worker(engine: Any) -> dict[str, Any]:
     states = await engine.engine_core.collective_rpc_async("inspect_hkv_replay")
     if not states:
@@ -642,13 +836,28 @@ async def observe_hkv(
     stop: asyncio.Event,
     interval: float,
     summary: dict[str, Any],
+    on_tick: Any | None = None,
 ) -> None:
     while not stop.is_set():
-        update_observation(summary, await inspect_worker(engine))
+        try:
+            update_observation(summary, await inspect_worker(engine))
+        except Exception:
+            if stop.is_set():
+                break
+        if on_tick is not None:
+            on_tick()
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:
             pass
+
+
+def load_vllm_sampling_types() -> tuple[Any, Any, Any]:
+    from vllm import SamplingParams
+    from vllm.engine.protocol import StreamingInput
+    from vllm.sampling_params import RequestOutputKind
+
+    return SamplingParams, StreamingInput, RequestOutputKind
 
 
 async def run_session(
@@ -658,10 +867,11 @@ async def run_session(
     seed: int,
     max_tokens_per_turn: int = 1,
     run_timing: dict[str, Any] | None = None,
+    live_sessions: list[SessionResult] | None = None,
 ) -> tuple[SessionResult, list[float]]:
-    from vllm import SamplingParams
-    from vllm.engine.protocol import StreamingInput
-    from vllm.sampling_params import RequestOutputKind
+    SamplingParams, StreamingInput, RequestOutputKind = (
+        load_vllm_sampling_types()
+    )
 
     result = SessionResult(
         root_chat_id=turns[0].root_chat_id,
@@ -672,6 +882,8 @@ async def run_session(
         scheduled_first_seconds=turns[0].send_at_seconds,
         scheduled_last_seconds=turns[-1].send_at_seconds,
     )
+    if live_sessions is not None:
+        live_sessions.append(result)
     common = {
         "temperature": 0.0,
         "seed": seed,
@@ -722,76 +934,69 @@ async def run_session(
 
     digest = hashlib.sha256()
     finish_index = 0
-    async for output in engine.generate(inputs(), base_params, result.session_id):
-        if not output.outputs:
-            continue
-        completion = output.outputs[0]
-        token_ids = list(completion.token_ids)
-        now = time.perf_counter() - replay_started
-        if run_timing is not None:
-            run_timing["last_output_received"] = utc_now()
-            run_timing["last_output_received_seconds"] = now
-        if token_ids and result.first_output_seconds is None:
-            result.first_output_seconds = now
-        if token_ids and finish_index < len(turns):
-            if turn_first_output_times[finish_index] is None:
-                turn_first_output_times[finish_index] = now
-            turn_generated_tokens[finish_index] += len(token_ids)
-            turn_generated_token_ids[finish_index].extend(token_ids)
-        for token_id in token_ids:
-            digest.update(int(token_id).to_bytes(8, "little"))
-        room = 16 - len(result.generated_token_sample)
-        if room > 0:
-            result.generated_token_sample.extend(token_ids[:room])
-        result.generated_tokens += len(token_ids)
-        if completion.finish_reason and finish_index < len(turn_finished):
-            finished_now = time.perf_counter() - replay_started
-            turn_finished_times[finish_index] = finished_now
-            turn_finish_reasons[finish_index] = completion.finish_reason
-            if turn_first_output_times[finish_index] is None:
-                turn_first_output_times[finish_index] = finished_now
-            turn_finished[finish_index].set()
-            finish_index += 1
-            result.completed_turns = finish_index
+    cancelled = False
+    try:
+        async for output in engine.generate(
+            inputs(), base_params, result.session_id
+        ):
+            if not output.outputs:
+                continue
+            completion = output.outputs[0]
+            token_ids = list(completion.token_ids)
+            now = time.perf_counter() - replay_started
+            if run_timing is not None:
+                run_timing["last_output_received"] = utc_now()
+                run_timing["last_output_received_seconds"] = now
+            if token_ids and result.first_output_seconds is None:
+                result.first_output_seconds = now
+            if token_ids and finish_index < len(turns):
+                if turn_first_output_times[finish_index] is None:
+                    turn_first_output_times[finish_index] = now
+                turn_generated_tokens[finish_index] += len(token_ids)
+                turn_generated_token_ids[finish_index].extend(token_ids)
+            for token_id in token_ids:
+                digest.update(int(token_id).to_bytes(8, "little"))
+            room = 16 - len(result.generated_token_sample)
+            if room > 0:
+                result.generated_token_sample.extend(token_ids[:room])
+            result.generated_tokens += len(token_ids)
+            if completion.finish_reason and finish_index < len(turn_finished):
+                finished_now = time.perf_counter() - replay_started
+                turn_finished_times[finish_index] = finished_now
+                turn_finish_reasons[finish_index] = completion.finish_reason
+                if turn_first_output_times[finish_index] is None:
+                    turn_first_output_times[finish_index] = finished_now
+                turn_finished[finish_index].set()
+                finish_index += 1
+                result.completed_turns = finish_index
+    except asyncio.CancelledError:
+        cancelled = True
 
     result.finished_seconds = time.perf_counter() - replay_started
     result.generated_token_sha256 = digest.hexdigest()
+    record_available_turn_results(
+        result,
+        turns,
+        actual_send_times=actual_send_times,
+        turn_first_output_times=turn_first_output_times,
+        turn_finished_times=turn_finished_times,
+        turn_generated_tokens=turn_generated_tokens,
+        turn_generated_token_ids=turn_generated_token_ids,
+        turn_finish_reasons=turn_finish_reasons,
+        max_tokens_per_turn=max_tokens_per_turn,
+        effective_max_tokens=effective_max_tokens,
+    )
+    if cancelled:
+        return result, lateness_values
     if result.completed_turns != result.turns:
         raise RuntimeError(
             f"session {result.root_chat_id} completed "
             f"{result.completed_turns}/{result.turns} turns"
         )
-
-    for i, turn in enumerate(turns):
-        actual_send = actual_send_times[i]
-        first_out = turn_first_output_times[i]
-        finished = turn_finished_times[i]
-        if actual_send is None or first_out is None or finished is None:
-            raise RuntimeError(
-                f"session {result.root_chat_id} turn {turn.turn} "
-                f"(chat_id={turn.chat_id}) has incomplete timing"
-            )
-        send_lateness = max(0.0, actual_send - turn.send_at_seconds)
-        ttft = first_out - actual_send
-        latency = finished - actual_send
-        result.turn_results.append(
-            TurnResult(
-                chat_id=turn.chat_id,
-                turn=turn.turn,
-                scheduled_send_seconds=turn.send_at_seconds,
-                actual_send_seconds=actual_send,
-                send_lateness_seconds=send_lateness,
-                first_output_seconds=first_out,
-                finished_seconds=finished,
-                ttft_seconds=ttft,
-                latency_seconds=latency,
-                generated_tokens=turn_generated_tokens[i],
-                generated_token_ids=turn_generated_token_ids[i],
-                configured_max_tokens_per_turn=max_tokens_per_turn,
-                effective_max_tokens=effective_max_tokens[i],
-                is_resume=turn.turn > 1,
-                finish_reason=turn_finish_reasons[i],
-            )
+    if len(result.turn_results) != result.turns:
+        raise RuntimeError(
+            f"session {result.root_chat_id} turn {turns[0].turn} "
+            f"(chat_id={turns[0].chat_id}) has incomplete timing"
         )
 
     return result, lateness_values
@@ -1024,6 +1229,7 @@ def build_experiment_fingerprint(
             "kv_memory_formula_version": KV_MEMORY_FORMULA_VERSION,
         },
         "attention_backend": ATTENTION_BACKEND,
+        "enable_prefix_caching": False,
         "dtype": MODEL_DTYPE,
         "topology_assumptions": TOPOLOGY_ASSUMPTIONS,
     }
@@ -1037,6 +1243,7 @@ def build_engine_args_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "model": args.model,
         "dtype": MODEL_DTYPE,
         "enforce_eager": True,
+        "enable_prefix_caching": False,
         "seed": args.seed,
         "max_model_len": args.max_model_len,
         "max_num_seqs": args.max_num_seqs,
@@ -1222,10 +1429,29 @@ def token_comparison_validation_errors(
     return []
 
 
-async def run(args: argparse.Namespace) -> dict[str, Any]:
-    from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.v1.engine.async_llm import AsyncLLM
+async def drain_warm_residency(
+    engine: Any,
+    observation: dict[str, Any],
+    cleanup_timeout: float,
+) -> dict[str, Any]:
+    deadline = time.perf_counter() + cleanup_timeout
+    final_state = await inspect_worker(engine)
+    while final_state["warm_blocks"] and time.perf_counter() < deadline:
+        await asyncio.sleep(0.05)
+        final_state = await inspect_worker(engine)
+    update_observation(observation, final_state)
+    observation["final_warm_blocks"] = final_state["warm_blocks"]
+    observation["cleanup_complete"] = final_state["warm_blocks"] == 0
+    return final_state
 
+
+def cli_exit_status(result: dict[str, Any]) -> int:
+    if result.get("termination", {}).get("timed_out"):
+        return 1
+    return 0
+
+
+async def run(args: argparse.Namespace) -> dict[str, Any]:
     run_started_at = utc_now()
     baseline = None
     if args.baseline_json:
@@ -1248,9 +1474,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         os.environ[TOTAL_KV_BUDGET_ENV] = str(
             memory_budget["total_kv_budget_bytes"]
         )
-    engine = AsyncLLM.from_engine_args(
-        AsyncEngineArgs(**build_engine_args_kwargs(args))
-    )
+    engine = create_engine(args)
     observation = {
         "samples": 0,
         "warm_observed": False,
@@ -1275,6 +1499,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     stop_observer = asyncio.Event()
     observer: asyncio.Task | None = None
     tasks: list[asyncio.Task] = []
+    live_sessions: list[SessionResult] = []
     run_timing: dict[str, Any] = {
         "replay_plan_ready": None,
         "workload_start": None,
@@ -1288,6 +1513,29 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     cleanup_started_perf: float | None = None
     shutdown_started_perf: float | None = None
     shutdown_complete_perf: float | None = None
+    timed_out = False
+    timeout_snapshot: dict[str, Any] | None = None
+    session_results: list[SessionResult] = []
+    lateness: list[float] = []
+    final_state: dict[str, Any] | None = None
+    scheduled_duration = 0.0
+    workload_started = 0.0
+
+    def progress_tick() -> None:
+        if run_timing["workload_start"] is None:
+            return
+        elapsed = time.perf_counter() - workload_started
+        progress = collect_session_progress(
+            live_sessions,
+            selected_session_count=selection["selected_session_count"],
+            selected_request_count=selection["selected_request_count"],
+        )
+        print_replay_progress(
+            elapsed_seconds=elapsed,
+            progress=progress,
+            hot_utilization=None,
+        )
+
     try:
         plan = build_replay_plan(
             selected,
@@ -1303,7 +1551,11 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         run_timing["workload_start"] = utc_now()
         observer = asyncio.create_task(
             observe_hkv(
-                engine, stop_observer, args.metrics_interval, observation
+                engine,
+                stop_observer,
+                args.metrics_interval,
+                observation,
+                on_tick=progress_tick,
             )
         )
         tasks = [
@@ -1315,32 +1567,43 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                     args.seed,
                     args.max_tokens_per_turn,
                     run_timing,
+                    live_sessions,
                 )
             )
             for _, turns in sorted(plan.items())
         ]
-        completed = await asyncio.wait_for(
-            asyncio.gather(*tasks), timeout=args.timeout
-        )
-        session_results = [item[0] for item in completed]
-        lateness = [value for item in completed for value in item[1]]
-        cleanup_started_perf = time.perf_counter()
-        run_timing["cleanup_start"] = utc_now()
-
-        deadline = time.perf_counter() + args.cleanup_timeout
-        final_state = await inspect_worker(engine)
-        while final_state["warm_blocks"] and time.perf_counter() < deadline:
-            await asyncio.sleep(0.05)
-            final_state = await inspect_worker(engine)
-        update_observation(observation, final_state)
-        observation["final_warm_blocks"] = final_state["warm_blocks"]
-        observation["cleanup_complete"] = final_state["warm_blocks"] == 0
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=args.timeout)
+        except TimeoutError:
+            timed_out = True
+            cleanup_started_perf = time.perf_counter()
+            run_timing["cleanup_start"] = utc_now()
+            try:
+                timeout_snapshot = await inspect_worker(engine)
+                update_observation(observation, timeout_snapshot)
+            except Exception:
+                timeout_snapshot = None
+        else:
+            cleanup_started_perf = time.perf_counter()
+            run_timing["cleanup_start"] = utc_now()
+            final_state = await drain_warm_residency(
+                engine, observation, args.cleanup_timeout
+            )
     finally:
         for task in tasks:
             if not task.done():
                 task.cancel()
+        gathered: list[Any] = []
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            gathered = await asyncio.gather(*tasks, return_exceptions=True)
+        session_results, lateness = session_results_from_outcomes(gathered)
+        if timed_out:
+            try:
+                final_state = await drain_warm_residency(
+                    engine, observation, args.cleanup_timeout
+                )
+            except Exception:
+                observation["cleanup_complete"] = False
         stop_observer.set()
         if observer is not None:
             await observer
@@ -1349,29 +1612,46 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         shutdown_complete_perf = time.perf_counter()
         run_timing["shutdown_complete"] = utc_now()
 
-    requests = sum(session.turns for session in session_results)
-    generated = sum(session.generated_tokens for session in session_results)
-    last_output_received_seconds = run_timing["last_output_received_seconds"]
-    if last_output_received_seconds is None:
-        raise RuntimeError("no model output was received during the workload")
-    last_output_received_perf = (
-        workload_started + last_output_received_seconds
+    progress = collect_session_progress(
+        session_results,
+        selected_session_count=selection["selected_session_count"],
+        selected_request_count=selection["selected_request_count"],
     )
+    generated = progress["total_generated_tokens"]
+    last_output_received_seconds = run_timing["last_output_received_seconds"]
     if (
-        cleanup_started_perf is None
-        or shutdown_started_perf is None
+        shutdown_started_perf is None
         or shutdown_complete_perf is None
+        or cleanup_started_perf is None
     ):
         raise RuntimeError("cleanup and shutdown timing was not completed")
-    run_metrics = compute_run_metrics(
-        requests=requests,
-        generated_tokens=generated,
-        workload_start=workload_started,
-        last_output_received=last_output_received_perf,
-        cleanup_start=cleanup_started_perf,
-        shutdown_start=shutdown_started_perf,
-        shutdown_complete=shutdown_complete_perf,
-    )
+    if timed_out:
+        service_window = cleanup_started_perf - workload_started
+        run_metrics = {
+            "service_window_duration_seconds": service_window,
+            "cleanup_duration_seconds": shutdown_started_perf - cleanup_started_perf,
+            "shutdown_duration_seconds": (
+                shutdown_complete_perf - shutdown_started_perf
+            ),
+            "requests_per_second": None,
+            "output_tokens_per_second_service_window": None,
+        }
+    else:
+        if last_output_received_seconds is None:
+            raise RuntimeError("no model output was received during the workload")
+        last_output_received_perf = (
+            workload_started + last_output_received_seconds
+        )
+        run_metrics = compute_run_metrics(
+            requests=progress["selected_request_count"],
+            generated_tokens=generated,
+            workload_start=workload_started,
+            last_output_received=last_output_received_perf,
+            cleanup_start=cleanup_started_perf,
+            shutdown_start=shutdown_started_perf,
+            shutdown_complete=shutdown_complete_perf,
+        )
+        service_window = run_metrics["service_window_duration_seconds"]
     turn_metrics_summary = compute_turn_metrics_summary(session_results)
     experiment_config = build_experiment_config(args)
     fingerprint = build_experiment_fingerprint(
@@ -1399,9 +1679,26 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         selection,
         timing_metadata,
     )
+    runtime_source = final_state if final_state is not None else observation
     runtime_memory = build_runtime_memory_accounting(
         memory_budget,
-        final_state,
+        runtime_source,
+    )
+    termination = build_termination(
+        timed_out=timed_out,
+        configured_timeout_seconds=args.timeout,
+        service_window_duration_seconds=service_window,
+        last_output_received_seconds=last_output_received_seconds,
+        progress=progress,
+        runtime_at_timeout=(
+            build_timeout_runtime_snapshot(
+                observation,
+                timeout_snapshot,
+                warm_pool_blocks=args.warm_pool_blocks,
+            )
+            if timed_out
+            else None
+        ),
     )
     result: dict[str, Any] = {
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -1415,11 +1712,12 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "max_num_seqs": args.max_num_seqs,
         "generation_parameters": generation_parameters(args),
         "generation_policy": generation_parameters(args)["generation_policy"],
-        "selected_sessions": len(session_results),
-        "selected_requests": requests,
+        "selected_sessions": selection["selected_session_count"],
+        "selected_requests": selection["selected_request_count"],
         "selection": selection,
         "scheduled_duration_seconds": scheduled_duration,
         "timing": timing_metadata,
+        "termination": termination,
         "total_final_input_tokens": sum(
             session.final_input_tokens for session in session_results
         ),
@@ -1464,6 +1762,25 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "sessions": [asdict(session) for session in session_results],
     }
     validation_errors: list[str] = []
+    if timed_out:
+        result["validation"] = {
+            "passed": False,
+            "errors": [
+                "workload timed out before all sessions completed"
+            ],
+            "full_validation_performed": False,
+            "full_validation_unavailable_reason": "timed_out",
+        }
+        if not observation["allocator_consistent"]:
+            result["validation"]["errors"].append(
+                "WARM allocator ownership became inconsistent"
+            )
+        args.result_json.parent.mkdir(parents=True, exist_ok=True)
+        args.result_json.write_text(
+            json.dumps(result, indent=2), encoding="utf-8"
+        )
+        return result
+
     if mixed and not observation["warm_observed"]:
         validation_errors.append("mixed mode never observed WARM residency")
     if not mixed and observation["warm_observed"]:
@@ -1508,13 +1825,13 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     result["validation"] = {
         "passed": not validation_errors,
         "errors": validation_errors,
+        "full_validation_performed": True,
     }
     args.result_json.parent.mkdir(parents=True, exist_ok=True)
     args.result_json.write_text(json.dumps(result, indent=2), encoding="utf-8")
     if validation_errors:
         raise AssertionError("; ".join(validation_errors))
     return result
-
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -1624,8 +1941,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def main() -> None:
-    args = parse_args()
+def apply_hkv_environment(args: argparse.Namespace) -> None:
+    """Apply the replay process environment before the engine starts."""
     mixed = args.kv_mode == "mixed"
     os.environ.update({
         "VLLM_USE_V2_MODEL_RUNNER": "1",
@@ -1633,9 +1950,16 @@ def main() -> None:
         "HKV_ENABLE_PHYSICAL_TIERS": "1" if mixed else "0",
         "HKV_WARM_POOL_BLOCKS": str(args.warm_pool_blocks) if mixed else "0",
         "HKV_DEBUG_DEMOTE_ONE_BLOCK": "0",
+        # Drop a stale shell setting. The resume-stall tracer has been removed.
+        "HKV_DEBUG_RESUME_PROGRESS": "0",
         "HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION": "1" if mixed else "0",
         "HKV_DEBUG_MIXED_READ": "1" if mixed else "0",
     })
+
+
+def main() -> None:
+    args = parse_args()
+    apply_hkv_environment(args)
     result = asyncio.run(run(args))
     printable = {
         key: result[key]
@@ -1664,7 +1988,10 @@ def main() -> None:
     }
     if "baseline_comparison" in result:
         printable["baseline_comparison"] = result["baseline_comparison"]
+    if "termination" in result:
+        printable["termination"] = result["termination"]
     print(json.dumps(printable, indent=2))
+    raise SystemExit(cli_exit_status(result))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -13,18 +14,24 @@ from experiments.scripts.run_qwen_bailian_replay import (
     RESULT_SCHEMA_VERSION,
     SessionResult,
     TurnResult,
+    apply_hkv_environment,
     build_engine_args_kwargs,
     build_experiment_config,
     build_experiment_fingerprint,
     build_reproducibility_metadata,
     build_runtime_memory_accounting,
+    build_termination,
+    cli_exit_status,
+    collect_session_progress,
     compare_baseline,
     compute_run_metrics,
     compute_turn_metrics_summary,
     derive_persistent_kv_budget,
     hot_bytes_per_block,
+    main,
     parse_args,
     percentile,
+    run,
     run_session,
     selection_metadata,
     select_sessions,
@@ -38,6 +45,31 @@ from experiments.scripts.run_qwen_bailian_replay import (
     warm_pool_storage_bytes,
     warm_slot_table_storage_bytes,
 )
+
+
+class _StubSamplingParams:
+    def __init__(self, max_tokens, **kwargs):
+        self.max_tokens = max_tokens
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class _StubStreamingInput:
+    def __init__(self, prompt, sampling_params=None):
+        self.prompt = prompt
+        self.sampling_params = sampling_params
+
+
+@pytest.fixture(autouse=True)
+def stub_vllm_sampling_types(monkeypatch):
+    monkeypatch.setattr(
+        "experiments.scripts.run_qwen_bailian_replay.load_vllm_sampling_types",
+        lambda: (
+            _StubSamplingParams,
+            _StubStreamingInput,
+            SimpleNamespace(DELTA="delta"),
+        ),
+    )
 
 
 def make_record(
@@ -651,6 +683,49 @@ def test_fingerprint_records_memory_formula_version():
 
     assert memory["max_num_seqs"] == 128
     assert memory["kv_memory_formula_version"] == KV_MEMORY_FORMULA_VERSION
+
+
+def test_fingerprint_records_prefix_caching_disabled():
+    args = make_replay_args()
+    fields = build_experiment_fingerprint(
+        args,
+        {"name": "trace.jsonl", "sha256": "trace"},
+        {
+            "selection_sha256": "selection",
+            "selected_session_count": 1,
+            "selected_request_count": 2,
+        },
+    )["fields"]
+
+    assert fields["enable_prefix_caching"] is False
+    assert build_engine_args_kwargs(args)["enable_prefix_caching"] is False
+
+
+def test_fingerprint_rejects_prefix_caching_enabled_baseline():
+    result = make_comparison_result()
+    baseline = make_comparison_result()
+    baseline["experiment_fingerprint"]["fields"]["enable_prefix_caching"] = True
+
+    with pytest.raises(ValueError, match="enable_prefix_caching"):
+        compare_baseline(result, baseline)
+
+
+def test_apply_hkv_environment_disables_resume_progress_debug(monkeypatch):
+    monkeypatch.setenv("HKV_DEBUG_RESUME_PROGRESS", "1")
+    apply_hkv_environment(make_replay_args())
+    assert os.environ["HKV_DEBUG_RESUME_PROGRESS"] == "0"
+
+    apply_hkv_environment(
+        make_replay_args(
+            experiment_mode="performance",
+            kv_mode="mixed",
+            max_tokens_per_turn=16,
+            demotion_start_utilization=0.8,
+            demotion_stop_utilization=0.65,
+            warm_pool_blocks=256,
+        )
+    )
+    assert os.environ["HKV_DEBUG_RESUME_PROGRESS"] == "0"
 
 
 def test_legacy_baseline_is_rejected_clearly():
@@ -1519,3 +1594,341 @@ def test_validate_allows_legitimate_early_stop_on_final_turn():
         )
         == []
     )
+
+
+FAKE_INSPECT_STATE = {
+    "warm_blocks": 0,
+    "warm_requests": 0,
+    "owned_warm_slots": 0,
+    "allocator_consistent": True,
+    "max_gpu_allocated_bytes": 0,
+    "max_gpu_reserved_bytes": 0,
+    "num_gpu_blocks": 1,
+    "hot_kv_storage_bytes": 0,
+    "warm_kv_storage_bytes": 0,
+    "hot_to_warm_map_storage_bytes": 0,
+    "warm_slot_table_storage_bytes": 0,
+    "actual_persistent_kv_bytes": 0,
+    "configured_total_kv_budget_bytes": None,
+    "derived_hot_kv_budget_bytes": None,
+    "budget_slack_bytes": None,
+}
+
+
+def _two_session_records():
+    return [
+        make_record(
+            chat_id=1,
+            parent_chat_id=-1,
+            timestamp=0.0,
+            input_length=8,
+            turn=1,
+            hash_ids=(10,),
+        ),
+        make_record(
+            chat_id=2,
+            parent_chat_id=1,
+            timestamp=1.0,
+            input_length=20,
+            turn=2,
+            hash_ids=(10, 11),
+        ),
+        make_record(
+            chat_id=3,
+            parent_chat_id=-1,
+            timestamp=0.0,
+            input_length=8,
+            turn=1,
+            hash_ids=(30,),
+        ),
+        make_record(
+            chat_id=4,
+            parent_chat_id=3,
+            timestamp=1.0,
+            input_length=20,
+            turn=2,
+            hash_ids=(30, 31),
+        ),
+    ]
+
+
+class FakeReplayEngine:
+    def __init__(self, *, hang_session_id=None, fail=None):
+        self.hang_session_id = hang_session_id
+        self.fail = fail
+        self.shutdown_calls = 0
+        self.cancelled_sessions: list[str] = []
+        self.inspect_calls = 0
+
+    def get_tokenizer(self):
+        return SimpleNamespace(vocab_size=32_000)
+
+    def shutdown(self):
+        self.shutdown_calls += 1
+
+    async def generate(self, input_gen, base_params, session_id):
+        if self.fail is not None:
+            raise self.fail
+        try:
+            await anext(input_gen)
+            yield SimpleNamespace(
+                outputs=[SimpleNamespace(token_ids=[101], finish_reason=None)]
+            )
+            yield SimpleNamespace(
+                outputs=[SimpleNamespace(token_ids=[], finish_reason="length")]
+            )
+            await anext(input_gen)
+            if session_id == self.hang_session_id:
+                yield SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(token_ids=[201], finish_reason=None)
+                    ]
+                )
+                await asyncio.Event().wait()
+            yield SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(token_ids=[201, 202], finish_reason=None)
+                ]
+            )
+            yield SimpleNamespace(
+                outputs=[SimpleNamespace(token_ids=[], finish_reason="length")]
+            )
+        except asyncio.CancelledError:
+            self.cancelled_sessions.append(session_id)
+            raise
+
+
+def _patch_harness(monkeypatch, engine, records, inspect_override=None):
+    import experiments.scripts.run_qwen_bailian_replay as replay
+
+    async def fake_inspect(_engine):
+        _engine.inspect_calls += 1
+        state = dict(FAKE_INSPECT_STATE)
+        if inspect_override is not None:
+            state.update(inspect_override(_engine))
+        return state
+
+    monkeypatch.setattr(replay, "create_engine", lambda args: engine)
+    monkeypatch.setattr(replay, "inspect_worker", fake_inspect)
+    monkeypatch.setattr(replay, "load_bailian_records", lambda path: records)
+    return replay
+
+
+def _harness_args(tmp_path, **overrides):
+    trace_path = tmp_path / "trace.jsonl"
+    if not trace_path.exists():
+        trace_path.write_text("{}\n", encoding="utf-8")
+    values = {
+        "--experiment-mode": "correctness",
+        "--kv-mode": "all-hot",
+        "--result-json": str(tmp_path / "result.json"),
+        "--trace": str(tmp_path / "trace.jsonl"),
+        "--max-sessions": "2",
+        "--metrics-interval": "30",
+        "--cleanup-timeout": "0.05",
+        "--timeout": "5",
+        "--time-scale": "0.01",
+        "--seed": "42",
+    }
+    values.update(overrides)
+    argv = []
+    for key, value in values.items():
+        argv.extend([key, value])
+    return parse_args(argv)
+
+
+def test_collect_session_progress_counts_completed_and_incomplete():
+    complete = make_session_result(1, "aaa")
+    partial = make_session_result(3, "bbb")
+    partial.completed_turns = 1
+    partial.generated_tokens = 4
+    progress = collect_session_progress(
+        [complete, partial],
+        selected_session_count=2,
+        selected_request_count=4,
+    )
+    assert progress["completed_session_count"] == 1
+    assert progress["incomplete_session_count"] == 1
+    assert progress["completed_request_count"] == 3
+    assert progress["incomplete_request_count"] == 1
+    assert progress["total_generated_tokens"] == 6
+
+
+def test_build_termination_completed_omits_runtime_snapshot():
+    progress = collect_session_progress(
+        [make_session_result(1, "aaa")],
+        selected_session_count=1,
+        selected_request_count=2,
+    )
+    termination = build_termination(
+        timed_out=False,
+        configured_timeout_seconds=300.0,
+        service_window_duration_seconds=1.5,
+        last_output_received_seconds=1.2,
+        progress=progress,
+    )
+    assert termination["status"] == "completed"
+    assert termination["timed_out"] is False
+    assert "runtime_at_timeout" not in termination
+    assert termination["seconds_since_last_completed_turn"] == pytest.approx(0.3)
+
+
+def test_successful_run_writes_completed_termination(tmp_path, monkeypatch):
+    engine = FakeReplayEngine()
+    _patch_harness(monkeypatch, engine, _two_session_records())
+    args = _harness_args(tmp_path)
+    result = asyncio.run(run(args))
+
+    assert result["termination"]["status"] == "completed"
+    assert result["termination"]["timed_out"] is False
+    assert result["validation"]["full_validation_performed"] is True
+    assert result["validation"]["passed"] is True
+    assert result["requests_per_second"] is not None
+    assert result["output_tokens_per_second_service_window"] is not None
+    assert result["experiment_fingerprint"]
+    assert result["selected_sessions"] == 2
+    assert result["selected_requests"] == 4
+    assert result["total_generated_tokens"] == 6
+    assert engine.shutdown_calls == 1
+    payload = json.loads(args.result_json.read_text(encoding="utf-8"))
+    assert payload["termination"]["status"] == "completed"
+    assert payload["schema_version"] == RESULT_SCHEMA_VERSION
+
+
+def test_timeout_run_writes_partial_json_and_skips_full_validation(
+    tmp_path, monkeypatch
+):
+    engine = FakeReplayEngine(hang_session_id="bailian-3")
+
+    def inspect_override(_engine):
+        if _engine.shutdown_calls:
+            return {"warm_blocks": 0}
+        return {
+            "warm_blocks": 5,
+            "warm_requests": 2,
+            "owned_warm_slots": 5,
+        }
+
+    _patch_harness(
+        monkeypatch, engine, _two_session_records(), inspect_override
+    )
+    args = _harness_args(tmp_path, **{"--timeout": "0.2"})
+    result = asyncio.run(run(args))
+
+    term = result["termination"]
+    assert term["status"] == "timeout"
+    assert term["timed_out"] is True
+    assert term["configured_timeout_seconds"] == 0.2
+    assert term["selected_session_count"] == 2
+    assert term["completed_session_count"] == 1
+    assert term["incomplete_session_count"] == 1
+    assert term["selected_request_count"] == 4
+    assert term["completed_request_count"] == 3
+    assert term["incomplete_request_count"] == 1
+    assert term["total_generated_tokens"] == 5
+    assert result["total_generated_tokens"] == 5
+    assert result["requests_per_second"] is None
+    assert "baseline_comparison" not in result
+    assert result["validation"]["passed"] is False
+    assert result["validation"]["full_validation_performed"] is False
+    assert result["validation"]["full_validation_unavailable_reason"] == (
+        "timed_out"
+    )
+    runtime = term["runtime_at_timeout"]
+    assert runtime["warm_occupied_slots"] == 5
+    assert runtime["warm_capacity_blocks"] == 0
+    assert runtime["hot_utilization"]["available"] is False
+    assert runtime["preemption_count"]["available"] is False
+    assert runtime["num_running_reqs"]["available"] is False
+    assert engine.cancelled_sessions == ["bailian-3"]
+    assert engine.shutdown_calls == 1
+    payload = json.loads(args.result_json.read_text(encoding="utf-8"))
+    assert payload["termination"]["status"] == "timeout"
+    assert payload["experiment_fingerprint"]
+    assert cli_exit_status(result) == 1
+
+
+def test_timeout_cancels_pending_tasks_and_records_cleanup(
+    tmp_path, monkeypatch
+):
+    engine = FakeReplayEngine(hang_session_id="bailian-1")
+    _patch_harness(monkeypatch, engine, _two_session_records())
+    args = _harness_args(tmp_path, **{"--timeout": "0.15"})
+    result = asyncio.run(run(args))
+
+    assert engine.cancelled_sessions
+    assert engine.shutdown_calls == 1
+    assert result["hkv_observation"]["cleanup_complete"] is True
+    assert result["hkv_observation"]["allocator_consistent"] is True
+
+
+def test_timeout_main_exits_nonzero_only_after_json_write(
+    tmp_path, monkeypatch
+):
+    engine = FakeReplayEngine(hang_session_id="bailian-3")
+    replay = _patch_harness(monkeypatch, engine, _two_session_records())
+    args = _harness_args(tmp_path, **{"--timeout": "0.2"})
+    monkeypatch.setattr(replay, "parse_args", lambda argv=None: args)
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 1
+    assert args.result_json.exists()
+    payload = json.loads(args.result_json.read_text(encoding="utf-8"))
+    assert payload["termination"]["status"] == "timeout"
+    assert payload["validation"]["full_validation_performed"] is False
+
+
+def test_unrelated_engine_exception_is_not_mislabeled_timeout(
+    tmp_path, monkeypatch
+):
+    engine = FakeReplayEngine(fail=RuntimeError("CUDA error: device-side assert"))
+    _patch_harness(monkeypatch, engine, _two_session_records())
+    args = _harness_args(tmp_path)
+
+    with pytest.raises(RuntimeError, match="CUDA error"):
+        asyncio.run(run(args))
+
+    assert not args.result_json.exists()
+    assert engine.shutdown_calls == 1
+
+
+def test_run_session_cancelled_returns_partial_tokens():
+    async def _test():
+        engine = FakeReplayEngine(hang_session_id="bailian-10")
+        turns = [
+            ReplayTurn(
+                session_id="bailian-10",
+                root_chat_id=10,
+                chat_id=10,
+                parent_chat_id=-1,
+                turn=1,
+                send_at_seconds=0.0,
+                input_length=4,
+                trace_output_length=2,
+                delta_token_ids=(10, 11, 12, 13),
+            ),
+            ReplayTurn(
+                session_id="bailian-10",
+                root_chat_id=10,
+                chat_id=11,
+                parent_chat_id=10,
+                turn=2,
+                send_at_seconds=0.0,
+                input_length=8,
+                trace_output_length=2,
+                delta_token_ids=(20, 21, 22, 23),
+            ),
+        ]
+        task = asyncio.create_task(
+            run_session(engine, turns, time.perf_counter(), seed=1)
+        )
+        await asyncio.sleep(0.05)
+        task.cancel()
+        session_result, _lateness = await task
+        assert session_result.completed_turns == 1
+        assert session_result.generated_tokens == 2
+        assert engine.cancelled_sessions == ["bailian-10"]
+
+    asyncio.run(_test())
