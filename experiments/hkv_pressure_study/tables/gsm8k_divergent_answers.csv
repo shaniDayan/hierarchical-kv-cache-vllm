@@ -1,0 +1,128 @@
+question_index,session_id,batch,gold_value,all_hot_extracted,mixed_extracted,all_hot_exact_match,mixed_exact_match,all_hot_parse_failure,mixed_parse_failure,identical_extracted,pair_class,all_hot_generated_token_count,mixed_generated_token_count,mixed_read_steps,warm_logical_blocks_observed,all_hot_final_text,mixed_final_text
+7,gsm8k-0007,batch_2_start_5,160,20,80,False,False,False,False,False,divergent_same_correctness,59,88,88,47," 
+
+**Answer:**  
+Carla has to restart the download from the beginning after the 40% download.  
+- The download takes 20 minutes to restart.  
+- So, the total time to download the file is 20 minutes.  
+
+#### 20
+"," 
+
+**Answer:**  
+Carla has to restart the download from the beginning after the 40% download is complete. The download speed is 2 GB/minute, so the time to download the remaining 160 GB is:  
+$$ 160 \div 2 = 80 \text{ minutes} $$  
+So, the total time to download the file is:  
+#### 80
+"
+8,gsm8k-0008,batch_2_start_5,45,55,250,False,False,False,False,False,divergent_same_correctness,237,256,256,49," 
+
+**Step-by-step reasoning:**
+
+1. **First part:**  
+   John drives for 3 hours at 60 mph.  
+   Distance = Speed × Time = $60 \times 3 = 180$ miles.
+
+2. **Second part:**  
+   He turns around and tries to get home in 4 hours.  
+   - He spends the first 2 hours in **standstill traffic**, so he spends 2 hours driving at 0 mph.  
+   - He spends the next **half-hour** driving at 30 mph.  
+   - He spends the remaining **half-hour** driving at 80 mph.  
+
+   Total driving time:  
+   $2 + 0.5 + 0.5 = 3$ hours.  
+
+   Total distance covered:  
+   $0 \times 2 + 30 \times 0.5 + 80 \times 0.5 = 15 + 40 = 55$ miles.
+
+3. **Final distance from home:**  
+   He is 55 miles away from home.
+
+#### 55
+"," 
+
+**Step-by-step reasoning:**
+
+1. **First part:**  
+   John drives for 3 hours at 60 mph.  
+   Distance = Speed × Time = $60 \times 3 = 180$ miles.
+
+2. **Second part:**  
+   He turns around and tries to get home in 4 hours.  
+   He spends the first 2 hours in **standstill traffic**, so he spends 2 hours driving at 60 mph.  
+   Then, he spends the next **half-hour** driving at 30 mph.  
+   Then, he drives the remaining **half-hour** at 80 mph.
+
+3. **Total driving time:**  
+   $2 + 0.5 + 0.5 = 3$ hours.
+
+4. **Total distance driven:**  
+   $180 + (60 \times 0.5) + (80 \times 0.5) = 180 + 30 + 40 = 250$ miles.
+
+5. **Final answer:**  
+   He is **250 miles** away from home at the end of those 4 hours.  
+
+#### 250
+"
+15,gsm8k-0015,batch_4_start_15,125,8096,125,False,True,False,False,False,divergent_only_mixed_correct,250,312,312,49," 
+
+### Problem:
+A merchant wants to choose between two purchase plans:
+- **Jewelry**: $5,000
+- **Electronic gadgets**: $8,000
+
+The financial advisor predicts:
+- Jewelry market will rise by **2.5%**
+- Electronic gadgets market will rise by **1.2%**
+
+The merchant wants to **maximize profit** at the end of the month.
+
+### Step-by-step:
+1. **Jewelry**:  
+   If the market rises by 2.5%, the value of the jewelry will be:  
+   $ 5,000 \times 1.025 = 5,125 $
+
+2. **Electronic gadgets**:  
+   If the market rises by 1.2%, the value of the gadgets will be:  
+   $ 8,000 \times 1.012 = 8,096 $
+
+3. **Profit**:  
+   The merchant wants to choose the plan that gives the **maximum profit**.  
+   Since the value of the gadgets is higher, the merchant should choose the **gadget plan**.
+
+### Final Answer:
+#### 8,096
+"," 
+
+### Problem:
+A merchant wants to choose between two purchase plans:
+- **Jewelry**: $5,000
+- **Electronic gadgets**: $8,000
+
+The financial advisor predicts:
+- Jewelry market will rise by **2.5%**
+- Electronic gadgets market will rise by **1.2%**
+
+The merchant wants to **maximize profit** at the end of the month.
+
+### Step-by-step:
+1. **Jewelry**: 
+   - Price = $5,000
+   - Price increase = 2.5% of $5,000 = $125
+   - Total price = $5,000 + $125 = **$5,125**
+
+2. **Electronic gadgets**:
+   - Price = $8,000
+   - Price increase = 1.2% of $8,000 = $96
+   - Total price = $8,000 + $96 = **$8,096**
+
+3. **Profit**:
+   - Jewelry: $5,125 - $5,000 = **$125**
+   - Electronic gadgets: $8,096 - $8,000 = **$96**
+
+4. **Maximize profit**:
+   - The merchant should choose **jewelry**, as it gives the highest profit.
+
+### Final Answer:
+#### 125
+"

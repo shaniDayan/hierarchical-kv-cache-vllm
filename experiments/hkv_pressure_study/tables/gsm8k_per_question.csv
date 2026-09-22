@@ -1,0 +1,661 @@
+batch,mode,session_id,question_index,gold_value,extracted_value,exact_match,parse_failure,final_text,generated_token_count,mixed_read_steps,warm_logical_blocks_observed,pre_resume_warm_confirmed,eligible,exclusion_reason,completed_turns,error
+batch_1_start_0,all-hot,gsm8k-0000,0,18,18,True,False," 
+
+**Step-by-step reasoning:**
+
+1. **Eggs per day:** 16 eggs/day  
+2. **Eggs eaten for breakfast:** 3 eggs  
+3. **Eggs baked for friends:** 4 eggs  
+4. **Eggs sold at farmers' market:** $2 per egg  
+
+**Total eggs per day:**  
+16 eggs/day - 3 eggs (breakfast) - 4 eggs (baking) = 9 eggs/day  
+
+**Earnings from eggs:**  
+9 eggs/day × $2/egg = $18/day  
+
+#### 18
+",128,0,0,False,True,,2,
+batch_1_start_0,mixed,gsm8k-0000,0,18,18,True,False," 
+
+**Step 1:**  
+Janet's ducks lay 16 eggs per day.  
+She eats 3 eggs for breakfast and 4 eggs for baking muffins.  
+So, she eats $3 + 4 = 7$ eggs per day.  
+
+**Step 2:**  
+She sells the remaining eggs at $2 per egg.  
+She lays 16 eggs per day, eats 7 eggs, and sells the rest.  
+So, she sells $16 - 7 = 9$ eggs per day.  
+
+**Step 3:**  
+She sells the eggs at $2 per egg.  
+So, she makes $9 × 2 = $18 per day.  
+
+#### 18
+",152,152,47,True,True,,2,
+batch_1_start_0,all-hot,gsm8k-0001,1,3,3,True,False," 
+
+A robe takes 2 bolts of blue fiber and half as much white fiber. Half of 2 is 1. So, the total number of bolts is:
+
+2 (blue) + 1 (white) = **3 bolts**.
+
+#### 3
+",55,0,0,False,True,,2,
+batch_1_start_0,mixed,gsm8k-0001,1,3,3,True,False," 
+
+A robe takes 2 bolts of blue fiber and half as much white fiber. Half of 2 is 1. So, the total number of bolts is:
+
+2 (blue) + 1 (white) = **3 bolts**.
+
+#### 3
+",55,55,44,True,True,,2,
+batch_1_start_0,all-hot,gsm8k-0002,2,70000,120000,False,False," 
+
+Josh buys a house for $80,000 and puts in $50,000 in repairs. The value of the house increased by 150%. 
+
+1. The value of the house increased by 150%, so the total value is:
+   $$
+   80,000 + 150\% \times 80,000 = 80,000 + 120,000 = 200,000
+   $$
+
+2. The profit is the difference between the total value and the cost:
+   $$
+   200,000 - 80,000 = 120,000
+   $$
+
+#### 120,000
+",175,0,0,False,True,,2,
+batch_1_start_0,mixed,gsm8k-0002,2,70000,120000,False,False," 
+
+Josh buys a house for $80,000 and puts in $50,000 in repairs. The value of the house increased by 150%. 
+
+1. The value of the house increased by 150%, so the total value is:
+   $$
+   80,000 + 150\% \times 80,000 = 80,000 + 120,000 = 200,000
+   $$
+
+2. The profit is the difference between the total value and the cost:
+   $$
+   200,000 - 80,000 = 120,000
+   $$
+
+#### 120,000
+",175,175,46,True,True,,2,
+batch_1_start_0,all-hot,gsm8k-0003,3,540,180,False,False," 
+
+James runs 60 meters each sprint and does this 3 times a week. So:
+
+$$
+\text{Total meters per week} = 60 \times 3 = 180
+$$
+
+#### 180
+",53,0,0,False,True,,2,
+batch_1_start_0,mixed,gsm8k-0003,3,540,180,False,False," 
+
+James runs 60 meters each sprint and does this 3 times a week. So:
+
+$$
+\text{Total meters per week} = 60 \times 3 = 180
+$$
+
+#### 180
+",53,53,45,True,True,,2,
+batch_1_start_0,all-hot,gsm8k-0004,4,20,60,False,False," 
+
+**Answer:**  
+Wendi gives each chicken 15 cups in the morning, 25 cups in the afternoon, and 3 cups per meal.  
+So, in the final meal, she gives each chicken 3 cups.  
+For 20 chickens, the total is $ 20 \times 3 = 60 $ cups.  
+
+#### 60
+",81,0,0,False,True,,2,
+batch_1_start_0,mixed,gsm8k-0004,4,20,60,False,False," 
+
+**Answer:**  
+Wendi gives each chicken 15 cups in the morning, 25 cups in the afternoon, and 3 cups per meal.  
+So, in the final meal, she gives 3 cups per chicken.  
+For 20 chickens, she needs $ 3 \times 20 = 60 $ cups.  
+
+#### 60
+",80,80,50,True,True,,2,
+batch_2_start_5,all-hot,gsm8k-0005,5,64,-9999999,False,True," 
+
+Kylar wants to buy 16 glasses. The first glass costs $5, and each subsequent glass costs 60% of the price of the previous one. 
+
+- First glass: $5  
+- Second glass: $5 × 0.60 = $3  
+- Third glass: $3 × 0.60 = $1.80  
+- Fourth glass: $1.80 × 0.60 = $1.08  
+- Fifth glass: $1.08 × 0.60 = $0.648  
+- Sixth glass: $0.648 × 0.60 = $0.3888  
+- Seventh glass: $0.3888 × 0.60 = $0.2333  
+- Eighth glass: $0.2333 × 0.60 = $0.14  
+- Ninth glass: $0.14 × 0.60 = $0.084  
+- Tenth glass: $0.084 × 0.60 = $0.0504  
+- Eleventh glass: $0.0504 × 0.60 = $0.03024  
+- Twelfth glass: $0.03024 × 0.60 = $0.018144  
+- Thirteenth glass: $0.018144 × 0.60 = $0.0108864  
+- Fourteenth glass: $0.0108864 × 0.60 = $0.00653184  
+- Fifteenth glass: $0.00653184 × 0.60 = $0.003919104  
+- Sixteenth glass: $0.003919104 × 0.60 = $0.0023514624  
+
+Adding these up:  
+$5 + $3 + $1.80 + $1.08 + $0.648 + $0.3888 + $0.2333 + $0.14 + $0.084 + $0.050",512,0,0,False,True,,2,
+batch_2_start_5,mixed,gsm8k-0005,5,64,-9999999,False,True," 
+
+Kylar wants to buy 16 glasses. The first glass costs $5, and each subsequent glass costs 60% of the price of the previous one. 
+
+- First glass: $5  
+- Second glass: $5 × 0.60 = $3  
+- Third glass: $3 × 0.60 = $1.80  
+- Fourth glass: $1.80 × 0.60 = $1.08  
+- Fifth glass: $1.08 × 0.60 = $0.648  
+- Sixth glass: $0.648 × 0.60 = $0.3888  
+- Seventh glass: $0.3888 × 0.60 = $0.2333  
+- Eighth glass: $0.2333 × 0.60 = $0.14  
+- Ninth glass: $0.14 × 0.60 = $0.084  
+- Tenth glass: $0.084 × 0.60 = $0.0504  
+- Eleventh glass: $0.0504 × 0.60 = $0.03024  
+- Twelfth glass: $0.03024 × 0.60 = $0.018144  
+- Thirteenth glass: $0.018144 × 0.60 = $0.0108864  
+- Fourteenth glass: $0.0108864 × 0.60 = $0.00653184  
+- Fifteenth glass: $0.00653184 × 0.60 = $0.003919104  
+- Sixteenth glass: $0.003919104 × 0.60 = $0.0023514624  
+
+Adding these up:  
+$5 + $3 + $1.80 + $1.08 + $0.648 + $0.3888 + $0.2333 + $0.14 + $0.084 + $0.050",512,512,46,True,True,,2,
+batch_2_start_5,all-hot,gsm8k-0006,6,260,260,True,False," 
+
+### Problem:
+Toulouse has twice as many sheep as Charleston.  
+Charleston has 4 times as many sheep as Seattle.  
+Seattle has 20 sheep.  
+How many sheep do Toulouse, Charleston, and Seattle have together?
+
+### Step-by-step:
+1. **Seattle has 20 sheep.**  
+2. **Charleston has 4 times as many sheep as Seattle:**  
+   $ 4 \times 20 = 80 $ sheep.  
+3. **Toulouse has twice as many sheep as Charleston:**  
+   $ 2 \times 80 = 160 $ sheep.  
+4. **Total number of sheep:**  
+   $ 160 + 80 + 20 = 260 $.
+
+### Final Answer:
+#### 260
+",173,0,0,False,True,,2,
+batch_2_start_5,mixed,gsm8k-0006,6,260,260,True,False," 
+
+### Problem:
+Toulouse has twice as many sheep as Charleston.  
+Charleston has 4 times as many sheep as Seattle.  
+Seattle has 20 sheep.  
+How many sheep do Toulouse, Charleston, and Seattle have together?
+
+### Step-by-step:
+1. **Seattle has 20 sheep.**  
+2. **Charleston has 4 times as many sheep as Seattle:**  
+   $ 4 \times 20 = 80 $ sheep.  
+3. **Toulouse has twice as many sheep as Charleston:**  
+   $ 2 \times 80 = 160 $ sheep.  
+4. **Total number of sheep:**  
+   $ 160 + 80 + 20 = 260 $.
+
+### Final Answer:
+#### 260
+",173,173,45,True,True,,2,
+batch_2_start_5,all-hot,gsm8k-0007,7,160,20,False,False," 
+
+**Answer:**  
+Carla has to restart the download from the beginning after the 40% download.  
+- The download takes 20 minutes to restart.  
+- So, the total time to download the file is 20 minutes.  
+
+#### 20
+",59,0,0,False,True,,2,
+batch_2_start_5,mixed,gsm8k-0007,7,160,80,False,False," 
+
+**Answer:**  
+Carla has to restart the download from the beginning after the 40% download is complete. The download speed is 2 GB/minute, so the time to download the remaining 160 GB is:  
+$$ 160 \div 2 = 80 \text{ minutes} $$  
+So, the total time to download the file is:  
+#### 80
+",88,88,47,True,True,,2,
+batch_2_start_5,all-hot,gsm8k-0008,8,45,55,False,False," 
+
+**Step-by-step reasoning:**
+
+1. **First part:**  
+   John drives for 3 hours at 60 mph.  
+   Distance = Speed × Time = $60 \times 3 = 180$ miles.
+
+2. **Second part:**  
+   He turns around and tries to get home in 4 hours.  
+   - He spends the first 2 hours in **standstill traffic**, so he spends 2 hours driving at 0 mph.  
+   - He spends the next **half-hour** driving at 30 mph.  
+   - He spends the remaining **half-hour** driving at 80 mph.  
+
+   Total driving time:  
+   $2 + 0.5 + 0.5 = 3$ hours.  
+
+   Total distance covered:  
+   $0 \times 2 + 30 \times 0.5 + 80 \times 0.5 = 15 + 40 = 55$ miles.
+
+3. **Final distance from home:**  
+   He is 55 miles away from home.
+
+#### 55
+",237,0,0,False,True,,2,
+batch_2_start_5,mixed,gsm8k-0008,8,45,250,False,False," 
+
+**Step-by-step reasoning:**
+
+1. **First part:**  
+   John drives for 3 hours at 60 mph.  
+   Distance = Speed × Time = $60 \times 3 = 180$ miles.
+
+2. **Second part:**  
+   He turns around and tries to get home in 4 hours.  
+   He spends the first 2 hours in **standstill traffic**, so he spends 2 hours driving at 60 mph.  
+   Then, he spends the next **half-hour** driving at 30 mph.  
+   Then, he drives the remaining **half-hour** at 80 mph.
+
+3. **Total driving time:**  
+   $2 + 0.5 + 0.5 = 3$ hours.
+
+4. **Total distance driven:**  
+   $180 + (60 \times 0.5) + (80 \times 0.5) = 180 + 30 + 40 = 250$ miles.
+
+5. **Final answer:**  
+   He is **250 miles** away from home at the end of those 4 hours.  
+
+#### 250
+",256,256,49,True,True,,2,
+batch_2_start_5,all-hot,gsm8k-0009,9,460,450,False,False," 
+
+Eliza's regular hourly rate is $10. She works for 45 hours this week, and she receives an overtime rate of 1.2 times her regular hourly rate. 
+
+- Regular earnings: $10 × 40 = $400
+- Overtime earnings: $10 × 5 = $50
+- Total earnings: $400 + $50 = $450
+
+#### 450
+",98,0,0,False,True,,2,
+batch_2_start_5,mixed,gsm8k-0009,9,460,450,False,False," 
+
+Eliza's regular hourly rate is $10. She works for 45 hours this week, and she receives an overtime rate of 1.2 times her regular hourly rate. 
+
+- Regular earnings: $10 × 40 = $400
+- Overtime earnings: $10 × 5 = $50
+- Total earnings: $400 + $50 = $450
+
+#### 450
+",98,98,47,True,True,,2,
+batch_3_start_10,all-hot,gsm8k-0010,10,366,366,True,False," 
+
+### Problem:
+A new program had 60 downloads in the first month. The number of downloads in the second month was three times as many as the downloads in the first month, but then reduced by 30% in the third month. How many downloads did the program have total over the three months?
+
+### Step-by-step:
+1. First month: 60 downloads.
+2. Second month: 3 times the first month = $ 3 \times 60 = 180 $ downloads.
+3. Third month: 180 downloads reduced by 30% = $ 180 \times (1 - 0.30) = 180 \times 0.70 = 126 $ downloads.
+
+### Total downloads over the three months:
+$$ 60 + 180 + 126 = 366 $$
+
+#### Final Answer:
+#### 366
+",200,0,0,False,True,,2,
+batch_3_start_10,mixed,gsm8k-0010,10,366,366,True,False," 
+
+### Problem:
+A new program had 60 downloads in the first month. The number of downloads in the second month was three times as many as the downloads in the first month, but then reduced by 30% in the third month. How many downloads did the program have total over the three months?
+
+### Step-by-step:
+1. First month: 60 downloads  
+2. Second month: 3 times the first month = $ 3 \times 60 = 180 $ downloads  
+3. Third month: 180 downloads reduced by 30% = $ 180 \times (1 - 0.30) = 180 \times 0.70 = 126 $ downloads  
+
+### Total downloads over the three months:
+$$ 60 + 180 + 126 = 366 $$
+
+#### Final Answer:
+#### 366
+",200,200,47,True,True,,2,
+batch_3_start_10,all-hot,gsm8k-0011,11,694,694,True,False," 
+
+Toula bought:
+- 3 dozen donuts: $68 per dozen → $68 × 3 = $204  
+- 2 dozen mini cupcakes: $80 per dozen → $80 × 2 = $160  
+- 6 dozen mini cheesecakes: $55 per dozen → $55 × 6 = $330  
+
+Total cost = $204 + $160 + $330 = $694
+
+#### 694
+",113,0,0,False,True,,2,
+batch_3_start_10,mixed,gsm8k-0011,11,694,694,True,False," 
+
+Toula bought:
+- 3 dozen donuts: $68 per dozen → $68 × 3 = $204  
+- 2 dozen mini cupcakes: $80 per dozen → $80 × 2 = $160  
+- 6 dozen mini cheesecakes: $55 per dozen → $55 × 6 = $330  
+
+Total cost = $204 + $160 + $330 = $694
+
+#### 694
+",113,113,47,True,True,,2,
+batch_3_start_10,all-hot,gsm8k-0012,12,13,1,False,False," 
+
+Carlos plants a lemon tree for $90. Each year, the tree grows 7 lemons, which he sells for $1.5 each. It costs $3 to water and feed the tree each year. 
+
+1. **Initial cost**: $90  
+2. **Growth and revenue**:  
+   - Each year, the tree grows 7 lemons, and he sells 7 lemons for $1.5.  
+   - So, each year, he earns $1.5 (from sales) - $3 (costs) = $1.5 - $3 = -$1.5 (net loss).  
+3. **Net profit per year**: -$1.5  
+4. **Years to start earning money**: Since he starts earning money when the net profit becomes positive, he will need **1 year** to start earning money.  
+
+#### 1
+",186,0,0,False,True,,2,
+batch_3_start_10,mixed,gsm8k-0012,12,13,1,False,False," 
+
+Carlos plants a lemon tree for $90. Each year, the tree grows 7 lemons, which he sells for $1.5 each. It costs $3 to water and feed the tree each year. 
+
+1. **Initial cost**: $90  
+2. **Growth and revenue**:  
+   - 7 lemons × $1.5 = $10.5 per year  
+   - Cost to water and feed: $3 per year  
+3. **Net profit per year**: $10.5 - $3 = $7.5 per year  
+
+Since Carlos starts earning money, the tree will **start earning money** after **1 year**.
+
+#### 1
+",147,147,47,True,True,,2,
+batch_3_start_10,all-hot,gsm8k-0013,13,18,4,False,False," 
+
+### Problem:
+Melanie is a door-to-door saleswoman. She sold a third of her vacuum cleaners at the green house, 2 more to the red house, and half of what was left at the orange house. If Melanie has 5 vacuum cleaners left, how many did she start with?
+
+### Step-by-step:
+1. Let the total number of vacuum cleaners Melanie started with be $ x $.
+2. She sold a third of them at the green house: $ \frac{x}{3} $.
+3. She sold 2 more to the red house: $ \frac{x}{3} + 2 $.
+4. She sold half of what was left at the orange house: $ \frac{1}{2} \left( \frac{x}{3} + 2 \right) $.
+5. She has 5 vacuum cleaners left: $ \frac{x}{3} + 2 + \frac{1}{2} \left( \frac{x}{3} + 2 \right) = 5 $.
+
+### Solve:
+Let’s simplify the equation:
+
+$$
+\frac{x}{3} + 2 + \frac{1}{2} \left( \frac{x}{3} + 2 \right) = 5
+$$
+
+$$
+\frac{x}{3} + 2 + \frac{x}{6} + 1 = 5
+$$
+
+$$
+\frac{2x}{6} + \frac{x}{6} + 3 = 5
+$$
+
+$$
+\frac{3x}{6} + 3 = 5
+$$
+
+$$
+\frac{x}{2} + 3 = 5
+$$
+
+$$
+\frac{x}{2} = 2
+$$
+
+$$
+x = 4
+$$
+
+### Final Answer:
+#### 4
+",387,0,0,False,True,,2,
+batch_3_start_10,mixed,gsm8k-0013,13,18,4,False,False," 
+
+### Problem:
+Melanie is a door-to-door saleswoman. She sold a third of her vacuum cleaners at the green house, 2 more to the red house, and half of what was left at the orange house. If Melanie has 5 vacuum cleaners left, how many did she start with?
+
+### Step-by-step:
+1. Let the total number of vacuum cleaners Melanie started with be $ x $.
+2. She sold a third of them at the green house: $ \frac{x}{3} $.
+3. She sold 2 more to the red house: $ \frac{x}{3} + 2 $.
+4. She sold half of what was left at the orange house: $ \frac{1}{2} \left( \frac{x}{3} + 2 \right) $.
+5. She has 5 vacuum cleaners left: $ \frac{x}{3} + 2 + \frac{1}{2} \left( \frac{x}{3} + 2 \right) = 5 $.
+
+### Solve:
+Let’s simplify the equation:
+
+$$
+\frac{x}{3} + 2 + \frac{1}{2} \left( \frac{x}{3} + 2 \right) = 5
+$$
+
+$$
+\frac{x}{3} + 2 + \frac{x}{6} + 1 = 5
+$$
+
+$$
+\frac{2x}{6} + \frac{x}{6} + 3 = 5
+$$
+
+$$
+\frac{3x}{6} + 3 = 5
+$$
+
+$$
+\frac{x}{2} + 3 = 5
+$$
+
+$$
+\frac{x}{2} = 2
+$$
+
+$$
+x = 4
+$$
+
+### Final Answer:
+#### 4
+",387,387,46,True,True,,2,
+batch_3_start_10,all-hot,gsm8k-0014,14,60,60,True,False," 
+
+**Problem:**  
+In a dance class of 20 students, 20% enrolled in contemporary dance, 25% of the remaining enrolled in jazz dance, and the rest enrolled in hip-hop dance. What percentage of the entire students enrolled in hip-hop dance?
+
+**Step-by-step reasoning:**
+
+1. 20% of 20 students = 0.2 × 20 = 4 students enrolled in contemporary dance.
+2. 25% of the remaining 16 students = 0.25 × 16 = 4 students enrolled in jazz dance.
+3. The remaining students = 20 - 4 - 4 = 12 students.
+4. These 12 students enrolled in hip-hop dance.
+5. The percentage of students in hip-hop dance is:  
+   $ \frac{12}{20} \times 100 = 60\% $.
+
+#### 60
+",203,0,0,False,True,,2,
+batch_3_start_10,mixed,gsm8k-0014,14,60,60,True,False," 
+
+### Problem:
+In a dance class of 20 students, 20% enrolled in contemporary dance, 25% of the remaining enrolled in jazz dance, and the rest enrolled in hip-hop dance. What percentage of the entire students enrolled in hip-hop dance?
+
+### Step-by-step:
+1. **Contemporary dance**: 20% of 20 students = $ 0.20 \times 20 = 4 $ students.
+2. **Remaining students**: $ 20 - 4 = 16 $ students.
+3. **Jazz dance**: 25% of the remaining students = $ 0.25 \times 16 = 4 $ students.
+4. **Hip-hop dance**: $ 20 - 4 - 4 = 12 $ students.
+
+### Percentage of students in hip-hop dance:
+$$
+\frac{12}{20} \times 100 = 60\%
+$$
+
+#### Final Answer:
+#### 60
+",216,216,46,True,True,,2,
+batch_4_start_15,all-hot,gsm8k-0015,15,125,8096,False,False," 
+
+### Problem:
+A merchant wants to choose between two purchase plans:
+- **Jewelry**: $5,000
+- **Electronic gadgets**: $8,000
+
+The financial advisor predicts:
+- Jewelry market will rise by **2.5%**
+- Electronic gadgets market will rise by **1.2%**
+
+The merchant wants to **maximize profit** at the end of the month.
+
+### Step-by-step:
+1. **Jewelry**:  
+   If the market rises by 2.5%, the value of the jewelry will be:  
+   $ 5,000 \times 1.025 = 5,125 $
+
+2. **Electronic gadgets**:  
+   If the market rises by 1.2%, the value of the gadgets will be:  
+   $ 8,000 \times 1.012 = 8,096 $
+
+3. **Profit**:  
+   The merchant wants to choose the plan that gives the **maximum profit**.  
+   Since the value of the gadgets is higher, the merchant should choose the **gadget plan**.
+
+### Final Answer:
+#### 8,096
+",250,0,0,False,True,,2,
+batch_4_start_15,mixed,gsm8k-0015,15,125,125,True,False," 
+
+### Problem:
+A merchant wants to choose between two purchase plans:
+- **Jewelry**: $5,000
+- **Electronic gadgets**: $8,000
+
+The financial advisor predicts:
+- Jewelry market will rise by **2.5%**
+- Electronic gadgets market will rise by **1.2%**
+
+The merchant wants to **maximize profit** at the end of the month.
+
+### Step-by-step:
+1. **Jewelry**: 
+   - Price = $5,000
+   - Price increase = 2.5% of $5,000 = $125
+   - Total price = $5,000 + $125 = **$5,125**
+
+2. **Electronic gadgets**:
+   - Price = $8,000
+   - Price increase = 1.2% of $8,000 = $96
+   - Total price = $8,000 + $96 = **$8,096**
+
+3. **Profit**:
+   - Jewelry: $5,125 - $5,000 = **$125**
+   - Electronic gadgets: $8,096 - $8,000 = **$96**
+
+4. **Maximize profit**:
+   - The merchant should choose **jewelry**, as it gives the highest profit.
+
+### Final Answer:
+#### 125
+",312,312,49,True,True,,2,
+batch_4_start_15,all-hot,gsm8k-0016,16,230,230,True,False," 
+
+Answer:  
+Two trains leave San Rafael at the same time.  
+They travel westward for 80 miles each.  
+They travel northward for 150 miles each.  
+The distance covered by each train in the two days is:  
+<<80 + 150 = 230>>230.
+",73,0,0,False,True,,2,
+batch_4_start_15,mixed,gsm8k-0016,16,230,230,True,False," 
+
+Answer:  
+Two trains leave San Rafael at the same time.  
+They travel westward for 80 miles each.  
+They travel northward for 150 miles each.  
+The distance covered by each train in the two days is:  
+<<80 + 150 = 230>>230.
+",73,73,46,True,True,,2,
+batch_4_start_15,all-hot,gsm8k-0017,17,57500,1150,False,False," 
+
+### Step-by-step:
+
+- Jill earns $20 per hour as a teacher.
+- She earns $30 as a cheerleading coach.
+- She works 35 hours a week as a teacher.
+- She works 15 hours a week as a coach.
+- She works 50 weeks a year.
+
+#### Total earnings from teaching:
+$$ 35 \times 20 = 700 $$
+
+#### Total earnings from coaching:
+$$ 15 \times 30 = 450 $$
+
+#### Total annual salary:
+$$ 700 + 450 = 1150 $$
+
+#### Final answer:
+#### 1150
+",145,0,0,False,True,,2,
+batch_4_start_15,mixed,gsm8k-0017,17,57500,1150,False,False," 
+
+### Step-by-step:
+
+- Jill earns $20 per hour as a teacher.
+- She earns $30 as a cheerleading coach.
+- She works 35 hours a week as a teacher.
+- She works 15 hours a week as a coach.
+- She works 50 weeks a year.
+
+#### Total earnings from teaching:
+$$ 35 \times 20 = 700 $$
+
+#### Total earnings from coaching:
+$$ 15 \times 30 = 450 $$
+
+#### Total annual salary:
+$$ 700 + 450 = 1150 $$
+
+#### Final answer:
+#### 1150
+",145,145,46,True,True,,2,
+batch_4_start_15,all-hot,gsm8k-0018,18,7,84,False,False,"  
+
+Answer: Claire makes a 3-egg omelet every morning. In 4 weeks, she eats 3 eggs per omelet × 7 days per week × 4 weeks = <<3×7×4=84>>84 eggs.  
+#### 84
+",62,0,0,False,True,,2,
+batch_4_start_15,mixed,gsm8k-0018,18,7,84,False,False,"  
+
+Answer: Claire makes a 3-egg omelet every morning. In 4 weeks, she eats 3 eggs per omelet × 7 days per week × 4 weeks = <<3×7×4=84>>84 eggs.  
+#### 84
+",62,62,45,True,True,,2,
+batch_4_start_15,all-hot,gsm8k-0019,19,6,3,False,False," 
+
+Marissa walks 4 miles in 1 hour, and 2 miles in another hour. That means she walks a total of $ 4 + 2 = 6 $ miles in 2 hours. 
+
+She has a total of 12 miles to hike. So the remaining distance is $ 12 - 6 = 6 $ miles.
+
+To find her average speed for the remaining 6 miles, we divide the distance by the time: $ 6 \div 2 = 3 $ miles per hour.
+
+#### 3
+",114,0,0,False,True,,2,
+batch_4_start_15,mixed,gsm8k-0019,19,6,3,False,False," 
+
+Marissa walks 4 miles in 1 hour, and 2 miles in another hour. So she walks a total of $ 4 + 2 = 6 $ miles in 2 hours. 
+
+She wants her average speed to be 4 miles per hour. The remaining distance is $ 12 - 6 = 6 $ miles. 
+
+To find the speed needed for the remaining 6 miles, we divide the distance by the time:  
+$$
+\text{Speed} = \frac{6 \text{ miles}}{2 \text{ hours}} = 3 \text{ miles per hour}
+$$
+
+#### 3
+",136,136,47,True,True,,2,
