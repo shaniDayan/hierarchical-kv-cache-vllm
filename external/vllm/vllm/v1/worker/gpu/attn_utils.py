@@ -31,6 +31,9 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.worker.gpu.hkv_migration import (
+    is_hkv_multi_block_warm_migration_enabled,
+)
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import (
     AttentionGroup,
@@ -40,6 +43,167 @@ from vllm.v1.worker.utils import (
 )
 
 logger = init_logger(__name__)
+
+_HKV_TRUE_VALUES = {"1", "true", "yes", "on"}
+_HKV_TRITON_BACKEND_NAME = "TRITON_ATTN"
+
+
+def is_hkv_physical_tiers_enabled() -> bool:
+    return (
+        os.getenv("HKV_ENABLE_PHYSICAL_TIERS", "").strip().lower()
+        in _HKV_TRUE_VALUES
+    )
+
+
+def is_hkv_mixed_read_enabled() -> bool:
+    return (
+        os.getenv("HKV_DEBUG_MIXED_READ", "").strip().lower()
+        in _HKV_TRUE_VALUES
+    )
+
+
+def is_hkv_mixed_read_stats_enabled() -> bool:
+    """Debug-only per-request mixed-read counters. Off unless explicitly set."""
+    return (
+        os.getenv("HKV_DEBUG_MIXED_READ_STATS", "").strip().lower()
+        in _HKV_TRUE_VALUES
+    )
+
+
+def record_hkv_mixed_read_stats(
+    runner: Any,
+    active_req_ids: Sequence[str],
+) -> None:
+    """Record WARM slot-table occupancy for the current attention batch.
+
+    Read-only: does not change scheduling, residency, or the slot table.
+    Enabled only when HKV_DEBUG_MIXED_READ_STATS is set.
+    """
+    if not is_hkv_mixed_read_stats_enabled():
+        return
+
+    stats = getattr(runner, "hkv_mixed_read_stats", None)
+    if stats is None:
+        stats = {}
+        runner.hkv_mixed_read_stats = stats
+
+    counts: dict[str, int] = {}
+    manager = getattr(runner, "hkv_warm_migration_manager", None)
+    residency = getattr(manager, "warm_residency", None) if manager else None
+    if residency:
+        for key in residency:
+            request_id = key[0]
+            counts[request_id] = counts.get(request_id, 0) + 1
+
+    for request_id in active_req_ids:
+        warm_blocks = counts.get(request_id, 0)
+        entry = stats.get(request_id)
+        if entry is None:
+            entry = {
+                "mixed_read_steps": 0,
+                "attention_had_warm_slots": False,
+                "warm_logical_blocks_observed": 0,
+            }
+            stats[request_id] = entry
+        if warm_blocks <= 0:
+            continue
+        entry["mixed_read_steps"] += 1
+        entry["attention_had_warm_slots"] = True
+        if warm_blocks > entry["warm_logical_blocks_observed"]:
+            entry["warm_logical_blocks_observed"] = warm_blocks
+
+
+def _hkv_backend_name(backend: Any) -> str:
+    get_name = getattr(backend, "get_name", None)
+    if get_name is None:
+        return type(backend).__name__
+    name = get_name()
+    if isinstance(name, str):
+        return name
+    # Attention backends currently return a string from get_name().
+    # Never compare the AttentionBackendEnum value/path to "TRITON_ATTN".
+    return str(name)
+
+
+def validate_hkv_physical_configuration(
+    *,
+    kv_cache_config: KVCacheConfig,
+    attn_groups: list[list[AttentionGroup]],
+    vllm_config: VllmConfig,
+    hot_kv_dtype: torch.dtype | None,
+    blocks_per_kv_block: list[int] | None,
+) -> int | None:
+    """Validate the currently supported physical HOT/WARM configuration."""
+    if not is_hkv_physical_tiers_enabled():
+        return None
+
+    violations: list[str] = []
+    if not vllm_config.use_v2_model_runner:
+        violations.append("v2_model_runner=False (expected True)")
+
+    if not is_hkv_mixed_read_enabled():
+        violations.append("mixed_hot_warm_read=False (expected True)")
+
+    multi_block_enabled = is_hkv_multi_block_warm_migration_enabled()
+    if not multi_block_enabled:
+        violations.append("multi_block_warm_migration=False (expected True)")
+
+    backend_names = sorted(
+        {
+            _hkv_backend_name(group.backend)
+            for groups in attn_groups
+            for group in groups
+        }
+    )
+    if backend_names != [_HKV_TRITON_BACKEND_NAME]:
+        violations.append(
+            f"attention_backends={backend_names!r} "
+            f"(expected [{_HKV_TRITON_BACKEND_NAME!r}])"
+        )
+
+    if hot_kv_dtype != torch.float16:
+        violations.append(
+            f"hot_kv_dtype={hot_kv_dtype!r} (expected {torch.float16!r})"
+        )
+
+    parallel_config = vllm_config.parallel_config
+    topology = (
+        ("tensor_parallel_size", parallel_config.tensor_parallel_size),
+        ("pipeline_parallel_size", parallel_config.pipeline_parallel_size),
+        ("data_parallel_size", parallel_config.data_parallel_size),
+    )
+    for field_name, actual in topology:
+        if actual != 1:
+            violations.append(f"{field_name}={actual!r} (expected 1)")
+
+    num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+    if num_kv_cache_groups != 1:
+        violations.append(
+            f"num_kv_cache_groups={num_kv_cache_groups} (expected 1)"
+        )
+
+    if blocks_per_kv_block != [1]:
+        violations.append(
+            f"blocks_per_kv_block={blocks_per_kv_block!r} (expected [1])"
+        )
+
+    warm_pool_blocks_str = os.getenv("HKV_WARM_POOL_BLOCKS", "0")
+    try:
+        warm_pool_blocks = int(warm_pool_blocks_str)
+    except ValueError:
+        warm_pool_blocks = None
+    if warm_pool_blocks is None or warm_pool_blocks <= 0:
+        violations.append(
+            f"warm_pool_blocks={warm_pool_blocks_str!r} "
+            "(expected a positive integer)"
+        )
+
+    if violations:
+        raise ValueError(
+            "Unsupported physical HOT/WARM HKV configuration: "
+            + "; ".join(violations)
+        )
+    return warm_pool_blocks
 
 
 @dataclass(frozen=True)
@@ -85,27 +249,19 @@ def initialize_hkv_warm_kv_caches(
     device: torch.device,
     vllm_config: VllmConfig,
     runner_only_attn_layers: set[str] | None = None,
+    hot_kv_dtype: torch.dtype | None = None,
+    blocks_per_kv_block: list[int] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Allocate the experimental, allocation-only physical WARM KV tier."""
-    enabled = os.getenv("HKV_ENABLE_PHYSICAL_TIERS", "").strip().lower()
-    if enabled not in {"1", "true", "yes", "on"}:
+    warm_pool_blocks = validate_hkv_physical_configuration(
+        kv_cache_config=kv_cache_config,
+        attn_groups=attn_groups,
+        vllm_config=vllm_config,
+        hot_kv_dtype=hot_kv_dtype,
+        blocks_per_kv_block=blocks_per_kv_block,
+    )
+    if warm_pool_blocks is None:
         return {}
-
-    warm_pool_blocks_str = os.getenv("HKV_WARM_POOL_BLOCKS", "0")
-    try:
-        warm_pool_blocks = int(warm_pool_blocks_str)
-    except ValueError as exc:
-        raise ValueError(
-            "HKV_WARM_POOL_BLOCKS must be an integer greater than zero "
-            "when HKV_ENABLE_PHYSICAL_TIERS is enabled; got "
-            f"{warm_pool_blocks_str!r}"
-        ) from exc
-    if warm_pool_blocks <= 0:
-        raise ValueError(
-            "HKV_WARM_POOL_BLOCKS must be greater than zero when "
-            "HKV_ENABLE_PHYSICAL_TIERS is enabled; got "
-            f"{warm_pool_blocks}"
-        )
 
     runner_only_attn_layers = runner_only_attn_layers or set()
     shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
@@ -336,6 +492,91 @@ def _get_hkv_per_token_head_scale_views(
     return k_scale_cache, v_scale_cache, head_size
 
 
+def quantize_hkv_blocks_to_warm(
+    *,
+    hot_kv_caches: dict[str, torch.Tensor],
+    warm_kv_caches: dict[str, torch.Tensor],
+    hot_block_ids: Sequence[int],
+    warm_slot_ids: Sequence[int],
+    device: torch.device,
+    hot_to_warm_maps: dict[str, torch.Tensor] | None = None,
+) -> None:
+    """Quantize HOT blocks into WARM slots."""
+    if len(hot_block_ids) != len(warm_slot_ids):
+        raise ValueError("HOT block and WARM slot counts must match")
+    if not hot_block_ids:
+        return
+    if len(set(warm_slot_ids)) != len(warm_slot_ids):
+        raise ValueError("WARM slot IDs must be unique")
+
+    layer_names = hot_kv_caches.keys() & warm_kv_caches.keys()
+    if not layer_names:
+        raise ValueError("No matching HOT and WARM cache layers available")
+
+    operations = []
+    processed_pairs: set[tuple[int, int]] = set()
+    block_size = None
+    for layer_name in layer_names:
+        hot_cache = hot_kv_caches[layer_name]
+        warm_cache = warm_kv_caches[layer_name]
+        k_scales, v_scales, head_size = _get_hkv_per_token_head_scale_views(
+            warm_cache
+        )
+        if (
+            hot_cache.shape[1] != 2
+            or hot_cache.shape[2] != warm_cache.shape[2]
+            or hot_cache.shape[3] != warm_cache.shape[3]
+            or hot_cache.shape[4] != head_size
+        ):
+            raise ValueError("Incompatible HOT/WARM KV-cache layouts")
+        if max(hot_block_ids) >= hot_cache.shape[0] or max(warm_slot_ids) >= (
+            warm_cache.shape[0]
+        ):
+            raise ValueError("HOT block or WARM slot is out of range")
+
+        pair = (
+            hot_cache.untyped_storage().data_ptr(),
+            warm_cache.untyped_storage().data_ptr(),
+        )
+        if pair not in processed_pairs:
+            processed_pairs.add(pair)
+            warm_key, warm_value = warm_cache.unbind(1)
+            operations.append((hot_cache, warm_key, warm_value, k_scales, v_scales))
+        block_size = warm_cache.shape[2]
+
+    assert block_size is not None
+    hot_ids = torch.tensor(hot_block_ids, dtype=torch.int64, device=device)
+    warm_ids = torch.tensor(warm_slot_ids, dtype=torch.int64, device=device)
+    offsets = torch.arange(block_size, dtype=torch.int64, device=device)
+    destination_slots = (warm_ids[:, None] * block_size + offsets).reshape(-1)
+
+    for hot_cache, warm_key, warm_value, k_scales, v_scales in operations:
+        hot_blocks = hot_cache.index_select(0, hot_ids)
+        hot_key = hot_blocks[:, 0].reshape(
+            -1, hot_blocks.shape[3], hot_blocks.shape[4]
+        )
+        hot_value = hot_blocks[:, 1].reshape(
+            -1, hot_blocks.shape[3], hot_blocks.shape[4]
+        )
+        triton_reshape_and_cache_flash_per_token_head_quant(
+            hot_key,
+            hot_value,
+            warm_key,
+            warm_value,
+            k_scales,
+            v_scales,
+            destination_slots,
+        )
+
+    if hot_to_warm_maps:
+        maps: dict[int, torch.Tensor] = {}
+        for layer_name in layer_names & hot_to_warm_maps.keys():
+            m = hot_to_warm_maps[layer_name]
+            maps[m.untyped_storage().data_ptr()] = m
+        for hot_to_warm_map in maps.values():
+            hot_to_warm_map[hot_ids] = warm_ids.to(torch.int32)
+
+
 def debug_demote_one_hkv_block(
     hot_kv_caches: dict[str, torch.Tensor],
     warm_kv_caches: dict[str, torch.Tensor],
@@ -406,209 +647,17 @@ def debug_demote_one_hkv_block(
     if source_block_id is None:
         return False
 
-    warm_block_id = 0
-    destination_slots = warm_block_id * block_size + torch.arange(
-        block_size, dtype=torch.int64, device=device
+    quantize_hkv_blocks_to_warm(
+        hot_kv_caches=hot_kv_caches,
+        warm_kv_caches=warm_kv_caches,
+        hot_to_warm_maps=hot_to_warm_maps,
+        hot_block_ids=(source_block_id,),
+        warm_slot_ids=(0,),
+        device=device,
     )
-    processed_cache_pairs: set[tuple[int, int]] = set()
-    processed_layers = 0
-    k_max_error = 0.0
-    v_max_error = 0.0
-    k_total_absolute_error = 0.0
-    v_total_absolute_error = 0.0
-    k_total_element_count = 0
-    v_total_element_count = 0
-    nonzero_int8_values = 0
-    min_scale = float("inf")
-    max_scale = float("-inf")
-
-    for layer_name in hot_kv_caches.keys() & warm_kv_caches.keys():
-        hot_cache = hot_kv_caches[layer_name]
-        warm_cache = warm_kv_caches[layer_name]
-        if not isinstance(hot_cache, torch.Tensor) or not isinstance(
-            warm_cache, torch.Tensor
-        ):
-            continue
-
-        cache_pair = (
-            hot_cache.untyped_storage().data_ptr(),
-            warm_cache.untyped_storage().data_ptr(),
-        )
-        if cache_pair in processed_cache_pairs:
-            continue
-        processed_cache_pairs.add(cache_pair)
-
-        if hot_cache.ndim != 5 or hot_cache.shape[1] != 2:
-            raise ValueError(
-                f"HOT KV cache for {layer_name!r} must be five-dimensional"
-            )
-        if warm_cache.ndim != 5 or warm_cache.shape[1] != 2:
-            raise ValueError(
-                f"WARM KV cache for {layer_name!r} must be five-dimensional"
-            )
-        if not hot_cache.is_floating_point():
-            raise ValueError(
-                f"HOT KV cache for {layer_name!r} must be floating point"
-            )
-        if hot_cache.stride(-1) != 1:
-            raise ValueError(
-                f"HOT KV cache for {layer_name!r} must have contiguous heads"
-            )
-        if source_block_id >= hot_cache.shape[0]:
-            raise ValueError(
-                f"HOT block {source_block_id} is unavailable for {layer_name!r}"
-            )
-        if warm_cache.shape[0] <= warm_block_id:
-            raise ValueError(f"WARM KV cache for {layer_name!r} has no block zero")
-
-        warm_k_scale_cache, warm_v_scale_cache, head_size = (
-            _get_hkv_per_token_head_scale_views(warm_cache)
-        )
-        if (
-            hot_cache.shape[2] != block_size
-            or warm_cache.shape[2] != block_size
-            or hot_cache.shape[3] != warm_cache.shape[3]
-            or hot_cache.shape[4] != head_size
-        ):
-            raise ValueError(
-                f"Incompatible HOT/WARM KV-cache layouts for {layer_name!r}"
-            )
-        if hot_cache.device != device or warm_cache.device != device:
-            raise ValueError(
-                f"HOT/WARM KV caches for {layer_name!r} must be on {device}"
-            )
-        if cache_pair[0] == cache_pair[1]:
-            raise ValueError("HOT and WARM KV caches must not share storage")
-
-        hot_key = hot_cache[source_block_id, 0]
-        hot_value = hot_cache[source_block_id, 1]
-        warm_key_cache, warm_value_cache = warm_cache.unbind(1)
-        triton_reshape_and_cache_flash_per_token_head_quant(
-            hot_key,
-            hot_value,
-            warm_key_cache,
-            warm_value_cache,
-            warm_k_scale_cache,
-            warm_v_scale_cache,
-            destination_slots,
-        )
-
-        reconstructed_key = (
-            warm_key_cache[warm_block_id, :, :, :head_size].float()
-            * warm_k_scale_cache[warm_block_id].unsqueeze(-1)
-        )
-        reconstructed_value = (
-            warm_value_cache[warm_block_id, :, :, :head_size].float()
-            * warm_v_scale_cache[warm_block_id].unsqueeze(-1)
-        )
-        k_absolute_error = (reconstructed_key - hot_key.float()).abs()
-        v_absolute_error = (reconstructed_value - hot_value.float()).abs()
-
-        k_max_error = max(k_max_error, k_absolute_error.max().item())
-        v_max_error = max(v_max_error, v_absolute_error.max().item())
-        k_total_absolute_error += k_absolute_error.sum(dtype=torch.float64).item()
-        v_total_absolute_error += v_absolute_error.sum(dtype=torch.float64).item()
-        k_total_element_count += k_absolute_error.numel()
-        v_total_element_count += v_absolute_error.numel()
-        nonzero_int8_values += int(
-            torch.count_nonzero(
-                warm_key_cache[warm_block_id, :, :, :head_size]
-            ).item()
-        )
-        nonzero_int8_values += int(
-            torch.count_nonzero(
-                warm_value_cache[warm_block_id, :, :, :head_size]
-            ).item()
-        )
-        min_scale = min(
-            min_scale,
-            warm_k_scale_cache[warm_block_id].min().item(),
-            warm_v_scale_cache[warm_block_id].min().item(),
-        )
-        max_scale = max(
-            max_scale,
-            warm_k_scale_cache[warm_block_id].max().item(),
-            warm_v_scale_cache[warm_block_id].max().item(),
-        )
-        processed_layers += 1
-
-    if processed_layers == 0:
-        return False
-
-    relevant_map_entries: list[torch.Tensor] = []
-    unique_maps_to_update: dict[int, torch.Tensor] = {}
-    for layer_name in (
-        hot_kv_caches.keys()
-        & warm_kv_caches.keys()
-        & hot_to_warm_maps.keys()
-    ):
-        hot_cache = hot_kv_caches[layer_name]
-        warm_cache = warm_kv_caches[layer_name]
-        hot_to_warm_map = hot_to_warm_maps[layer_name]
-        if not isinstance(hot_cache, torch.Tensor) or not isinstance(
-            warm_cache, torch.Tensor
-        ):
-            continue
-        cache_pair = (
-            hot_cache.untyped_storage().data_ptr(),
-            warm_cache.untyped_storage().data_ptr(),
-        )
-        if cache_pair not in processed_cache_pairs:
-            continue
-        if not isinstance(hot_to_warm_map, torch.Tensor):
-            raise ValueError(
-                f"HOT-to-WARM map for {layer_name!r} must be a tensor"
-            )
-        if (
-            not hot_to_warm_map.is_cuda
-            or hot_to_warm_map.device != device
-            or hot_to_warm_map.dtype != torch.int32
-            or hot_to_warm_map.ndim != 1
-        ):
-            raise ValueError(
-                f"Invalid HOT-to-WARM map layout for {layer_name!r}"
-            )
-        if source_block_id >= hot_to_warm_map.shape[0]:
-            raise ValueError(
-                f"HOT block {source_block_id} is outside the map for "
-                f"{layer_name!r}"
-            )
-        previous_warm_block = hot_to_warm_map[source_block_id].item()
-        if previous_warm_block not in (-1, warm_block_id):
-            raise ValueError(
-                f"HOT block {source_block_id} for {layer_name!r} is already "
-                f"mapped to WARM block {previous_warm_block}"
-            )
-
-        relevant_map_entries.append(hot_to_warm_map)
-        map_storage_ptr = hot_to_warm_map.untyped_storage().data_ptr()
-        unique_maps_to_update[map_storage_ptr] = hot_to_warm_map
-
-    if not relevant_map_entries:
-        return False
-
-    # Commit map state only after every cache and map has been validated.
-    for hot_to_warm_map in unique_maps_to_update.values():
-        hot_to_warm_map[source_block_id] = warm_block_id
-
     logger.info(
-        "HKV debug demotion completed: HOT block %d -> WARM block %d, "
-        "layers=%d, map entries=%d, unique maps=%d, "
-        "K max error=%.6g, K mean error=%.6g, "
-        "V max error=%.6g, V mean error=%.6g, "
-        "nonzero int8 values=%d, scale range=[%.6g, %.6g]",
+        "HKV debug demotion completed: HOT block %d -> WARM block 0",
         source_block_id,
-        warm_block_id,
-        processed_layers,
-        len(relevant_map_entries),
-        len(unique_maps_to_update),
-        k_max_error,
-        k_total_absolute_error / k_total_element_count,
-        v_max_error,
-        v_total_absolute_error / v_total_element_count,
-        nonzero_int8_values,
-        min_scale,
-        max_scale,
     )
     return True
 

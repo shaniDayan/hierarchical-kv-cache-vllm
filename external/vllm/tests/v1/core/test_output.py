@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 
 
 def _create_new_requests_data(prompt_embeds: torch.Tensor | None) -> NewRequestData:
@@ -34,3 +34,9 @@ def test_repr_with_multi_element_tensor() -> None:
 
     assert "prompt_embeds_shape=torch.Size([10, 768])" in repr(new_requests_data)
     assert "prompt_embeds_shape=torch.Size([10, 768])" in new_requests_data.anon_repr()
+
+
+def test_scheduler_output_make_empty_has_no_kv_cache_state_transitions() -> None:
+    output = SchedulerOutput.make_empty()
+
+    assert output.kv_cache_state_transitions == []

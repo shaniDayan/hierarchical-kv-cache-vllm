@@ -16,6 +16,11 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
+from vllm.v1.kv_cache_state import (
+    KVBlockState,
+    KVCacheBlockTransition,
+    KVCacheStateTransition,
+)
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
@@ -154,6 +159,9 @@ class KVCacheManager:
             metrics_collector=self.metrics_collector,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+        self.block_sizes = tuple(
+            manager.block_size for manager in self.coordinator.single_type_managers
+        )
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
 
@@ -580,6 +588,158 @@ class KVCacheManager:
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
         """Get the blocks of a request."""
         return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))
+
+    def plan_request_kv_state(
+        self,
+        request_id: str,
+        state: KVBlockState,
+        *,
+        num_computed_tokens: int | None = None,
+    ) -> tuple[list[KVCacheBlockTransition], ...]:
+        """Plan a request-level state transition without mutating metadata.
+
+        Shared blocks are kept HOT but excluded from the returned request-level
+        transition payload. When a computed-token boundary is supplied,
+        demotion applies only to complete blocks.
+        """
+        if num_computed_tokens is not None and num_computed_tokens < 0:
+            raise ValueError("num_computed_tokens must be non-negative")
+
+        changed_blocks: list[list[KVCacheBlockTransition]] = []
+        request_blocks = self.get_blocks(request_id).blocks
+        for group, block_size in zip(request_blocks, self.block_sizes, strict=True):
+            changed_group: list[KVCacheBlockTransition] = []
+            num_complete_blocks = (
+                num_computed_tokens // block_size
+                if num_computed_tokens is not None
+                else None
+            )
+            for block_index, block in enumerate(group):
+                if block.is_null or block.ref_cnt == 0:
+                    continue
+
+                if block.ref_cnt > 1:
+                    continue
+
+                if (
+                    state is not KVBlockState.HOT
+                    and num_complete_blocks is not None
+                    and block_index >= num_complete_blocks
+                ):
+                    continue
+
+                if block.hierarchy_state is state:
+                    continue
+
+                changed_group.append(
+                    KVCacheBlockTransition(
+                        logical_block_index=block_index,
+                        source_hot_block_id=block.block_id,
+                    )
+                )
+            changed_blocks.append(changed_group)
+
+        return tuple(changed_blocks)
+
+    def commit_request_kv_transition(
+        self,
+        transition: KVCacheStateTransition,
+    ) -> None:
+        """Commit exact planned blocks to target hierarchy state on SUCCESS."""
+        request_blocks = self.get_blocks(transition.request_id).blocks
+        if len(transition.changed_blocks) > len(request_blocks):
+            raise ValueError(
+                f"Transition has {len(transition.changed_blocks)} groups but "
+                f"request {transition.request_id} has {len(request_blocks)} groups"
+            )
+
+        validated_reclaims: list[tuple[int, int, KVCacheBlock]] = []
+        for group_idx, group_transitions in enumerate(transition.changed_blocks):
+            if group_idx >= len(request_blocks):
+                raise ValueError(
+                    f"Cache group index {group_idx} out of range during "
+                    f"commit for request {transition.request_id}"
+                )
+            current_group = request_blocks[group_idx]
+            for block_trans in group_transitions:
+                logical_idx = block_trans.logical_block_index
+                expected_hot_id = block_trans.source_hot_block_id
+                if logical_idx >= len(current_group):
+                    raise ValueError(
+                        f"Logical block index {logical_idx} out of range "
+                        f"during commit for request {transition.request_id}"
+                    )
+                block = current_group[logical_idx]
+                if block.is_null:
+                    raise ValueError(
+                        f"Logical block index {logical_idx} is already a null block "
+                        f"during commit for request {transition.request_id}"
+                    )
+                if block.block_id != expected_hot_id:
+                    raise ValueError(
+                        f"Physical block ID mismatch during commit for "
+                        f"request {transition.request_id} group {group_idx} "
+                        f"logical block {logical_idx}: expected block_id "
+                        f"{expected_hot_id}, found {block.block_id}"
+                    )
+                if block.ref_cnt != 1:
+                    raise ValueError(
+                        f"Cannot reclaim shared or unreferenced block during commit "
+                        f"for request {transition.request_id} group {group_idx} "
+                        f"logical block {logical_idx}: ref_cnt={block.ref_cnt}"
+                    )
+                validated_reclaims.append((group_idx, logical_idx, block))
+
+        freed_blocks: list[KVCacheBlock] = []
+        null_block = self.block_pool.null_block
+
+        for group_idx, logical_idx, block in validated_reclaims:
+            if transition.new_state is KVBlockState.WARM:
+                if self.enable_caching and block.block_hash is not None:
+                    self.block_pool._maybe_evict_cached_block(block)
+                current_group = request_blocks[group_idx]
+                current_group[logical_idx] = null_block
+                freed_blocks.append(block)
+            else:
+                block.hierarchy_state = transition.new_state
+
+        if freed_blocks:
+            self.block_pool.free_blocks(reversed(freed_blocks))
+
+    def apply_request_kv_state(
+        self,
+        request_id: str,
+        state: KVBlockState,
+        *,
+        num_computed_tokens: int | None = None,
+    ) -> tuple[list[KVCacheBlockTransition], ...]:
+        """Apply a request-level state and return changed private blocks."""
+        planned = self.plan_request_kv_state(
+            request_id,
+            state,
+            num_computed_tokens=num_computed_tokens,
+        )
+        request_blocks = self.get_blocks(request_id).blocks
+        for group, block_size in zip(request_blocks, self.block_sizes, strict=True):
+            num_complete_blocks = (
+                num_computed_tokens // block_size
+                if num_computed_tokens is not None
+                else None
+            )
+            for block_index, block in enumerate(group):
+                if block.ref_cnt > 1:
+                    block.hierarchy_state = KVBlockState.HOT
+                elif (
+                    state is not KVBlockState.HOT
+                    and num_complete_blocks is not None
+                    and block_index >= num_complete_blocks
+                ):
+                    block.hierarchy_state = KVBlockState.HOT
+        for group_idx, group in enumerate(request_blocks):
+            if group_idx < len(planned):
+                for block_trans in planned[group_idx]:
+                    group[block_trans.logical_block_index].hierarchy_state = state
+        return planned
 
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
         """Get the block ids of a request."""

@@ -608,6 +608,19 @@ class EngineArgs:
 
     watermark: float = SchedulerConfig.watermark
 
+    kv_cache_hot_idle_threshold_seconds: float | None = (
+        SchedulerConfig.kv_cache_hot_idle_threshold_seconds
+    )
+    kv_cache_cold_idle_threshold_seconds: float | None = (
+        SchedulerConfig.kv_cache_cold_idle_threshold_seconds
+    )
+    kv_cache_demotion_start_utilization: float | None = (
+        SchedulerConfig.kv_cache_demotion_start_utilization
+    )
+    kv_cache_demotion_stop_utilization: float | None = (
+        SchedulerConfig.kv_cache_demotion_stop_utilization
+    )
+
     disable_hybrid_kv_cache_manager: bool | None = (
         SchedulerConfig.disable_hybrid_kv_cache_manager
     )
@@ -1438,6 +1451,22 @@ class EngineArgs:
         )
         scheduler_group.add_argument("--watermark", **scheduler_kwargs["watermark"])
         scheduler_group.add_argument(
+            "--kv-cache-hot-idle-threshold-seconds",
+            **scheduler_kwargs["kv_cache_hot_idle_threshold_seconds"],
+        )
+        scheduler_group.add_argument(
+            "--kv-cache-cold-idle-threshold-seconds",
+            **scheduler_kwargs["kv_cache_cold_idle_threshold_seconds"],
+        )
+        scheduler_group.add_argument(
+            "--kv-cache-demotion-start-utilization",
+            **scheduler_kwargs["kv_cache_demotion_start_utilization"],
+        )
+        scheduler_group.add_argument(
+            "--kv-cache-demotion-stop-utilization",
+            **scheduler_kwargs["kv_cache_demotion_stop_utilization"],
+        )
+        scheduler_group.add_argument(
             "--prefill-schedule-interval",
             **scheduler_kwargs["prefill_schedule_interval"],
         )
@@ -2130,6 +2159,18 @@ class EngineArgs:
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
+            kv_cache_hot_idle_threshold_seconds=(
+                self.kv_cache_hot_idle_threshold_seconds
+            ),
+            kv_cache_cold_idle_threshold_seconds=(
+                self.kv_cache_cold_idle_threshold_seconds
+            ),
+            kv_cache_demotion_start_utilization=(
+                self.kv_cache_demotion_start_utilization
+            ),
+            kv_cache_demotion_stop_utilization=(
+                self.kv_cache_demotion_stop_utilization
+            ),
             prefill_schedule_interval=self.prefill_schedule_interval,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,

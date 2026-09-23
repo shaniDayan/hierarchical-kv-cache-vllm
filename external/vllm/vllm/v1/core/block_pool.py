@@ -625,8 +625,10 @@ class BlockPool:
         blocks_with_hash = []
         blocks_without_hash = []
         for block in ordered_blocks:
+            if block.is_null:
+                continue
             block.ref_cnt -= 1
-            if block.ref_cnt == 0 and not block.is_null:
+            if block.ref_cnt == 0:
                 if block.block_hash is None:
                     blocks_without_hash.append(block)
                 else:

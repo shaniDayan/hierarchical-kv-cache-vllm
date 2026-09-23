@@ -61,12 +61,20 @@ from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_state import (
+    KVBlockState,
+    KVCacheBlockTransition,
+    KVCacheStateTransition,
+)
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     DraftTokenIds,
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.gpu.hkv_migration import (
+    is_hkv_multi_block_warm_migration_enabled,
+)
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -832,6 +840,55 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
+    def _handle_kv_cache_state_transitions(
+        self,
+        transitions: list[KVCacheStateTransition],
+    ) -> None:
+        """Validate logical KV-state work before physical migration exists."""
+        supported_transitions = {
+            (KVBlockState.HOT, KVBlockState.WARM),
+            (KVBlockState.WARM, KVBlockState.COLD),
+            (KVBlockState.HOT, KVBlockState.COLD),
+        }
+        for transition in transitions:
+            state_change = (transition.previous_state, transition.new_state)
+            if state_change not in supported_transitions:
+                raise ValueError(
+                    "Unsupported KV-cache state transition: "
+                    f"{transition.previous_state.value}->"
+                    f"{transition.new_state.value}"
+                )
+            for group in transition.changed_blocks:
+                for block in group:
+                    if not isinstance(block, KVCacheBlockTransition):
+                        raise TypeError(
+                            "KV-cache transition groups must contain "
+                            "KVCacheBlockTransition values"
+                        )
+                    for name, value in (
+                        ("logical block index", block.logical_block_index),
+                        ("source HOT block ID", block.source_hot_block_id),
+                    ):
+                        if (
+                            not isinstance(value, int)
+                            or isinstance(value, bool)
+                            or value < 0
+                        ):
+                            raise ValueError(
+                                f"KV-cache transition {name} must be a "
+                                f"non-negative integer; got {value!r}"
+                            )
+
+        if not is_hkv_multi_block_warm_migration_enabled():
+            logger.debug("Validated %d KV-cache state transitions", len(transitions))
+            return
+        if not self.use_v2_model_runner:
+            raise ValueError(
+                "Experimental multi-block WARM migration supports only "
+                "the V2 model runner; legacy/MRV1 is not supported"
+            )
+        self.model_runner.handle_kv_cache_state_transitions(transitions)
+
     @torch.inference_mode()
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
@@ -841,6 +898,11 @@ class Worker(WorkerBase):
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
+
+        if scheduler_output.kv_cache_state_transitions:
+            self._handle_kv_cache_state_transitions(
+                scheduler_output.kv_cache_state_transitions
+            )
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0

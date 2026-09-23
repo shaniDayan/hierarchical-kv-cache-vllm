@@ -20,7 +20,7 @@ instead of embedding feature-specific logic directly.
 import functools
 import gc
 import time
-from copy import deepcopy
+from copy import copy, deepcopy
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -49,7 +49,17 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.kv_cache_state import (
+    KVBlockState,
+    KVCacheStateTransition,
+    KVCacheTransitionResult,
+    KVCacheTransitionStatus,
+)
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    DraftTokenIds,
+    ModelRunnerOutput,
+)
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
@@ -61,6 +71,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_kv_cache,
     initialize_hkv_hot_to_warm_maps,
     initialize_hkv_warm_kv_caches,
+    record_hkv_mixed_read_stats,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import (
@@ -75,6 +86,12 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
+from vllm.v1.worker.gpu.hkv_migration import (
+    HKVWarmCapacityError,
+    HKVWarmMigrationManager,
+    HKVWarmStaleValidationError,
+    is_hkv_multi_block_warm_migration_enabled,
+)
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
@@ -149,7 +166,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.hkv_hot_kv_caches: dict[str, torch.Tensor] = {}
         self.hkv_warm_kv_caches: dict[str, torch.Tensor] = {}
         self.hkv_hot_to_warm_maps: dict[str, torch.Tensor] = {}
+        self.hkv_warm_slot_table: torch.Tensor | None = None
+        self.hkv_warm_migration_manager: HKVWarmMigrationManager | None = None
+        self._hkv_warm_slot_table_req_ids: tuple[str, ...] | None = None
+        self._hkv_warm_slot_table_revision = -1
+        self._hkv_warm_slot_table_num_reqs_after_padding = -1
         self._hkv_debug_demote_done = False
+        self._pending_kv_transition_results: list[KVCacheTransitionResult] = []
 
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
@@ -507,6 +530,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kernel_block_sizes=self.kernel_block_sizes,
             device=self.device,
             vllm_config=self.vllm_config,
+            hot_kv_dtype=self.kv_cache_dtype,
+            blocks_per_kv_block=self.block_tables.blocks_per_kv_block,
         )
         self.hkv_hot_to_warm_maps = initialize_hkv_hot_to_warm_maps(
             hot_kv_caches=self.hkv_hot_kv_caches,
@@ -520,7 +545,172 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.vllm_config.compilation_config.static_forward_context
             ),
         )
+        if is_hkv_multi_block_warm_migration_enabled():
+            if not self.hkv_warm_kv_caches:
+                raise ValueError(
+                    "Multi-block WARM migration requires an allocated physical "
+                    "WARM pool"
+                )
+            if len(self.kv_cache_config.kv_cache_groups) != 1:
+                raise ValueError(
+                    "Experimental multi-block WARM migration currently supports "
+                    "exactly one KV-cache group"
+                )
+            if self.block_tables.blocks_per_kv_block != [1]:
+                raise ValueError(
+                    "Experimental multi-block WARM migration requires "
+                    "blocks_per_kv_block == 1"
+                )
+            self.hkv_warm_slot_table = torch.full_like(
+                self.block_tables.input_block_tables[0], -1
+            )
+            for layer_name in self.hkv_warm_kv_caches:
+                self.compilation_config.static_forward_context[
+                    layer_name
+                ]._hkv_warm_slot_table = self.hkv_warm_slot_table
+            warm_capacity = next(iter(self.hkv_warm_kv_caches.values())).shape[0]
+            self.hkv_warm_migration_manager = HKVWarmMigrationManager(
+                warm_capacity=warm_capacity,
+                hot_kv_caches=self.hkv_hot_kv_caches,
+                warm_kv_caches=self.hkv_warm_kv_caches,
+                device=self.device,
+            )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+
+    def _take_kv_transition_results(self) -> list[KVCacheTransitionResult]:
+        results = self._pending_kv_transition_results
+        self._pending_kv_transition_results = []
+        return results
+
+    def _attach_kv_transition_results(
+        self, output: ModelRunnerOutput | None
+    ) -> ModelRunnerOutput:
+        results = self._take_kv_transition_results()
+        if output is None or output is EMPTY_MODEL_RUNNER_OUTPUT or results:
+            out = (
+                copy(output)
+                if output is not None
+                else ModelRunnerOutput([], {})
+            )
+            out.kv_cache_transition_results = results
+            return out
+        return output
+
+    def handle_kv_cache_state_transitions(
+        self, transitions: list[KVCacheStateTransition]
+    ) -> list[KVCacheTransitionResult]:
+        """Physically shadow-migrate logical transitions into WARM storage."""
+        if not transitions:
+            return []
+
+        if (
+            self.parallel_config.tensor_parallel_size > 1
+            or self.parallel_config.pipeline_parallel_size > 1
+            or self.dp_size > 1
+        ):
+            raise NotImplementedError(
+                "Hierarchical KV cache WARM migration completion proof is currently "
+                "supported only in single-rank (TP=1, PP=1, DP=1) configuration."
+            )
+
+        if self.hkv_warm_migration_manager is None:
+            raise ValueError(
+                "Multi-block WARM migration manager is not initialized"
+            )
+        if self.block_tables.blocks_per_kv_block != [1]:
+            raise ValueError(
+                "Physical migration requires blocks_per_kv_block == 1"
+            )
+
+        indexed_results: list[KVCacheTransitionResult | None] = [
+            None
+        ] * len(transitions)
+        needs_cuda_sync = False
+        successful_indices: list[int] = []
+
+        for transition_idx, transition in enumerate(transitions):
+            if (
+                transition.previous_state is not KVBlockState.HOT
+                or transition.new_state is not KVBlockState.WARM
+            ):
+                raise ValueError(
+                    "Physical migration currently supports only HOT->WARM; "
+                    f"got {transition.previous_state.value}->"
+                    f"{transition.new_state.value}"
+                )
+            if len(transition.changed_blocks) != 1:
+                raise ValueError(
+                    "Physical migration currently supports exactly one "
+                    "KV-cache group"
+                )
+            req_index = self.req_states.req_id_to_index.get(transition.request_id)
+            if req_index is None:
+                indexed_results[transition_idx] = transition.to_result(
+                    KVCacheTransitionStatus.STALE_VALIDATION,
+                    f"Request {transition.request_id} not found in "
+                    "model runner req_states",
+                )
+                continue
+
+            group_num_blocks = self.block_tables.num_blocks.np[:, req_index]
+            request_block_table = tuple(
+                tuple(
+                    block_table.gpu[
+                        req_index, : int(num_blocks)
+                    ].tolist()
+                )
+                for block_table, num_blocks in zip(
+                    self.block_tables.block_tables,
+                    group_num_blocks,
+                    strict=True,
+                )
+            )
+            try:
+                enqueued = self.hkv_warm_migration_manager.migrate(
+                    transition.request_id,
+                    transition.changed_blocks,
+                    request_block_table,
+                )
+                if enqueued:
+                    needs_cuda_sync = True
+                successful_indices.append(transition_idx)
+            except HKVWarmCapacityError as e:
+                indexed_results[transition_idx] = transition.to_result(
+                    KVCacheTransitionStatus.RETRYABLE_CAPACITY,
+                    str(e),
+                )
+            except HKVWarmStaleValidationError as e:
+                indexed_results[transition_idx] = transition.to_result(
+                    KVCacheTransitionStatus.STALE_VALIDATION,
+                    str(e),
+                )
+
+        if needs_cuda_sync:
+            device = (
+                self.device
+                if isinstance(self.device, torch.device)
+                else torch.device(self.device)
+            )
+            if device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.current_stream(device).synchronize()
+
+        for transition_idx in successful_indices:
+            indexed_results[transition_idx] = transitions[transition_idx].to_result(
+                KVCacheTransitionStatus.SUCCESS
+            )
+
+        if any(result is None for result in indexed_results):
+            raise RuntimeError(
+                "KV transition result assembly failed: "
+                "missing result for at least one transition"
+            )
+
+        results = [
+            result for result in indexed_results if result is not None
+        ]
+
+        self._pending_kv_transition_results.extend(results)
+        return results
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -780,6 +970,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         preempted_req_ids = scheduler_output.preempted_req_ids
         if preempted_req_ids:
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
+        if self.hkv_warm_migration_manager is not None:
+            for req_id in finished_req_ids:
+                self.hkv_warm_migration_manager.release_request(req_id)
         for req_id in finished_req_ids:
             self._remove_request(req_id)
 
@@ -1039,6 +1232,60 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def prepare_attn(
         self, input_batch: InputBatch
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        if self.hkv_warm_slot_table is not None:
+            assert self.hkv_warm_migration_manager is not None
+            active_req_ids = tuple(input_batch.req_ids)
+            residency_revision = (
+                self.hkv_warm_migration_manager.warm_residency_revision
+            )
+            if (
+                active_req_ids != self._hkv_warm_slot_table_req_ids
+                or residency_revision != self._hkv_warm_slot_table_revision
+                or input_batch.num_reqs_after_padding
+                != self._hkv_warm_slot_table_num_reqs_after_padding
+            ):
+                warm_slot_table = self.hkv_warm_slot_table
+                warm_slot_table[: input_batch.num_reqs_after_padding].fill_(-1)
+                active_rows = {
+                    req_id: row for row, req_id in enumerate(active_req_ids)
+                }
+                rows = []
+                logical_block_indices = []
+                warm_slot_ids = []
+                for (
+                    request_id,
+                    cache_group_index,
+                    logical_block_index,
+                ), residency in (
+                    self.hkv_warm_migration_manager.warm_residency.items()
+                ):
+                    row = active_rows.get(request_id)
+                    if row is None:
+                        continue
+                    if cache_group_index != 0:
+                        raise ValueError(
+                            "Logical WARM attention supports only cache group 0"
+                        )
+                    if logical_block_index >= warm_slot_table.shape[1]:
+                        raise ValueError(
+                            f"logical WARM block index {logical_block_index} "
+                            "exceeds the attention block-table width"
+                        )
+                    rows.append(row)
+                    logical_block_indices.append(logical_block_index)
+                    warm_slot_ids.append(residency.warm_slot_id)
+                if rows:
+                    warm_slot_table[rows, logical_block_indices] = torch.tensor(
+                        warm_slot_ids,
+                        dtype=torch.int32,
+                        device=warm_slot_table.device,
+                    )
+                self._hkv_warm_slot_table_req_ids = active_req_ids
+                self._hkv_warm_slot_table_revision = residency_revision
+                self._hkv_warm_slot_table_num_reqs_after_padding = (
+                    input_batch.num_reqs_after_padding
+                )
+        record_hkv_mixed_read_stats(self, input_batch.req_ids)
         # Block tables: num_kv_cache_groups x [num_reqs_padded, max_num_blocks].
         block_tables = self.block_tables.gather_block_tables(
             input_batch.idx_mapping,
@@ -1146,7 +1393,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
-                return empty_output
+                return self._attach_kv_transition_results(empty_output)
 
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
@@ -1182,7 +1429,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
-            return empty_output
+            return self._attach_kv_transition_results(empty_output)
 
         if not dummy_run:
             # Common case.
@@ -1320,7 +1567,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
-        if not dummy_run and not self._hkv_debug_demote_done:
+        if (
+            not dummy_run
+            and not is_hkv_multi_block_warm_migration_enabled()
+            and not self._hkv_debug_demote_done
+        ):
             self._hkv_debug_demote_done = debug_demote_one_hkv_block(
                 hot_kv_caches=self.hkv_hot_kv_caches,
                 warm_kv_caches=self.hkv_warm_kv_caches,
@@ -1392,7 +1643,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            return self._attach_kv_transition_results(
+                ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            )
 
         # Last rank: sample tokens
         sampler_output, num_sampled, num_rejected = self.sample(
@@ -1426,6 +1679,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            kv_cache_transition_results=self._take_kv_transition_results(),
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
@@ -1525,7 +1779,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not self.is_last_pp_rank:
             self.postprocess_num_computed_tokens(input_batch)
-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            return self._attach_kv_transition_results(
+                ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            )
 
         assert self.pooling_runner is not None
         pooler_output, is_valid = self.pooling_runner.pool(
@@ -1537,6 +1793,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_ids=input_batch.req_ids,
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             kv_connector_output=kv_connector_output,
+            kv_cache_transition_results=self._take_kv_transition_results(),
         )
         async_output = AsyncPoolingOutput(
             model_runner_output=model_runner_output,
@@ -1561,6 +1818,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
+        compilation_config = getattr(self, "compilation_config", None)
+        forward_context = getattr(compilation_config, "static_forward_context", {})
+        for layer in forward_context.values():
+            for attr_name in (
+                "_hkv_warm_kv_cache",
+                "_hkv_hot_to_warm_map",
+                "_hkv_warm_slot_table",
+            ):
+                if hasattr(layer, attr_name):
+                    delattr(layer, attr_name)
+
+        manager = getattr(self, "hkv_warm_migration_manager", None)
+        if manager is not None:
+            manager.allocator.clear()
+            manager.warm_residency.clear()
+        self.hkv_warm_migration_manager = None
+        self.hkv_warm_slot_table = None
+        for attr_name in (
+            "hkv_hot_kv_caches",
+            "hkv_warm_kv_caches",
+            "hkv_hot_to_warm_maps",
+        ):
+            container = getattr(self, attr_name, None)
+            if container is not None:
+                container.clear()
+
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
         if hasattr(self, "attn_groups"):

@@ -13,12 +13,19 @@ from vllm.multimodal.inputs import (
     PlaceholderRange,
 )
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+)
+from vllm.v1.kv_cache_state import (
+    KVBlockState,
+    KVCacheBlockTransition,
+    KVCacheStateTransition,
+    KVCacheTransitionStatus,
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -35,6 +42,7 @@ class DummyRequest(Request):
         prompt_token_ids=None,
         mm_features: list[MultiModalFeatureSpec] | None = None,
         max_tokens: int | None = 16,
+        arrival_time: float | None = None,
     ):
         super().__init__(
             request_id=request_id,
@@ -45,21 +53,33 @@ class DummyRequest(Request):
             pooling_params=None,
             mm_features=mm_features,
             resumable=resumable,
+            arrival_time=arrival_time,
         )
 
 
-def create_scheduler() -> Scheduler:
+def create_scheduler(
+    hot_threshold: float | None = None,
+    cold_threshold: float | None = None,
+    demotion_start: float | None = None,
+    demotion_stop: float | None = None,
+    num_blocks: int = 1000,
+) -> Scheduler:
     vllm_config = VllmConfig(device_config=DeviceConfig("cpu"))
+    vllm_config.scheduler_config.kv_cache_hot_idle_threshold_seconds = hot_threshold
+    vllm_config.scheduler_config.kv_cache_cold_idle_threshold_seconds = cold_threshold
+    vllm_config.scheduler_config.kv_cache_demotion_start_utilization = demotion_start
+    vllm_config.scheduler_config.kv_cache_demotion_stop_utilization = demotion_stop
     vllm_config.model_config = MagicMock()
     vllm_config.model_config.skip_tokenizer_init = True
     vllm_config.model_config.is_multimodal_model = False
+    vllm_config.model_config.is_encoder_decoder = False
     vllm_config.model_config.max_model_len = 1024
     vllm_config.model_config.enable_return_routed_experts = False
     vllm_config.cache_config = MagicMock()
-    vllm_config.cache_config.num_gpu_blocks = 1000
+    vllm_config.cache_config.num_gpu_blocks = num_blocks
     vllm_config.cache_config.enable_prefix_caching = False
     kv_cache_config = KVCacheConfig(
-        num_blocks=1000,
+        num_blocks=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -80,7 +100,570 @@ def create_scheduler() -> Scheduler:
     )
 
 
+def _add_waiting_session(
+    scheduler: Scheduler,
+    request_id: str,
+    *,
+    last_activity_time: float,
+    arrival_time: float,
+) -> DummyRequest:
+    session = DummyRequest(
+        request_id=request_id,
+        prompt_token_ids=list(range(16)),
+        arrival_time=arrival_time,
+    )
+    scheduler.add_request(session)
+    assert scheduler.kv_cache_manager.allocate_slots(session, 16) is not None
+    session.num_computed_tokens = 16
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.last_activity_time = last_activity_time
+    return session
+
+
+def _create_full_pressure_scheduler(
+    *,
+    demotion_stop: float = 0.6,
+) -> tuple[Scheduler, list[DummyRequest]]:
+    scheduler = create_scheduler(
+        demotion_start=0.8,
+        demotion_stop=demotion_stop,
+        num_blocks=11,
+    )
+    sessions = [
+        _add_waiting_session(
+            scheduler,
+            f"session-{index}",
+            last_activity_time=float(index),
+            arrival_time=float(index),
+        )
+        for index in range(8)
+    ]
+    return scheduler, sessions
+
+
+def _ack_transitions(
+    scheduler: Scheduler,
+    transitions: list[KVCacheStateTransition],
+    status: KVCacheTransitionStatus,
+) -> None:
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.kv_cache_state_transitions = transitions
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_cache_transition_results=[
+            transition.to_result(status) for transition in transitions
+        ],
+    )
+    scheduler._validate_kv_cache_transition_results(
+        scheduler_output,
+        model_runner_output,
+    )
+
+
 class TestStreamingScheduler(unittest.TestCase):
+    def test_idle_kv_classification_and_partial_tail(self):
+        disabled_scheduler = create_scheduler()
+        assert disabled_scheduler._classify_idle_kv_sessions(
+            current_time=100.0
+        ) == []
+
+        scheduler = create_scheduler(hot_threshold=10.0, cold_threshold=20.0)
+        session = DummyRequest(
+            request_id="session",
+            prompt_token_ids=list(range(20)),
+            arrival_time=100.0,
+        )
+        scheduler.add_request(session)
+        allocated = scheduler.kv_cache_manager.allocate_slots(session, 20)
+        assert allocated is not None
+        session.num_computed_tokens = 20
+        session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+        transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+
+        block_groups = scheduler.kv_cache_manager.get_blocks(
+            session.request_id
+        ).blocks
+        complete_blocks = tuple(
+            [KVCacheBlockTransition(0, group[0].block_id)] for group in block_groups
+        )
+        assert transitions == [
+            KVCacheStateTransition(
+                transition_id=0,
+                request_id=session.request_id,
+                previous_state=KVBlockState.HOT,
+                new_state=KVBlockState.WARM,
+                changed_blocks=complete_blocks,
+            )
+        ]
+        # Non-mutating planning keeps authoritative state HOT before ACK
+        assert session.kv_cache_state is KVBlockState.HOT
+        assert all(
+            group[0].hierarchy_state is KVBlockState.HOT
+            and group[1].hierarchy_state is KVBlockState.HOT
+            for group in block_groups
+        )
+        assert scheduler._pending_kv_transitions[session.request_id] == transitions[0]
+
+        # Duplicate classification pass is suppressed
+        assert scheduler._classify_idle_kv_sessions(current_time=110.0) == []
+
+        # Validate SUCCESS acknowledgment commits to WARM
+        sched_out = SchedulerOutput.make_empty()
+        sched_out.kv_cache_state_transitions = transitions
+        mr_out = ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            kv_cache_transition_results=[
+                transitions[0].to_result(KVCacheTransitionStatus.SUCCESS)
+            ],
+        )
+        scheduler._validate_kv_cache_transition_results(sched_out, mr_out)
+
+        assert session.kv_cache_state is KVBlockState.WARM
+        assert all(
+            group[0].is_null
+            and group[1].hierarchy_state is KVBlockState.HOT
+            for group in block_groups
+        )
+        assert session.request_id not in scheduler._pending_kv_transitions
+
+    def test_pressure_demotion_does_not_start_below_threshold(self):
+        scheduler = create_scheduler(
+            hot_threshold=1.0,
+            cold_threshold=2.0,
+            demotion_start=0.8,
+            demotion_stop=0.6,
+            num_blocks=11,
+        )
+        for index in range(7):
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=float(index),
+                arrival_time=float(index),
+            )
+
+        assert scheduler._classify_idle_kv_sessions(current_time=1000.0) == []
+
+    def test_pressure_demotion_starts_at_threshold(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.7,
+            num_blocks=11,
+        )
+        for index in range(8):
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=float(index),
+                arrival_time=float(index),
+            )
+
+        transitions = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in transitions] == ["session-0"]
+
+    def test_pressure_demotion_selects_oldest_eligible_session_first(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.7,
+            num_blocks=11,
+        )
+        activity_times = [30.0, 10.0, 20.0, 40.0, 50.0, 60.0, 70.0, 80.0]
+        for index, activity_time in enumerate(activity_times):
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=activity_time,
+                arrival_time=float(index),
+            )
+
+        transitions = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in transitions] == ["session-1"]
+
+    def test_pressure_demotion_uses_deterministic_tie_breaking(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.5,
+            num_blocks=11,
+        )
+        session_keys = [
+            ("session-c", 10.0, 2.0),
+            ("session-b", 10.0, 1.0),
+            ("session-a", 10.0, 1.0),
+            ("session-d", 20.0, 0.0),
+            ("session-e", 30.0, 0.0),
+            ("session-f", 40.0, 0.0),
+            ("session-g", 50.0, 0.0),
+            ("session-h", 60.0, 0.0),
+        ]
+        for request_id, last_activity_time, arrival_time in session_keys:
+            _add_waiting_session(
+                scheduler,
+                request_id,
+                last_activity_time=last_activity_time,
+                arrival_time=arrival_time,
+            )
+
+        transitions = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in transitions] == [
+            "session-a",
+            "session-b",
+            "session-c",
+        ]
+
+    def test_pressure_demotion_stops_after_projected_target(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.6,
+            num_blocks=11,
+        )
+        for index in range(8):
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=float(index),
+                arrival_time=float(index),
+            )
+
+        transitions = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in transitions] == [
+            "session-0",
+            "session-1",
+        ]
+
+    def test_pressure_demotion_counts_pending_releases_before_replanning(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.6,
+            num_blocks=11,
+        )
+        for index in range(8):
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=float(index),
+                arrival_time=float(index),
+            )
+
+        first = scheduler._classify_idle_kv_sessions()
+        second = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in first] == [
+            "session-0",
+            "session-1",
+        ]
+        assert second == []
+
+    def test_pressure_demotion_plans_only_remainder_after_pending_releases(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.5,
+            num_blocks=11,
+        )
+        sessions = [
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=float(index),
+                arrival_time=float(index),
+            )
+            for index in range(8)
+        ]
+        for session in sessions[1:]:
+            session.resumable = False
+
+        first = scheduler._classify_idle_kv_sessions()
+        for session in sessions[1:]:
+            session.resumable = True
+        second = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in first] == ["session-0"]
+        assert [transition.request_id for transition in second] == [
+            "session-1",
+            "session-2",
+        ]
+
+    def test_capacity_failure_clears_pending_and_starts_cooldown(self):
+        scheduler, _ = _create_full_pressure_scheduler()
+        transitions = scheduler._classify_idle_kv_sessions()
+
+        _ack_transitions(
+            scheduler,
+            transitions,
+            KVCacheTransitionStatus.RETRYABLE_CAPACITY,
+        )
+
+        assert scheduler._pending_kv_transitions == {}
+        assert scheduler._kv_demotion_capacity_failure_count == 1
+        assert scheduler._kv_demotion_capacity_cooldown_steps_remaining == 1
+        assert scheduler._kv_demotion_capacity_probe_required
+        assert scheduler._kv_demotion_capacity_probe_transition_id is None
+
+    def test_capacity_cooldown_suppresses_pressure_transitions(self):
+        scheduler, _ = _create_full_pressure_scheduler()
+        transitions = scheduler._classify_idle_kv_sessions()
+        _ack_transitions(
+            scheduler,
+            transitions,
+            KVCacheTransitionStatus.RETRYABLE_CAPACITY,
+        )
+
+        assert scheduler._classify_idle_kv_sessions() == []
+        assert scheduler._kv_demotion_capacity_cooldown_steps_remaining == 0
+        assert scheduler._pending_kv_transitions == {}
+
+    def test_capacity_cooldown_does_not_disable_normal_preemption(self):
+        scheduler = create_scheduler(
+            demotion_start=0.5,
+            demotion_stop=0.25,
+            num_blocks=3,
+        )
+        running = DummyRequest(
+            request_id="running",
+            prompt_token_ids=list(range(32)),
+            arrival_time=0.0,
+        )
+        scheduler.add_request(running)
+        assert scheduler.kv_cache_manager.allocate_slots(running, 16) is not None
+        running.num_computed_tokens = 16
+        running.status = RequestStatus.RUNNING
+        scheduler.waiting.remove_requests([running])
+        scheduler.running.append(running)
+        _add_waiting_session(
+            scheduler,
+            "idle",
+            last_activity_time=0.0,
+            arrival_time=1.0,
+        )
+        scheduler._kv_demotion_capacity_cooldown_steps_remaining = 1
+        scheduler._kv_demotion_capacity_probe_required = True
+
+        scheduler_output = scheduler.schedule()
+
+        assert scheduler_output.kv_cache_state_transitions == []
+        assert scheduler_output.preempted_req_ids == {"running"}
+        assert running.status is RequestStatus.PREEMPTED
+
+    def test_capacity_cooldown_expiry_emits_one_probe(self):
+        scheduler, _ = _create_full_pressure_scheduler(demotion_stop=0.5)
+        transitions = scheduler._classify_idle_kv_sessions()
+        _ack_transitions(
+            scheduler,
+            transitions,
+            KVCacheTransitionStatus.RETRYABLE_CAPACITY,
+        )
+
+        assert scheduler._classify_idle_kv_sessions() == []
+        probe = scheduler._classify_idle_kv_sessions()
+
+        assert len(probe) == 1
+        assert scheduler._kv_demotion_capacity_probe_required is False
+        assert (
+            scheduler._kv_demotion_capacity_probe_transition_id
+            == probe[0].transition_id
+        )
+
+    def test_pending_capacity_probe_suppresses_planning_until_success(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.5,
+            num_blocks=11,
+        )
+        for index in range(9):
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=float(index),
+                arrival_time=float(index),
+            )
+        transitions = scheduler._classify_idle_kv_sessions()
+        _ack_transitions(
+            scheduler,
+            transitions,
+            KVCacheTransitionStatus.RETRYABLE_CAPACITY,
+        )
+        assert scheduler._classify_idle_kv_sessions() == []
+        probe = scheduler._classify_idle_kv_sessions()
+        assert len(probe) == 1
+
+        assert scheduler._classify_idle_kv_sessions() == []
+
+        _ack_transitions(
+            scheduler,
+            probe,
+            KVCacheTransitionStatus.SUCCESS,
+        )
+        resumed = scheduler._classify_idle_kv_sessions()
+        assert [transition.request_id for transition in resumed] == [
+            "session-1",
+            "session-2",
+            "session-3",
+        ]
+
+    def test_capacity_probe_success_clears_backoff(self):
+        scheduler, _ = _create_full_pressure_scheduler(demotion_stop=0.5)
+        transitions = scheduler._classify_idle_kv_sessions()
+        _ack_transitions(
+            scheduler,
+            transitions,
+            KVCacheTransitionStatus.RETRYABLE_CAPACITY,
+        )
+        assert scheduler._classify_idle_kv_sessions() == []
+        probe = scheduler._classify_idle_kv_sessions()
+
+        _ack_transitions(
+            scheduler,
+            probe,
+            KVCacheTransitionStatus.SUCCESS,
+        )
+
+        assert scheduler._kv_demotion_capacity_failure_count == 0
+        assert scheduler._kv_demotion_capacity_cooldown_steps_remaining == 0
+        assert scheduler._kv_demotion_capacity_probe_required is False
+        assert scheduler._kv_demotion_capacity_probe_transition_id is None
+
+    def test_repeated_capacity_failures_use_capped_exponential_cooldown(self):
+        scheduler, _ = _create_full_pressure_scheduler(demotion_stop=0.5)
+        transitions = scheduler._classify_idle_kv_sessions()
+        expected_cooldowns = [1, 2, 4, 8, 16, 16]
+
+        for expected_cooldown in expected_cooldowns:
+            _ack_transitions(
+                scheduler,
+                transitions,
+                KVCacheTransitionStatus.RETRYABLE_CAPACITY,
+            )
+            assert (
+                scheduler._kv_demotion_capacity_cooldown_steps_remaining
+                == expected_cooldown
+            )
+            for _ in range(expected_cooldown):
+                assert scheduler._classify_idle_kv_sessions() == []
+            transitions = scheduler._classify_idle_kv_sessions()
+            assert len(transitions) == 1
+
+    def test_stale_validation_does_not_start_or_extend_capacity_backoff(self):
+        scheduler, _ = _create_full_pressure_scheduler(demotion_stop=0.5)
+        transitions = scheduler._classify_idle_kv_sessions()
+        _ack_transitions(
+            scheduler,
+            transitions,
+            KVCacheTransitionStatus.STALE_VALIDATION,
+        )
+
+        assert scheduler._kv_demotion_capacity_failure_count == 0
+        assert scheduler._kv_demotion_capacity_cooldown_steps_remaining == 0
+        assert scheduler._kv_demotion_capacity_probe_required is False
+
+        transitions = scheduler._classify_idle_kv_sessions()
+        _ack_transitions(
+            scheduler,
+            transitions,
+            KVCacheTransitionStatus.RETRYABLE_CAPACITY,
+        )
+        assert scheduler._classify_idle_kv_sessions() == []
+        probe = scheduler._classify_idle_kv_sessions()
+        _ack_transitions(
+            scheduler,
+            probe,
+            KVCacheTransitionStatus.STALE_VALIDATION,
+        )
+
+        assert scheduler._kv_demotion_capacity_failure_count == 1
+        assert scheduler._kv_demotion_capacity_cooldown_steps_remaining == 0
+        assert scheduler._kv_demotion_capacity_probe_required
+        assert scheduler._kv_demotion_capacity_probe_transition_id is None
+
+    def test_normal_success_does_not_activate_capacity_backoff(self):
+        scheduler, _ = _create_full_pressure_scheduler()
+        transitions = scheduler._classify_idle_kv_sessions()
+
+        _ack_transitions(
+            scheduler,
+            transitions,
+            KVCacheTransitionStatus.SUCCESS,
+        )
+
+        assert scheduler._kv_demotion_capacity_failure_count == 0
+        assert scheduler._kv_demotion_capacity_cooldown_steps_remaining == 0
+        assert scheduler._kv_demotion_capacity_probe_required is False
+        assert scheduler._kv_demotion_capacity_probe_transition_id is None
+
+    def test_pressure_demotion_skips_pending_transition(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.7,
+            num_blocks=11,
+        )
+        sessions = [
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=float(index),
+                arrival_time=float(index),
+            )
+            for index in range(8)
+        ]
+        scheduler._pending_kv_transitions[sessions[0].request_id] = MagicMock()
+
+        transitions = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in transitions] == ["session-1"]
+
+    def test_pressure_demotion_skips_warm_session(self):
+        scheduler = create_scheduler(
+            demotion_start=0.8,
+            demotion_stop=0.7,
+            num_blocks=11,
+        )
+        sessions = [
+            _add_waiting_session(
+                scheduler,
+                f"session-{index}",
+                last_activity_time=float(index),
+                arrival_time=float(index),
+            )
+            for index in range(8)
+        ]
+        sessions[0].kv_cache_state = KVBlockState.WARM
+
+        transitions = scheduler._classify_idle_kv_sessions()
+
+        assert [transition.request_id for transition in transitions] == ["session-1"]
+
+    def test_unset_pressure_thresholds_preserve_time_based_demotion(self):
+        scheduler = create_scheduler(
+            hot_threshold=10.0,
+            cold_threshold=20.0,
+            num_blocks=11,
+        )
+        _add_waiting_session(
+            scheduler,
+            "session",
+            last_activity_time=100.0,
+            arrival_time=100.0,
+        )
+
+        transitions = scheduler._classify_idle_kv_sessions(current_time=110.0)
+
+        assert [transition.request_id for transition in transitions] == ["session"]
+        assert scheduler._kv_demotion_capacity_cooldown_steps_remaining == 0
+
+    def test_disabled_demotion_ignores_capacity_backoff_state(self):
+        scheduler = create_scheduler()
+        scheduler._kv_demotion_capacity_cooldown_steps_remaining = 1
+        scheduler._kv_demotion_capacity_probe_required = True
+
+        assert scheduler._classify_idle_kv_sessions(current_time=100.0) == []
+        assert scheduler._kv_demotion_capacity_cooldown_steps_remaining == 1
+        assert scheduler._kv_demotion_capacity_probe_required
+
     def test_add_request(self):
         scheduler = create_scheduler()
 
@@ -219,6 +802,7 @@ class TestStreamingScheduler(unittest.TestCase):
             request_id="session",
             prompt_token_ids=[1, 2, 3],
             resumable=True,
+            arrival_time=100.0,
         )
         scheduler.add_request(session)
         session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
@@ -260,6 +844,7 @@ class TestStreamingScheduler(unittest.TestCase):
             request_id="session",
             prompt_token_ids=[4, 5],
             resumable=True,
+            arrival_time=200.0,
         )
 
         scheduler.add_request(next_request)
@@ -269,6 +854,7 @@ class TestStreamingScheduler(unittest.TestCase):
         # becomes WAITING
         assert session.status == RequestStatus.WAITING
         assert session.prompt_token_ids == [1, 2, 3, 4, 5]
+        assert session.last_activity_time == 200.0
 
         _ = scheduler.schedule()
 
@@ -496,7 +1082,7 @@ class TestStreamingScheduler(unittest.TestCase):
         eco_cycle2 = eco_dict_cycle2[session.client_index].outputs[0]
         assert eco_cycle2.finish_reason == FinishReason.STOP
         assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
-        assert session in scheduler.waiting
+        assert session in scheduler.skipped_waiting
         assert session._all_token_ids == [1, 2, 3, 10, STOP_TOKEN]
 
         # CRITICAL ASSERTION: Cached prompt_token_ids STILL must not have changed
@@ -573,3 +1159,108 @@ class TestStreamingScheduler(unittest.TestCase):
             cached_state_cycle1["prompt_token_ids"]
             is not cached_state_cycle3["prompt_token_ids"]
         ), "Cached states from different cycles should be independent objects."
+
+    def test_update_request_as_session_partial_prefill_keeps_prompt_suffix(self):
+        scheduler = create_scheduler()
+        previous_prompt = list(range(540))
+        delta = list(range(1000, 1100))
+        session = DummyRequest(
+            request_id="session",
+            prompt_token_ids=list(previous_prompt),
+        )
+        session.num_computed_tokens = 440
+
+        update = StreamingUpdate.from_request(
+            DummyRequest(request_id="session", prompt_token_ids=list(delta))
+        )
+        scheduler._update_request_as_session(session, update)
+
+        expected = previous_prompt + delta
+        assert session.prompt_token_ids == expected
+        assert session._all_token_ids == expected
+        assert session.num_prompt_tokens == 640
+        assert session.num_computed_tokens == 440
+
+    def test_preempted_session_queued_streaming_update_keeps_prompt_tokens(self):
+        scheduler = create_scheduler()
+        previous_prompt = list(range(540))
+        delta = list(range(1000, 1100))
+        session = DummyRequest(
+            request_id="session",
+            prompt_token_ids=list(previous_prompt),
+        )
+        scheduler.add_request(session)
+        assert scheduler.kv_cache_manager.allocate_slots(session, 440) is not None
+        session.num_computed_tokens = 440
+        session.status = RequestStatus.RUNNING
+        scheduler.waiting.remove_requests([session])
+        scheduler.running.append(session)
+
+        scheduler.add_request(
+            DummyRequest(request_id="session", prompt_token_ids=list(delta))
+        )
+        assert len(session.streaming_queue) == 1
+
+        scheduler.running.remove(session)
+        scheduler._preempt_request(session, timestamp=0.0)
+        assert session.status is RequestStatus.PREEMPTED
+        assert session.num_computed_tokens == 0
+
+        queued = session.streaming_queue.popleft()
+        scheduler._update_request_as_session(session, queued)
+
+        expected = previous_prompt + delta
+        assert session.prompt_token_ids == expected
+        assert session._all_token_ids == expected
+        assert len(session._all_token_ids) >= len(session.prompt_token_ids)
+
+    def test_v2_new_request_data_prefill_covers_prompt_after_streaming_update(self):
+        scheduler = create_scheduler()
+        previous_prompt = list(range(540))
+        delta = list(range(1000, 1100))
+        session = DummyRequest(
+            request_id="session",
+            prompt_token_ids=list(previous_prompt),
+        )
+        session.num_computed_tokens = 440
+        scheduler._update_request_as_session(
+            session,
+            StreamingUpdate.from_request(
+                DummyRequest(request_id="session", prompt_token_ids=list(delta))
+            ),
+        )
+
+        new_req = NewRequestData.from_request(
+            session,
+            block_ids=([],),
+            prefill_token_ids=session._all_token_ids,
+        )
+        assert new_req.prompt_token_ids is not None
+        assert new_req.prefill_token_ids is not None
+        assert len(new_req.prefill_token_ids) >= len(new_req.prompt_token_ids)
+        assert new_req.prefill_token_ids == new_req.prompt_token_ids
+        assert len(new_req.prefill_token_ids) == 640
+
+    def test_update_request_as_session_keeps_computed_output_once(self):
+        scheduler = create_scheduler()
+        session = DummyRequest(
+            request_id="session",
+            prompt_token_ids=[1, 2, 3],
+        )
+        session.append_output_token_ids([10, 11])
+        session.num_computed_tokens = 4
+
+        scheduler._update_request_as_session(
+            session,
+            StreamingUpdate.from_request(
+                DummyRequest(request_id="session", prompt_token_ids=[4, 5])
+            ),
+        )
+
+        assert session._all_token_ids == [1, 2, 3, 10, 4, 5]
+        assert session.prompt_token_ids == [1, 2, 3, 10, 4, 5]
+        assert session._all_token_ids.count(10) == 1
+        assert 11 not in session._all_token_ids
+        assert 11 not in session.prompt_token_ids
+        assert session._output_token_ids == []
+        assert session.max_tokens == 16

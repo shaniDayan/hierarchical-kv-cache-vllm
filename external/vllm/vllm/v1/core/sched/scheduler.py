@@ -53,6 +53,13 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_state import (
+    KVBlockState,
+    KVCacheStateTransition,
+    KVCacheTransitionResult,
+    KVCacheTransitionStatus,
+    classify_request_kv_state,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -63,6 +70,15 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+_KV_STATE_COLDNESS = {
+    KVBlockState.HOT: 0,
+    KVBlockState.WARM: 1,
+    KVBlockState.COLD: 2,
+}
+
+_KV_DEMOTION_CAPACITY_INITIAL_COOLDOWN_STEPS = 1
+_KV_DEMOTION_CAPACITY_MAX_COOLDOWN_STEPS = 16
 
 
 class Scheduler(SchedulerInterface):
@@ -79,6 +95,25 @@ class Scheduler(SchedulerInterface):
     ) -> None:
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
+        self.kv_cache_hot_idle_threshold_seconds = (
+            self.scheduler_config.kv_cache_hot_idle_threshold_seconds
+        )
+        self.kv_cache_cold_idle_threshold_seconds = (
+            self.scheduler_config.kv_cache_cold_idle_threshold_seconds
+        )
+        self.kv_cache_demotion_start_utilization = (
+            self.scheduler_config.kv_cache_demotion_start_utilization
+        )
+        self.kv_cache_demotion_stop_utilization = (
+            self.scheduler_config.kv_cache_demotion_stop_utilization
+        )
+        self._next_kv_transition_id: int = 0
+        self._pending_kv_transitions: dict[str, KVCacheStateTransition] = {}
+        self._pending_finish_requests: dict[str, RequestStatus] = {}
+        self._kv_demotion_capacity_failure_count = 0
+        self._kv_demotion_capacity_cooldown_steps_remaining = 0
+        self._kv_demotion_capacity_probe_required = False
+        self._kv_demotion_capacity_probe_transition_id: int | None = None
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.kv_cache_config = kv_cache_config
@@ -420,6 +455,20 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+
+        # This maintenance runs only when schedule() is already invoked. A
+        # future deadline wakeup is needed when all sessions await streaming input.
+        kv_state_transitions = self._classify_idle_kv_sessions()
+        for transition in kv_state_transitions:
+            logger.info(
+                "Idle KV state transition: request_id=%s %s->%s "
+                "changed_blocks=%d changed_blocks_by_group=%s",
+                transition.request_id,
+                transition.previous_state.value,
+                transition.new_state.value,
+                sum(len(group) for group in transition.changed_blocks),
+                transition.changed_blocks,
+            )
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
@@ -1072,6 +1121,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            kv_cache_state_transitions=kv_state_transitions,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
         )
 
@@ -1113,6 +1163,11 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        if request.request_id in self._pending_kv_transitions:
+            raise RuntimeError(
+                f"Cannot preempt request {request.request_id} while a KV cache "
+                "state transition is pending"
+            )
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -1184,13 +1239,23 @@ class Scheduler(SchedulerInterface):
         Discards the last sampled output token from the prior input chunk.
         """
 
-        # Current streaming input behaviour: Keep only computed output tokens
-        # (discard final sampled output token).
+        if session.request_id in self._pending_kv_transitions:
+            raise RuntimeError(
+                f"Cannot resume request {session.request_id} while a KV cache "
+                "state transition is pending"
+            )
+
+        # Keep computed output tokens and discard only the extra sampled
+        # token. Never truncate tokens that already belong to the prompt;
+        # a new turn can arrive while the previous prompt is still being
+        # chunked-prefilled (num_computed_tokens < num_prompt_tokens).
         num_computed_tokens = session.num_computed_tokens
+        num_prompt_tokens = session.num_prompt_tokens
         kept_output_tokens = session._all_token_ids[
-            session.num_prompt_tokens : num_computed_tokens
+            num_prompt_tokens : num_computed_tokens
         ]
-        del session._all_token_ids[num_computed_tokens:]
+        truncate_at = max(num_computed_tokens, num_prompt_tokens)
+        del session._all_token_ids[truncate_at:]
         session._output_token_ids.clear()
         assert session.prompt_token_ids is not None
         # Extend prompt with kept output tokens.
@@ -1209,14 +1274,172 @@ class Scheduler(SchedulerInterface):
         # Update block hashes for the new tokens.
         session.update_block_hashes()
         session.num_prompt_tokens = len(session.prompt_token_ids)
+        # This path folds retained outputs into the prompt, then appends the
+        # same delta to both lists, so equality is expected. The worker
+        # invariant is the weaker prefill_len >= prompt_len.
+        assert len(session._all_token_ids) >= len(session.prompt_token_ids)
         session.arrival_time = update.arrival_time
+        session.mark_activity(update.arrival_time)
+        # The request is active again, but historical residency is preserved
+        # for lazy mixed HOT/WARM attention. Future COLD restoration will
+        # explicitly move COLD blocks to WARM before attention.
+        session.kv_cache_state = KVBlockState.HOT
         session.sampling_params = update.sampling_params
+        session.max_tokens = update.max_tokens
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+    def _classify_idle_kv_sessions(
+        self,
+        current_time: float | None = None,
+    ) -> list[KVCacheStateTransition]:
+        """Classify inactive resumable sessions into colder KV states."""
+        if self.kv_cache_demotion_start_utilization is not None:
+            return self._demote_kv_sessions_under_pressure()
+
+        hot_threshold = self.kv_cache_hot_idle_threshold_seconds
+        cold_threshold = self.kv_cache_cold_idle_threshold_seconds
+        if hot_threshold is None or cold_threshold is None:
+            return []
+
+        if current_time is None:
+            current_time = time.time()
+
+        transitions = []
+        for request in self.requests.values():
+            if not request.resumable or (
+                request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+            ):
+                continue
+
+            if request.request_id in self._pending_kv_transitions:
+                continue
+
+            previous_state = request.kv_cache_state
+            new_state = classify_request_kv_state(
+                request.get_idle_time(current_time),
+                hot_threshold,
+                cold_threshold,
+            )
+            # COLD migration is not implemented on the worker yet; prevent scheduling
+            # unsupported WARM -> COLD transitions while allowing HOT -> WARM.
+            if new_state is KVBlockState.COLD:
+                if previous_state is KVBlockState.WARM:
+                    continue
+                new_state = KVBlockState.WARM
+
+            if _KV_STATE_COLDNESS[new_state] <= _KV_STATE_COLDNESS[previous_state]:
+                continue
+
+            transition = self._plan_kv_state_transition(request, new_state)
+            if transition is not None:
+                transitions.append(transition)
+
+        return transitions
+
+    def _demote_kv_sessions_under_pressure(
+        self,
+    ) -> list[KVCacheStateTransition]:
+        start = self.kv_cache_demotion_start_utilization
+        stop = self.kv_cache_demotion_stop_utilization
+        assert start is not None and stop is not None
+
+        if self._kv_demotion_capacity_cooldown_steps_remaining > 0:
+            self._kv_demotion_capacity_cooldown_steps_remaining -= 1
+            return []
+        if self._kv_demotion_capacity_probe_transition_id is not None:
+            return []
+
+        block_pool = self.kv_cache_manager.block_pool
+        usable_hot_blocks = block_pool.num_gpu_blocks - 1
+        if usable_hot_blocks <= 0:
+            return []
+
+        free_hot_blocks = block_pool.get_num_free_blocks()
+        used_hot_blocks = usable_hot_blocks - free_hot_blocks
+        if used_hot_blocks / usable_hot_blocks < start:
+            return []
+
+        projected_released_blocks = sum(
+            len(group)
+            for transition in self._pending_kv_transitions.values()
+            if transition.previous_state is KVBlockState.HOT
+            and transition.new_state is KVBlockState.WARM
+            for group in transition.changed_blocks
+        )
+        projected_used_blocks = used_hot_blocks - projected_released_blocks
+        if projected_used_blocks / usable_hot_blocks <= stop:
+            return []
+
+        candidates = sorted(
+            (
+                request
+                for request in self.requests.values()
+                if request.resumable
+                and request.status is RequestStatus.WAITING_FOR_STREAMING_REQ
+                and request.kv_cache_state is KVBlockState.HOT
+                and request.request_id not in self._pending_kv_transitions
+            ),
+            key=lambda request: (
+                request.last_activity_time,
+                request.arrival_time,
+                request.request_id,
+            ),
+        )
+
+        transitions = []
+        for request in candidates:
+            transition = self._plan_kv_state_transition(
+                request,
+                KVBlockState.WARM,
+            )
+            if transition is None:
+                continue
+
+            transitions.append(transition)
+            if self._kv_demotion_capacity_probe_required:
+                self._kv_demotion_capacity_probe_required = False
+                self._kv_demotion_capacity_probe_transition_id = (
+                    transition.transition_id
+                )
+                break
+
+            projected_released_blocks += sum(
+                len(group) for group in transition.changed_blocks
+            )
+            projected_used_blocks = used_hot_blocks - projected_released_blocks
+            if projected_used_blocks / usable_hot_blocks <= stop:
+                break
+
+        return transitions
+
+    def _plan_kv_state_transition(
+        self,
+        request: Request,
+        new_state: KVBlockState,
+    ) -> KVCacheStateTransition | None:
+        changed_blocks = self.kv_cache_manager.plan_request_kv_state(
+            request.request_id,
+            new_state,
+            num_computed_tokens=request.num_computed_tokens,
+        )
+        if not any(changed_blocks):
+            return None
+
+        transition = KVCacheStateTransition(
+            transition_id=self._next_kv_transition_id,
+            request_id=request.request_id,
+            previous_state=request.kv_cache_state,
+            new_state=new_state,
+            changed_blocks=changed_blocks,
+        )
+        self._next_kv_transition_id += 1
+        self._pending_kv_transitions[request.request_id] = transition
+        return transition
 
     def _make_cached_request_data(
         self,
@@ -1461,11 +1684,173 @@ class Scheduler(SchedulerInterface):
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
+    def _validate_kv_cache_transition_results(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        expected_transitions = scheduler_output.kv_cache_state_transitions
+        actual_results = getattr(
+            model_runner_output, "kv_cache_transition_results", None
+        )
+        if actual_results is None:
+            actual_results = []
+
+        if not expected_transitions and not actual_results:
+            return
+
+        if len(expected_transitions) != len(actual_results):
+            expected_ids = [t.transition_id for t in expected_transitions]
+            actual_ids = [r.transition_id for r in actual_results]
+            raise ValueError(
+                f"Mismatch in KV transition result count: "
+                f"expected {len(expected_transitions)} results for transitions "
+                f"{expected_ids}, got {len(actual_results)} results {actual_ids}"
+            )
+
+        seen_transition_ids: set[int] = set()
+        pressure_capacity_failure = False
+        for expected, actual in zip(expected_transitions, actual_results, strict=True):
+            if not isinstance(actual, KVCacheTransitionResult):
+                raise TypeError(
+                    f"Expected KVCacheTransitionResult, got {type(actual).__name__}"
+                )
+            if actual.transition_id in seen_transition_ids:
+                raise ValueError(
+                    f"Duplicate KV transition result for "
+                    f"transition_id={actual.transition_id}"
+                )
+            seen_transition_ids.add(actual.transition_id)
+
+            if actual.transition_id != expected.transition_id:
+                raise ValueError(
+                    f"KV transition ID mismatch: expected {expected.transition_id}, "
+                    f"got {actual.transition_id}"
+                )
+
+            if actual.signature != expected.signature:
+                raise ValueError(
+                    f"KV transition signature mismatch for "
+                    f"transition_id={expected.transition_id}: "
+                    f"expected signature {expected.signature}, "
+                    f"got {actual.signature}"
+                )
+
+            pending = self._pending_kv_transitions.get(expected.request_id)
+            if pending is None or pending.transition_id != expected.transition_id:
+                raise ValueError(
+                    f"No matching pending KV transition for request "
+                    f"{expected.request_id} and transition_id={expected.transition_id}"
+                )
+
+            if actual.status is KVCacheTransitionStatus.SUCCESS:
+                self.kv_cache_manager.commit_request_kv_transition(expected)
+                request = self.requests.get(expected.request_id)
+                if request is not None:
+                    request.kv_cache_state = expected.new_state
+                del self._pending_kv_transitions[expected.request_id]
+                if (
+                    expected.transition_id
+                    == getattr(
+                        self,
+                        "_kv_demotion_capacity_probe_transition_id",
+                        None,
+                    )
+                ):
+                    self._kv_demotion_capacity_failure_count = 0
+                    self._kv_demotion_capacity_cooldown_steps_remaining = 0
+                    self._kv_demotion_capacity_probe_required = False
+                    self._kv_demotion_capacity_probe_transition_id = None
+            elif actual.status in (
+                KVCacheTransitionStatus.RETRYABLE_CAPACITY,
+                KVCacheTransitionStatus.STALE_VALIDATION,
+            ):
+                logger.warning(
+                    "KV cache transition %d for request %s was not successful: "
+                    "status=%s, error=%s. Authoritative state remains %s.",
+                    actual.transition_id,
+                    actual.request_id,
+                    actual.status.value,
+                    actual.error_message,
+                    expected.previous_state.value,
+                )
+                del self._pending_kv_transitions[expected.request_id]
+                is_pressure_demotion = (
+                    getattr(
+                        self,
+                        "kv_cache_demotion_start_utilization",
+                        None,
+                    )
+                    is not None
+                    and expected.previous_state is KVBlockState.HOT
+                    and expected.new_state is KVBlockState.WARM
+                )
+                if (
+                    actual.status is KVCacheTransitionStatus.RETRYABLE_CAPACITY
+                    and is_pressure_demotion
+                ):
+                    pressure_capacity_failure = True
+                elif (
+                    actual.status is KVCacheTransitionStatus.STALE_VALIDATION
+                    and expected.transition_id
+                    == getattr(
+                        self,
+                        "_kv_demotion_capacity_probe_transition_id",
+                        None,
+                    )
+                ):
+                    self._kv_demotion_capacity_probe_required = True
+                    self._kv_demotion_capacity_probe_transition_id = None
+            else:
+                raise ValueError(
+                    f"Unexpected KV transition status: {actual.status}"
+                )
+
+            # Process deferred finish/abort if requested while pending
+            deferred_status = getattr(
+                self, "_pending_finish_requests", {}
+            ).pop(expected.request_id, None)
+            request = self.requests.get(expected.request_id)
+            if deferred_status is not None:
+                if request is not None and not request.is_finished():
+                    self.finish_requests(
+                        [expected.request_id], deferred_status
+                    )
+                continue
+
+            # Process queued streaming update if one arrived while pending
+            streaming_queue = getattr(request, "streaming_queue", None)
+            if streaming_queue:
+                update = streaming_queue.popleft()
+                if update is not None:
+                    self._update_request_as_session(request, update)
+                else:
+                    self.finish_requests(
+                        [request.request_id], RequestStatus.FINISHED_ABORTED
+                    )
+
+        if pressure_capacity_failure:
+            self._kv_demotion_capacity_failure_count += 1
+            cooldown_steps = _KV_DEMOTION_CAPACITY_INITIAL_COOLDOWN_STEPS
+            for _ in range(self._kv_demotion_capacity_failure_count - 1):
+                cooldown_steps = min(
+                    cooldown_steps * 2,
+                    _KV_DEMOTION_CAPACITY_MAX_COOLDOWN_STEPS,
+                )
+                if cooldown_steps == _KV_DEMOTION_CAPACITY_MAX_COOLDOWN_STEPS:
+                    break
+            self._kv_demotion_capacity_cooldown_steps_remaining = cooldown_steps
+            self._kv_demotion_capacity_probe_required = True
+            self._kv_demotion_capacity_probe_transition_id = None
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        self._validate_kv_cache_transition_results(
+            scheduler_output, model_runner_output
+        )
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -1965,7 +2350,10 @@ class Scheduler(SchedulerInterface):
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
-            if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+            if (
+                existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+                or existing.request_id in self._pending_kv_transitions
+            ):
                 assert existing.streaming_queue is not None, "duplicate request id"
                 # Queue next input chunk (or finished sentinel).
                 existing.streaming_queue.append(update)
@@ -1974,7 +2362,9 @@ class Scheduler(SchedulerInterface):
                 self._update_request_as_session(existing, update)
             else:
                 # Streaming-input session finished.
-                self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+                self.finish_requests(
+                    [request.request_id], RequestStatus.FINISHED_ABORTED
+                )
         else:
             if request.resumable:
                 request.streaming_queue = deque()
@@ -2019,6 +2409,10 @@ class Scheduler(SchedulerInterface):
                 continue
 
             valid_requests.append(request)
+            if req_id in self._pending_kv_transitions:
+                self._pending_finish_requests[req_id] = finished_status
+                continue
+
             if request.status == RequestStatus.RUNNING:
                 running_requests_to_remove.add(request)
             else:
@@ -2035,6 +2429,9 @@ class Scheduler(SchedulerInterface):
 
         # Second pass: set status and free requests
         for request in valid_requests:
+            if request.request_id in self._pending_finish_requests:
+                continue
+
             delay_free_blocks = False
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 delay_free_blocks = (
@@ -2052,6 +2449,11 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
         assert request.is_finished()
+        if request.request_id in self._pending_kv_transitions:
+            raise RuntimeError(
+                f"Cannot free request {request.request_id} while a KV cache "
+                "state transition is pending"
+            )
 
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
@@ -2411,6 +2813,8 @@ class Scheduler(SchedulerInterface):
             return True
 
         if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            if request.request_id in self._pending_kv_transitions:
+                return False
             assert not request.streaming_queue
             return False
 

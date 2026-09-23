@@ -20,6 +20,7 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
+from vllm.v1.kv_cache_state import KVBlockState
 from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
@@ -93,6 +94,8 @@ class Request:
                 reasoning_parser_kwargs
             )
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
+        self.last_activity_time: float = self.arrival_time
+        self.kv_cache_state = KVBlockState.HOT
 
         self.status = RequestStatus.WAITING
         self.events: list[EngineCoreEvent] = []
@@ -278,6 +281,15 @@ class Request:
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)
+
+    def mark_activity(self, activity_time: float | None = None) -> None:
+        self.last_activity_time = (
+            activity_time if activity_time is not None else time.time()
+        )
+
+    def get_idle_time(self, current_time: float | None = None) -> float:
+        current_time = current_time if current_time is not None else time.time()
+        return max(0.0, current_time - self.last_activity_time)
 
     def get_finished_reason(self) -> FinishReason | None:
         return RequestStatus.get_finished_reason(self.status)

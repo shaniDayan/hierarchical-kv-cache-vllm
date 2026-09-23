@@ -1392,6 +1392,141 @@ def test_scheduler_config_init():
         print(SchedulerConfig.default_factory().max_model_len)
 
 
+def test_valid_kv_cache_idle_thresholds(monkeypatch):
+    for env_name, env_value in (
+        ("VLLM_USE_V2_MODEL_RUNNER", "1"),
+        ("HKV_ENABLE_PHYSICAL_TIERS", "1"),
+        ("HKV_WARM_POOL_BLOCKS", "16"),
+        ("HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION", "1"),
+        ("HKV_DEBUG_MIXED_READ", "1"),
+    ):
+        monkeypatch.setenv(env_name, env_value)
+
+    config = SchedulerConfig.default_factory(
+        kv_cache_hot_idle_threshold_seconds=10.0,
+        kv_cache_cold_idle_threshold_seconds=20.0,
+    )
+
+    assert config.kv_cache_hot_idle_threshold_seconds == 10.0
+    assert config.kv_cache_cold_idle_threshold_seconds == 20.0
+
+
+def test_valid_kv_cache_demotion_utilizations(monkeypatch):
+    _set_full_hkv_env(monkeypatch)
+
+    config = SchedulerConfig.default_factory(
+        kv_cache_demotion_start_utilization=0.8,
+        kv_cache_demotion_stop_utilization=0.65,
+    )
+
+    assert config.kv_cache_demotion_start_utilization == 0.8
+    assert config.kv_cache_demotion_stop_utilization == 0.65
+
+
+@pytest.mark.parametrize(
+    ("hot_threshold", "cold_threshold"),
+    [
+        (10.0, None),
+        (None, 20.0),
+        (-1.0, 20.0),
+        (10.0, -1.0),
+        (10.0, 10.0),
+        (20.0, 10.0),
+        (float("nan"), 20.0),
+        (10.0, float("inf")),
+    ],
+)
+def test_invalid_kv_cache_idle_thresholds(hot_threshold, cold_threshold):
+    with pytest.raises(ValidationError):
+        SchedulerConfig.default_factory(
+            kv_cache_hot_idle_threshold_seconds=hot_threshold,
+            kv_cache_cold_idle_threshold_seconds=cold_threshold,
+        )
+
+
+@pytest.mark.parametrize(
+    ("start", "stop"),
+    [
+        (0.8, None),
+        (None, 0.65),
+        (-0.1, 0.0),
+        (1.1, 0.65),
+        (0.8, -0.1),
+        (0.8, 1.1),
+        (0.8, 0.8),
+        (0.7, 0.8),
+        (float("nan"), 0.65),
+        (0.8, float("nan")),
+        (float("inf"), 0.65),
+        (0.8, float("inf")),
+        (float("-inf"), 0.65),
+        (0.8, float("-inf")),
+    ],
+)
+def test_invalid_kv_cache_demotion_utilizations(start, stop):
+    with pytest.raises(ValidationError):
+        SchedulerConfig.default_factory(
+            kv_cache_demotion_start_utilization=start,
+            kv_cache_demotion_stop_utilization=stop,
+        )
+
+
+def _set_full_hkv_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("HKV_ENABLE_PHYSICAL_TIERS", "1")
+    monkeypatch.setenv("HKV_WARM_POOL_BLOCKS", "16")
+    monkeypatch.setenv("HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION", "1")
+    monkeypatch.setenv("HKV_DEBUG_MIXED_READ", "1")
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    [
+        "VLLM_USE_V2_MODEL_RUNNER",
+        "HKV_ENABLE_PHYSICAL_TIERS",
+        "HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION",
+        "HKV_DEBUG_MIXED_READ",
+    ],
+)
+def test_kv_cache_idle_thresholds_reject_missing_required_flag(monkeypatch, env_name):
+    _set_full_hkv_env(monkeypatch)
+    monkeypatch.delenv(env_name, raising=False)
+
+    with pytest.raises(ValidationError, match=env_name):
+        SchedulerConfig.default_factory(
+            kv_cache_hot_idle_threshold_seconds=10.0,
+            kv_cache_cold_idle_threshold_seconds=20.0,
+        )
+
+
+@pytest.mark.parametrize("warm_pool_blocks", [None, "0", "not-an-int"])
+def test_kv_cache_idle_thresholds_reject_invalid_warm_pool_blocks(
+    monkeypatch, warm_pool_blocks
+):
+    _set_full_hkv_env(monkeypatch)
+    if warm_pool_blocks is None:
+        monkeypatch.delenv("HKV_WARM_POOL_BLOCKS", raising=False)
+    else:
+        monkeypatch.setenv("HKV_WARM_POOL_BLOCKS", warm_pool_blocks)
+
+    with pytest.raises(ValidationError, match="HKV_WARM_POOL_BLOCKS"):
+        SchedulerConfig.default_factory(
+            kv_cache_hot_idle_threshold_seconds=10.0,
+            kv_cache_cold_idle_threshold_seconds=20.0,
+        )
+
+def test_kv_cache_idle_thresholds_unset_keeps_default_behavior(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    monkeypatch.setenv("HKV_ENABLE_PHYSICAL_TIERS", "0")
+    monkeypatch.setenv("HKV_WARM_POOL_BLOCKS", "0")
+    monkeypatch.setenv("HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION", "0")
+    monkeypatch.setenv("HKV_DEBUG_MIXED_READ", "0")
+
+    config = SchedulerConfig.default_factory()
+    assert config.kv_cache_hot_idle_threshold_seconds is None
+    assert config.kv_cache_cold_idle_threshold_seconds is None
+
+
 @pytest.mark.parametrize(
     (
         "model_id",

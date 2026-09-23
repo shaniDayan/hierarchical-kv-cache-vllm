@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
+import os
 from collections.abc import Callable
 from dataclasses import InitVar
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
@@ -166,6 +168,18 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
+    kv_cache_hot_idle_threshold_seconds: float | None = None
+    """Idle time at which a resumable session's KV cache becomes WARM."""
+
+    kv_cache_cold_idle_threshold_seconds: float | None = None
+    """Idle time at which a resumable session's KV cache becomes COLD."""
+
+    kv_cache_demotion_start_utilization: float | None = None
+    """HOT utilization at which pressure-driven demotion starts."""
+
+    kv_cache_demotion_stop_utilization: float | None = None
+    """Projected HOT utilization at which pressure-driven demotion stops."""
+
     @staticmethod
     def default_factory(**kwargs):
         """
@@ -235,6 +249,69 @@ class SchedulerConfig:
         return None if value is None else handler(value)
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
+        hot_threshold = self.kv_cache_hot_idle_threshold_seconds
+        cold_threshold = self.kv_cache_cold_idle_threshold_seconds
+        demotion_start = self.kv_cache_demotion_start_utilization
+        demotion_stop = self.kv_cache_demotion_stop_utilization
+        if (hot_threshold is None) != (cold_threshold is None):
+            raise ValueError(
+                "KV cache HOT and COLD idle thresholds must both be set or both "
+                "be omitted"
+            )
+        if hot_threshold is not None and cold_threshold is not None:
+            if not math.isfinite(hot_threshold) or not math.isfinite(cold_threshold):
+                raise ValueError("KV cache idle thresholds must be finite")
+            if hot_threshold < 0 or cold_threshold < 0:
+                raise ValueError("KV cache idle thresholds must be non-negative")
+            if cold_threshold <= hot_threshold:
+                raise ValueError(
+                    "KV cache COLD idle threshold must be greater than the HOT "
+                    "idle threshold"
+                )
+
+        if (demotion_start is None) != (demotion_stop is None):
+            raise ValueError(
+                "KV cache demotion start and stop utilizations must both be set "
+                "or both be omitted"
+            )
+        if demotion_start is not None and demotion_stop is not None:
+            if not 0.0 <= demotion_stop < demotion_start <= 1.0:
+                raise ValueError(
+                    "KV cache demotion utilizations must satisfy "
+                    "0.0 <= stop < start <= 1.0"
+                )
+
+        if hot_threshold is not None or demotion_start is not None:
+            required_true_envs = (
+                "VLLM_USE_V2_MODEL_RUNNER",
+                "HKV_ENABLE_PHYSICAL_TIERS",
+                "HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION",
+                "HKV_DEBUG_MIXED_READ",
+            )
+            for env_name in required_true_envs:
+                env_value = os.getenv(env_name)
+                if env_value != "1":
+                    raise ValueError(
+                        "KV cache demotion requires full HOT/WARM mode: "
+                        f"{env_name} must be '1'; got {env_value!r}"
+                    )
+
+            warm_pool_blocks_value = os.getenv("HKV_WARM_POOL_BLOCKS")
+            try:
+                warm_pool_blocks = int(warm_pool_blocks_value or "")
+            except ValueError as exc:
+                raise ValueError(
+                    "KV cache demotion requires full HOT/WARM mode: "
+                    "HKV_WARM_POOL_BLOCKS must be an integer greater than zero; "
+                    f"got {warm_pool_blocks_value!r}"
+                ) from exc
+            if warm_pool_blocks <= 0:
+                raise ValueError(
+                    "KV cache demotion requires full HOT/WARM mode: "
+                    "HKV_WARM_POOL_BLOCKS must be greater than zero; "
+                    f"got {warm_pool_blocks}"
+                )
+
         if is_encoder_decoder:
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True
