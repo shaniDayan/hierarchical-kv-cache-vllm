@@ -1,661 +1,101 @@
-batch,mode,session_id,question_index,gold_value,extracted_value,exact_match,parse_failure,final_text,generated_token_count,mixed_read_steps,warm_logical_blocks_observed,pre_resume_warm_confirmed,eligible,exclusion_reason,completed_turns,error
-batch_1_start_0,all-hot,gsm8k-0000,0,18,18,True,False," 
-
-**Step-by-step reasoning:**
-
-1. **Eggs per day:** 16 eggs/day  
-2. **Eggs eaten for breakfast:** 3 eggs  
-3. **Eggs baked for friends:** 4 eggs  
-4. **Eggs sold at farmers' market:** $2 per egg  
-
-**Total eggs per day:**  
-16 eggs/day - 3 eggs (breakfast) - 4 eggs (baking) = 9 eggs/day  
-
-**Earnings from eggs:**  
-9 eggs/day × $2/egg = $18/day  
-
-#### 18
-",128,0,0,False,True,,2,
-batch_1_start_0,mixed,gsm8k-0000,0,18,18,True,False," 
-
-**Step 1:**  
-Janet's ducks lay 16 eggs per day.  
-She eats 3 eggs for breakfast and 4 eggs for baking muffins.  
-So, she eats $3 + 4 = 7$ eggs per day.  
-
-**Step 2:**  
-She sells the remaining eggs at $2 per egg.  
-She lays 16 eggs per day, eats 7 eggs, and sells the rest.  
-So, she sells $16 - 7 = 9$ eggs per day.  
-
-**Step 3:**  
-She sells the eggs at $2 per egg.  
-So, she makes $9 × 2 = $18 per day.  
-
-#### 18
-",152,152,47,True,True,,2,
-batch_1_start_0,all-hot,gsm8k-0001,1,3,3,True,False," 
-
-A robe takes 2 bolts of blue fiber and half as much white fiber. Half of 2 is 1. So, the total number of bolts is:
-
-2 (blue) + 1 (white) = **3 bolts**.
-
-#### 3
-",55,0,0,False,True,,2,
-batch_1_start_0,mixed,gsm8k-0001,1,3,3,True,False," 
-
-A robe takes 2 bolts of blue fiber and half as much white fiber. Half of 2 is 1. So, the total number of bolts is:
-
-2 (blue) + 1 (white) = **3 bolts**.
-
-#### 3
-",55,55,44,True,True,,2,
-batch_1_start_0,all-hot,gsm8k-0002,2,70000,120000,False,False," 
-
-Josh buys a house for $80,000 and puts in $50,000 in repairs. The value of the house increased by 150%. 
-
-1. The value of the house increased by 150%, so the total value is:
-   $$
-   80,000 + 150\% \times 80,000 = 80,000 + 120,000 = 200,000
-   $$
-
-2. The profit is the difference between the total value and the cost:
-   $$
-   200,000 - 80,000 = 120,000
-   $$
-
-#### 120,000
-",175,0,0,False,True,,2,
-batch_1_start_0,mixed,gsm8k-0002,2,70000,120000,False,False," 
-
-Josh buys a house for $80,000 and puts in $50,000 in repairs. The value of the house increased by 150%. 
-
-1. The value of the house increased by 150%, so the total value is:
-   $$
-   80,000 + 150\% \times 80,000 = 80,000 + 120,000 = 200,000
-   $$
-
-2. The profit is the difference between the total value and the cost:
-   $$
-   200,000 - 80,000 = 120,000
-   $$
-
-#### 120,000
-",175,175,46,True,True,,2,
-batch_1_start_0,all-hot,gsm8k-0003,3,540,180,False,False," 
-
-James runs 60 meters each sprint and does this 3 times a week. So:
-
-$$
-\text{Total meters per week} = 60 \times 3 = 180
-$$
-
-#### 180
-",53,0,0,False,True,,2,
-batch_1_start_0,mixed,gsm8k-0003,3,540,180,False,False," 
-
-James runs 60 meters each sprint and does this 3 times a week. So:
-
-$$
-\text{Total meters per week} = 60 \times 3 = 180
-$$
-
-#### 180
-",53,53,45,True,True,,2,
-batch_1_start_0,all-hot,gsm8k-0004,4,20,60,False,False," 
-
-**Answer:**  
-Wendi gives each chicken 15 cups in the morning, 25 cups in the afternoon, and 3 cups per meal.  
-So, in the final meal, she gives each chicken 3 cups.  
-For 20 chickens, the total is $ 20 \times 3 = 60 $ cups.  
-
-#### 60
-",81,0,0,False,True,,2,
-batch_1_start_0,mixed,gsm8k-0004,4,20,60,False,False," 
-
-**Answer:**  
-Wendi gives each chicken 15 cups in the morning, 25 cups in the afternoon, and 3 cups per meal.  
-So, in the final meal, she gives 3 cups per chicken.  
-For 20 chickens, she needs $ 3 \times 20 = 60 $ cups.  
-
-#### 60
-",80,80,50,True,True,,2,
-batch_2_start_5,all-hot,gsm8k-0005,5,64,-9999999,False,True," 
-
-Kylar wants to buy 16 glasses. The first glass costs $5, and each subsequent glass costs 60% of the price of the previous one. 
-
-- First glass: $5  
-- Second glass: $5 × 0.60 = $3  
-- Third glass: $3 × 0.60 = $1.80  
-- Fourth glass: $1.80 × 0.60 = $1.08  
-- Fifth glass: $1.08 × 0.60 = $0.648  
-- Sixth glass: $0.648 × 0.60 = $0.3888  
-- Seventh glass: $0.3888 × 0.60 = $0.2333  
-- Eighth glass: $0.2333 × 0.60 = $0.14  
-- Ninth glass: $0.14 × 0.60 = $0.084  
-- Tenth glass: $0.084 × 0.60 = $0.0504  
-- Eleventh glass: $0.0504 × 0.60 = $0.03024  
-- Twelfth glass: $0.03024 × 0.60 = $0.018144  
-- Thirteenth glass: $0.018144 × 0.60 = $0.0108864  
-- Fourteenth glass: $0.0108864 × 0.60 = $0.00653184  
-- Fifteenth glass: $0.00653184 × 0.60 = $0.003919104  
-- Sixteenth glass: $0.003919104 × 0.60 = $0.0023514624  
-
-Adding these up:  
-$5 + $3 + $1.80 + $1.08 + $0.648 + $0.3888 + $0.2333 + $0.14 + $0.084 + $0.050",512,0,0,False,True,,2,
-batch_2_start_5,mixed,gsm8k-0005,5,64,-9999999,False,True," 
-
-Kylar wants to buy 16 glasses. The first glass costs $5, and each subsequent glass costs 60% of the price of the previous one. 
-
-- First glass: $5  
-- Second glass: $5 × 0.60 = $3  
-- Third glass: $3 × 0.60 = $1.80  
-- Fourth glass: $1.80 × 0.60 = $1.08  
-- Fifth glass: $1.08 × 0.60 = $0.648  
-- Sixth glass: $0.648 × 0.60 = $0.3888  
-- Seventh glass: $0.3888 × 0.60 = $0.2333  
-- Eighth glass: $0.2333 × 0.60 = $0.14  
-- Ninth glass: $0.14 × 0.60 = $0.084  
-- Tenth glass: $0.084 × 0.60 = $0.0504  
-- Eleventh glass: $0.0504 × 0.60 = $0.03024  
-- Twelfth glass: $0.03024 × 0.60 = $0.018144  
-- Thirteenth glass: $0.018144 × 0.60 = $0.0108864  
-- Fourteenth glass: $0.0108864 × 0.60 = $0.00653184  
-- Fifteenth glass: $0.00653184 × 0.60 = $0.003919104  
-- Sixteenth glass: $0.003919104 × 0.60 = $0.0023514624  
-
-Adding these up:  
-$5 + $3 + $1.80 + $1.08 + $0.648 + $0.3888 + $0.2333 + $0.14 + $0.084 + $0.050",512,512,46,True,True,,2,
-batch_2_start_5,all-hot,gsm8k-0006,6,260,260,True,False," 
-
-### Problem:
-Toulouse has twice as many sheep as Charleston.  
-Charleston has 4 times as many sheep as Seattle.  
-Seattle has 20 sheep.  
-How many sheep do Toulouse, Charleston, and Seattle have together?
-
-### Step-by-step:
-1. **Seattle has 20 sheep.**  
-2. **Charleston has 4 times as many sheep as Seattle:**  
-   $ 4 \times 20 = 80 $ sheep.  
-3. **Toulouse has twice as many sheep as Charleston:**  
-   $ 2 \times 80 = 160 $ sheep.  
-4. **Total number of sheep:**  
-   $ 160 + 80 + 20 = 260 $.
-
-### Final Answer:
-#### 260
-",173,0,0,False,True,,2,
-batch_2_start_5,mixed,gsm8k-0006,6,260,260,True,False," 
-
-### Problem:
-Toulouse has twice as many sheep as Charleston.  
-Charleston has 4 times as many sheep as Seattle.  
-Seattle has 20 sheep.  
-How many sheep do Toulouse, Charleston, and Seattle have together?
-
-### Step-by-step:
-1. **Seattle has 20 sheep.**  
-2. **Charleston has 4 times as many sheep as Seattle:**  
-   $ 4 \times 20 = 80 $ sheep.  
-3. **Toulouse has twice as many sheep as Charleston:**  
-   $ 2 \times 80 = 160 $ sheep.  
-4. **Total number of sheep:**  
-   $ 160 + 80 + 20 = 260 $.
-
-### Final Answer:
-#### 260
-",173,173,45,True,True,,2,
-batch_2_start_5,all-hot,gsm8k-0007,7,160,20,False,False," 
-
-**Answer:**  
-Carla has to restart the download from the beginning after the 40% download.  
-- The download takes 20 minutes to restart.  
-- So, the total time to download the file is 20 minutes.  
-
-#### 20
-",59,0,0,False,True,,2,
-batch_2_start_5,mixed,gsm8k-0007,7,160,80,False,False," 
-
-**Answer:**  
-Carla has to restart the download from the beginning after the 40% download is complete. The download speed is 2 GB/minute, so the time to download the remaining 160 GB is:  
-$$ 160 \div 2 = 80 \text{ minutes} $$  
-So, the total time to download the file is:  
-#### 80
-",88,88,47,True,True,,2,
-batch_2_start_5,all-hot,gsm8k-0008,8,45,55,False,False," 
-
-**Step-by-step reasoning:**
-
-1. **First part:**  
-   John drives for 3 hours at 60 mph.  
-   Distance = Speed × Time = $60 \times 3 = 180$ miles.
-
-2. **Second part:**  
-   He turns around and tries to get home in 4 hours.  
-   - He spends the first 2 hours in **standstill traffic**, so he spends 2 hours driving at 0 mph.  
-   - He spends the next **half-hour** driving at 30 mph.  
-   - He spends the remaining **half-hour** driving at 80 mph.  
-
-   Total driving time:  
-   $2 + 0.5 + 0.5 = 3$ hours.  
-
-   Total distance covered:  
-   $0 \times 2 + 30 \times 0.5 + 80 \times 0.5 = 15 + 40 = 55$ miles.
-
-3. **Final distance from home:**  
-   He is 55 miles away from home.
-
-#### 55
-",237,0,0,False,True,,2,
-batch_2_start_5,mixed,gsm8k-0008,8,45,250,False,False," 
-
-**Step-by-step reasoning:**
-
-1. **First part:**  
-   John drives for 3 hours at 60 mph.  
-   Distance = Speed × Time = $60 \times 3 = 180$ miles.
-
-2. **Second part:**  
-   He turns around and tries to get home in 4 hours.  
-   He spends the first 2 hours in **standstill traffic**, so he spends 2 hours driving at 60 mph.  
-   Then, he spends the next **half-hour** driving at 30 mph.  
-   Then, he drives the remaining **half-hour** at 80 mph.
-
-3. **Total driving time:**  
-   $2 + 0.5 + 0.5 = 3$ hours.
-
-4. **Total distance driven:**  
-   $180 + (60 \times 0.5) + (80 \times 0.5) = 180 + 30 + 40 = 250$ miles.
-
-5. **Final answer:**  
-   He is **250 miles** away from home at the end of those 4 hours.  
-
-#### 250
-",256,256,49,True,True,,2,
-batch_2_start_5,all-hot,gsm8k-0009,9,460,450,False,False," 
-
-Eliza's regular hourly rate is $10. She works for 45 hours this week, and she receives an overtime rate of 1.2 times her regular hourly rate. 
-
-- Regular earnings: $10 × 40 = $400
-- Overtime earnings: $10 × 5 = $50
-- Total earnings: $400 + $50 = $450
-
-#### 450
-",98,0,0,False,True,,2,
-batch_2_start_5,mixed,gsm8k-0009,9,460,450,False,False," 
-
-Eliza's regular hourly rate is $10. She works for 45 hours this week, and she receives an overtime rate of 1.2 times her regular hourly rate. 
-
-- Regular earnings: $10 × 40 = $400
-- Overtime earnings: $10 × 5 = $50
-- Total earnings: $400 + $50 = $450
-
-#### 450
-",98,98,47,True,True,,2,
-batch_3_start_10,all-hot,gsm8k-0010,10,366,366,True,False," 
-
-### Problem:
-A new program had 60 downloads in the first month. The number of downloads in the second month was three times as many as the downloads in the first month, but then reduced by 30% in the third month. How many downloads did the program have total over the three months?
-
-### Step-by-step:
-1. First month: 60 downloads.
-2. Second month: 3 times the first month = $ 3 \times 60 = 180 $ downloads.
-3. Third month: 180 downloads reduced by 30% = $ 180 \times (1 - 0.30) = 180 \times 0.70 = 126 $ downloads.
-
-### Total downloads over the three months:
-$$ 60 + 180 + 126 = 366 $$
-
-#### Final Answer:
-#### 366
-",200,0,0,False,True,,2,
-batch_3_start_10,mixed,gsm8k-0010,10,366,366,True,False," 
-
-### Problem:
-A new program had 60 downloads in the first month. The number of downloads in the second month was three times as many as the downloads in the first month, but then reduced by 30% in the third month. How many downloads did the program have total over the three months?
-
-### Step-by-step:
-1. First month: 60 downloads  
-2. Second month: 3 times the first month = $ 3 \times 60 = 180 $ downloads  
-3. Third month: 180 downloads reduced by 30% = $ 180 \times (1 - 0.30) = 180 \times 0.70 = 126 $ downloads  
-
-### Total downloads over the three months:
-$$ 60 + 180 + 126 = 366 $$
-
-#### Final Answer:
-#### 366
-",200,200,47,True,True,,2,
-batch_3_start_10,all-hot,gsm8k-0011,11,694,694,True,False," 
-
-Toula bought:
-- 3 dozen donuts: $68 per dozen → $68 × 3 = $204  
-- 2 dozen mini cupcakes: $80 per dozen → $80 × 2 = $160  
-- 6 dozen mini cheesecakes: $55 per dozen → $55 × 6 = $330  
-
-Total cost = $204 + $160 + $330 = $694
-
-#### 694
-",113,0,0,False,True,,2,
-batch_3_start_10,mixed,gsm8k-0011,11,694,694,True,False," 
-
-Toula bought:
-- 3 dozen donuts: $68 per dozen → $68 × 3 = $204  
-- 2 dozen mini cupcakes: $80 per dozen → $80 × 2 = $160  
-- 6 dozen mini cheesecakes: $55 per dozen → $55 × 6 = $330  
-
-Total cost = $204 + $160 + $330 = $694
-
-#### 694
-",113,113,47,True,True,,2,
-batch_3_start_10,all-hot,gsm8k-0012,12,13,1,False,False," 
-
-Carlos plants a lemon tree for $90. Each year, the tree grows 7 lemons, which he sells for $1.5 each. It costs $3 to water and feed the tree each year. 
-
-1. **Initial cost**: $90  
-2. **Growth and revenue**:  
-   - Each year, the tree grows 7 lemons, and he sells 7 lemons for $1.5.  
-   - So, each year, he earns $1.5 (from sales) - $3 (costs) = $1.5 - $3 = -$1.5 (net loss).  
-3. **Net profit per year**: -$1.5  
-4. **Years to start earning money**: Since he starts earning money when the net profit becomes positive, he will need **1 year** to start earning money.  
-
-#### 1
-",186,0,0,False,True,,2,
-batch_3_start_10,mixed,gsm8k-0012,12,13,1,False,False," 
-
-Carlos plants a lemon tree for $90. Each year, the tree grows 7 lemons, which he sells for $1.5 each. It costs $3 to water and feed the tree each year. 
-
-1. **Initial cost**: $90  
-2. **Growth and revenue**:  
-   - 7 lemons × $1.5 = $10.5 per year  
-   - Cost to water and feed: $3 per year  
-3. **Net profit per year**: $10.5 - $3 = $7.5 per year  
-
-Since Carlos starts earning money, the tree will **start earning money** after **1 year**.
-
-#### 1
-",147,147,47,True,True,,2,
-batch_3_start_10,all-hot,gsm8k-0013,13,18,4,False,False," 
-
-### Problem:
-Melanie is a door-to-door saleswoman. She sold a third of her vacuum cleaners at the green house, 2 more to the red house, and half of what was left at the orange house. If Melanie has 5 vacuum cleaners left, how many did she start with?
-
-### Step-by-step:
-1. Let the total number of vacuum cleaners Melanie started with be $ x $.
-2. She sold a third of them at the green house: $ \frac{x}{3} $.
-3. She sold 2 more to the red house: $ \frac{x}{3} + 2 $.
-4. She sold half of what was left at the orange house: $ \frac{1}{2} \left( \frac{x}{3} + 2 \right) $.
-5. She has 5 vacuum cleaners left: $ \frac{x}{3} + 2 + \frac{1}{2} \left( \frac{x}{3} + 2 \right) = 5 $.
-
-### Solve:
-Let’s simplify the equation:
-
-$$
-\frac{x}{3} + 2 + \frac{1}{2} \left( \frac{x}{3} + 2 \right) = 5
-$$
-
-$$
-\frac{x}{3} + 2 + \frac{x}{6} + 1 = 5
-$$
-
-$$
-\frac{2x}{6} + \frac{x}{6} + 3 = 5
-$$
-
-$$
-\frac{3x}{6} + 3 = 5
-$$
-
-$$
-\frac{x}{2} + 3 = 5
-$$
-
-$$
-\frac{x}{2} = 2
-$$
-
-$$
-x = 4
-$$
-
-### Final Answer:
-#### 4
-",387,0,0,False,True,,2,
-batch_3_start_10,mixed,gsm8k-0013,13,18,4,False,False," 
-
-### Problem:
-Melanie is a door-to-door saleswoman. She sold a third of her vacuum cleaners at the green house, 2 more to the red house, and half of what was left at the orange house. If Melanie has 5 vacuum cleaners left, how many did she start with?
-
-### Step-by-step:
-1. Let the total number of vacuum cleaners Melanie started with be $ x $.
-2. She sold a third of them at the green house: $ \frac{x}{3} $.
-3. She sold 2 more to the red house: $ \frac{x}{3} + 2 $.
-4. She sold half of what was left at the orange house: $ \frac{1}{2} \left( \frac{x}{3} + 2 \right) $.
-5. She has 5 vacuum cleaners left: $ \frac{x}{3} + 2 + \frac{1}{2} \left( \frac{x}{3} + 2 \right) = 5 $.
-
-### Solve:
-Let’s simplify the equation:
-
-$$
-\frac{x}{3} + 2 + \frac{1}{2} \left( \frac{x}{3} + 2 \right) = 5
-$$
-
-$$
-\frac{x}{3} + 2 + \frac{x}{6} + 1 = 5
-$$
-
-$$
-\frac{2x}{6} + \frac{x}{6} + 3 = 5
-$$
-
-$$
-\frac{3x}{6} + 3 = 5
-$$
-
-$$
-\frac{x}{2} + 3 = 5
-$$
-
-$$
-\frac{x}{2} = 2
-$$
-
-$$
-x = 4
-$$
-
-### Final Answer:
-#### 4
-",387,387,46,True,True,,2,
-batch_3_start_10,all-hot,gsm8k-0014,14,60,60,True,False," 
-
-**Problem:**  
-In a dance class of 20 students, 20% enrolled in contemporary dance, 25% of the remaining enrolled in jazz dance, and the rest enrolled in hip-hop dance. What percentage of the entire students enrolled in hip-hop dance?
-
-**Step-by-step reasoning:**
-
-1. 20% of 20 students = 0.2 × 20 = 4 students enrolled in contemporary dance.
-2. 25% of the remaining 16 students = 0.25 × 16 = 4 students enrolled in jazz dance.
-3. The remaining students = 20 - 4 - 4 = 12 students.
-4. These 12 students enrolled in hip-hop dance.
-5. The percentage of students in hip-hop dance is:  
-   $ \frac{12}{20} \times 100 = 60\% $.
-
-#### 60
-",203,0,0,False,True,,2,
-batch_3_start_10,mixed,gsm8k-0014,14,60,60,True,False," 
-
-### Problem:
-In a dance class of 20 students, 20% enrolled in contemporary dance, 25% of the remaining enrolled in jazz dance, and the rest enrolled in hip-hop dance. What percentage of the entire students enrolled in hip-hop dance?
-
-### Step-by-step:
-1. **Contemporary dance**: 20% of 20 students = $ 0.20 \times 20 = 4 $ students.
-2. **Remaining students**: $ 20 - 4 = 16 $ students.
-3. **Jazz dance**: 25% of the remaining students = $ 0.25 \times 16 = 4 $ students.
-4. **Hip-hop dance**: $ 20 - 4 - 4 = 12 $ students.
-
-### Percentage of students in hip-hop dance:
-$$
-\frac{12}{20} \times 100 = 60\%
-$$
-
-#### Final Answer:
-#### 60
-",216,216,46,True,True,,2,
-batch_4_start_15,all-hot,gsm8k-0015,15,125,8096,False,False," 
-
-### Problem:
-A merchant wants to choose between two purchase plans:
-- **Jewelry**: $5,000
-- **Electronic gadgets**: $8,000
-
-The financial advisor predicts:
-- Jewelry market will rise by **2.5%**
-- Electronic gadgets market will rise by **1.2%**
-
-The merchant wants to **maximize profit** at the end of the month.
-
-### Step-by-step:
-1. **Jewelry**:  
-   If the market rises by 2.5%, the value of the jewelry will be:  
-   $ 5,000 \times 1.025 = 5,125 $
-
-2. **Electronic gadgets**:  
-   If the market rises by 1.2%, the value of the gadgets will be:  
-   $ 8,000 \times 1.012 = 8,096 $
-
-3. **Profit**:  
-   The merchant wants to choose the plan that gives the **maximum profit**.  
-   Since the value of the gadgets is higher, the merchant should choose the **gadget plan**.
-
-### Final Answer:
-#### 8,096
-",250,0,0,False,True,,2,
-batch_4_start_15,mixed,gsm8k-0015,15,125,125,True,False," 
-
-### Problem:
-A merchant wants to choose between two purchase plans:
-- **Jewelry**: $5,000
-- **Electronic gadgets**: $8,000
-
-The financial advisor predicts:
-- Jewelry market will rise by **2.5%**
-- Electronic gadgets market will rise by **1.2%**
-
-The merchant wants to **maximize profit** at the end of the month.
-
-### Step-by-step:
-1. **Jewelry**: 
-   - Price = $5,000
-   - Price increase = 2.5% of $5,000 = $125
-   - Total price = $5,000 + $125 = **$5,125**
-
-2. **Electronic gadgets**:
-   - Price = $8,000
-   - Price increase = 1.2% of $8,000 = $96
-   - Total price = $8,000 + $96 = **$8,096**
-
-3. **Profit**:
-   - Jewelry: $5,125 - $5,000 = **$125**
-   - Electronic gadgets: $8,096 - $8,000 = **$96**
-
-4. **Maximize profit**:
-   - The merchant should choose **jewelry**, as it gives the highest profit.
-
-### Final Answer:
-#### 125
-",312,312,49,True,True,,2,
-batch_4_start_15,all-hot,gsm8k-0016,16,230,230,True,False," 
-
-Answer:  
-Two trains leave San Rafael at the same time.  
-They travel westward for 80 miles each.  
-They travel northward for 150 miles each.  
-The distance covered by each train in the two days is:  
-<<80 + 150 = 230>>230.
-",73,0,0,False,True,,2,
-batch_4_start_15,mixed,gsm8k-0016,16,230,230,True,False," 
-
-Answer:  
-Two trains leave San Rafael at the same time.  
-They travel westward for 80 miles each.  
-They travel northward for 150 miles each.  
-The distance covered by each train in the two days is:  
-<<80 + 150 = 230>>230.
-",73,73,46,True,True,,2,
-batch_4_start_15,all-hot,gsm8k-0017,17,57500,1150,False,False," 
-
-### Step-by-step:
-
-- Jill earns $20 per hour as a teacher.
-- She earns $30 as a cheerleading coach.
-- She works 35 hours a week as a teacher.
-- She works 15 hours a week as a coach.
-- She works 50 weeks a year.
-
-#### Total earnings from teaching:
-$$ 35 \times 20 = 700 $$
-
-#### Total earnings from coaching:
-$$ 15 \times 30 = 450 $$
-
-#### Total annual salary:
-$$ 700 + 450 = 1150 $$
-
-#### Final answer:
-#### 1150
-",145,0,0,False,True,,2,
-batch_4_start_15,mixed,gsm8k-0017,17,57500,1150,False,False," 
-
-### Step-by-step:
-
-- Jill earns $20 per hour as a teacher.
-- She earns $30 as a cheerleading coach.
-- She works 35 hours a week as a teacher.
-- She works 15 hours a week as a coach.
-- She works 50 weeks a year.
-
-#### Total earnings from teaching:
-$$ 35 \times 20 = 700 $$
-
-#### Total earnings from coaching:
-$$ 15 \times 30 = 450 $$
-
-#### Total annual salary:
-$$ 700 + 450 = 1150 $$
-
-#### Final answer:
-#### 1150
-",145,145,46,True,True,,2,
-batch_4_start_15,all-hot,gsm8k-0018,18,7,84,False,False,"  
-
-Answer: Claire makes a 3-egg omelet every morning. In 4 weeks, she eats 3 eggs per omelet × 7 days per week × 4 weeks = <<3×7×4=84>>84 eggs.  
-#### 84
-",62,0,0,False,True,,2,
-batch_4_start_15,mixed,gsm8k-0018,18,7,84,False,False,"  
-
-Answer: Claire makes a 3-egg omelet every morning. In 4 weeks, she eats 3 eggs per omelet × 7 days per week × 4 weeks = <<3×7×4=84>>84 eggs.  
-#### 84
-",62,62,45,True,True,,2,
-batch_4_start_15,all-hot,gsm8k-0019,19,6,3,False,False," 
-
-Marissa walks 4 miles in 1 hour, and 2 miles in another hour. That means she walks a total of $ 4 + 2 = 6 $ miles in 2 hours. 
-
-She has a total of 12 miles to hike. So the remaining distance is $ 12 - 6 = 6 $ miles.
-
-To find her average speed for the remaining 6 miles, we divide the distance by the time: $ 6 \div 2 = 3 $ miles per hour.
-
-#### 3
-",114,0,0,False,True,,2,
-batch_4_start_15,mixed,gsm8k-0019,19,6,3,False,False," 
-
-Marissa walks 4 miles in 1 hour, and 2 miles in another hour. So she walks a total of $ 4 + 2 = 6 $ miles in 2 hours. 
-
-She wants her average speed to be 4 miles per hour. The remaining distance is $ 12 - 6 = 6 $ miles. 
-
-To find the speed needed for the remaining 6 miles, we divide the distance by the time:  
-$$
-\text{Speed} = \frac{6 \text{ miles}}{2 \text{ hours}} = 3 \text{ miles per hour}
-$$
-
-#### 3
-",136,136,47,True,True,,2,
+question_index,question_id,gold_answer,all_hot_extracted_answer,mixed_extracted_answer,all_hot_extraction_success,mixed_extraction_success,all_hot_exact_match,mixed_exact_match,all_hot_generated_token_count,mixed_generated_token_count,token_sequences_identical,extracted_answers_identical,correctness_category,batch_number,start_index,all_hot_execution_status,mixed_execution_status,all_hot_answer_outcome,mixed_answer_outcome,batch
+0,gsm8k-0000,18,18,18,True,True,True,True,128,152,False,True,both_correct,1,0,completed,completed,exact_match,exact_match,batch_01_start_000
+1,gsm8k-0001,3,3,3,True,True,True,True,55,55,True,True,both_correct,1,0,completed,completed,exact_match,exact_match,batch_01_start_000
+2,gsm8k-0002,70000,120000,120000,True,True,False,False,175,175,True,True,both_incorrect,1,0,completed,completed,incorrect,incorrect,batch_01_start_000
+3,gsm8k-0003,540,180,180,True,True,False,False,53,53,True,True,both_incorrect,1,0,completed,completed,incorrect,incorrect,batch_01_start_000
+4,gsm8k-0004,20,60,60,True,True,False,False,81,80,False,True,both_incorrect,1,0,completed,completed,incorrect,incorrect,batch_01_start_000
+5,gsm8k-0005,64,,,False,False,False,False,512,512,True,False,both_extraction_failure,2,5,completed,completed,extraction_failure,extraction_failure,batch_02_start_005
+6,gsm8k-0006,260,260,260,True,True,True,True,173,173,True,True,both_correct,2,5,completed,completed,exact_match,exact_match,batch_02_start_005
+7,gsm8k-0007,160,20,80,True,True,False,False,59,88,False,False,both_incorrect,2,5,completed,completed,incorrect,incorrect,batch_02_start_005
+8,gsm8k-0008,45,55,250,True,True,False,False,237,256,False,False,both_incorrect,2,5,completed,completed,incorrect,incorrect,batch_02_start_005
+9,gsm8k-0009,460,450,450,True,True,False,False,98,98,True,True,both_incorrect,2,5,completed,completed,incorrect,incorrect,batch_02_start_005
+10,gsm8k-0010,366,366,366,True,True,True,True,200,200,False,True,both_correct,3,10,completed,completed,exact_match,exact_match,batch_03_start_010
+11,gsm8k-0011,694,694,694,True,True,True,True,113,113,True,True,both_correct,3,10,completed,completed,exact_match,exact_match,batch_03_start_010
+12,gsm8k-0012,13,1,1,True,True,False,False,186,147,False,True,both_incorrect,3,10,completed,completed,incorrect,incorrect,batch_03_start_010
+13,gsm8k-0013,18,4,4,True,True,False,False,387,387,True,True,both_incorrect,3,10,completed,completed,incorrect,incorrect,batch_03_start_010
+14,gsm8k-0014,60,60,60,True,True,True,True,203,215,False,True,both_correct,3,10,completed,completed,exact_match,exact_match,batch_03_start_010
+15,gsm8k-0015,125,8096,125,True,True,False,True,250,312,False,False,only_mixed_correct,4,15,completed,completed,incorrect,exact_match,batch_04_start_015
+16,gsm8k-0016,230,230,230,True,True,True,True,73,73,True,True,both_correct,4,15,completed,completed,exact_match,exact_match,batch_04_start_015
+17,gsm8k-0017,57500,1150,1150,True,True,False,False,145,145,True,True,both_incorrect,4,15,completed,completed,incorrect,incorrect,batch_04_start_015
+18,gsm8k-0018,7,84,84,True,True,False,False,62,62,True,True,both_incorrect,4,15,completed,completed,incorrect,incorrect,batch_04_start_015
+19,gsm8k-0019,6,3,3,True,True,False,False,114,136,False,True,both_incorrect,4,15,completed,completed,incorrect,incorrect,batch_04_start_015
+20,gsm8k-0020,15,33,18,True,True,False,False,324,332,False,False,both_incorrect,5,20,completed,completed,incorrect,incorrect,batch_05_start_020
+21,gsm8k-0021,14,23,23,True,True,False,False,140,140,True,True,both_incorrect,5,20,completed,completed,incorrect,incorrect,batch_05_start_020
+22,gsm8k-0022,7,7,7,True,True,True,True,110,110,True,True,both_correct,5,20,completed,completed,exact_match,exact_match,batch_05_start_020
+23,gsm8k-0023,8,8,8,True,True,True,True,91,91,True,True,both_correct,5,20,completed,completed,exact_match,exact_match,batch_05_start_020
+24,gsm8k-0024,26,26,26,True,True,True,True,156,156,False,True,both_correct,5,20,completed,completed,exact_match,exact_match,batch_05_start_020
+25,gsm8k-0025,2,2,2,True,True,True,True,245,189,False,True,both_correct,6,25,completed,completed,exact_match,exact_match,batch_06_start_025
+26,gsm8k-0026,243,243,243,True,True,True,True,144,144,True,True,both_correct,6,25,completed,completed,exact_match,exact_match,batch_06_start_025
+27,gsm8k-0027,16,16,16,True,True,True,True,102,102,True,True,both_correct,6,25,completed,completed,exact_match,exact_match,batch_06_start_025
+28,gsm8k-0028,25,25,25,True,True,True,True,94,94,True,True,both_correct,6,25,completed,completed,exact_match,exact_match,batch_06_start_025
+29,gsm8k-0029,104,99,99,True,True,False,False,102,101,False,True,both_incorrect,6,25,completed,completed,incorrect,incorrect,batch_06_start_025
+30,gsm8k-0030,109,109,109,True,True,True,True,193,187,False,True,both_correct,7,30,completed,completed,exact_match,exact_match,batch_07_start_030
+31,gsm8k-0031,80,67,67,True,True,False,False,216,216,True,True,both_incorrect,7,30,completed,completed,incorrect,incorrect,batch_07_start_030
+32,gsm8k-0032,35,260,260,True,True,False,False,122,122,True,True,both_incorrect,7,30,completed,completed,incorrect,incorrect,batch_07_start_030
+33,gsm8k-0033,70,70,70,True,True,True,True,151,142,False,True,both_correct,7,30,completed,completed,exact_match,exact_match,batch_07_start_030
+34,gsm8k-0034,23,23,23,True,True,True,True,112,112,True,True,both_correct,7,30,completed,completed,exact_match,exact_match,batch_07_start_030
+35,gsm8k-0035,9,9,9,True,True,True,True,124,124,True,True,both_correct,8,35,completed,completed,exact_match,exact_match,batch_08_start_035
+36,gsm8k-0036,75,75,75,True,True,True,True,106,101,False,True,both_correct,8,35,completed,completed,exact_match,exact_match,batch_08_start_035
+37,gsm8k-0037,2,2,2,True,True,True,True,230,230,True,True,both_correct,8,35,completed,completed,exact_match,exact_match,batch_08_start_035
+38,gsm8k-0038,10,10,10,True,True,True,True,197,197,True,True,both_correct,8,35,completed,completed,exact_match,exact_match,batch_08_start_035
+39,gsm8k-0039,18,18,18,True,True,True,True,411,407,False,True,both_correct,8,35,completed,completed,exact_match,exact_match,batch_08_start_035
+40,gsm8k-0040,8,8,8,True,True,True,True,101,101,True,True,both_correct,9,40,completed,completed,exact_match,exact_match,batch_09_start_040
+41,gsm8k-0041,200,1200,1200,True,True,False,False,190,104,False,True,both_incorrect,9,40,completed,completed,incorrect,incorrect,batch_09_start_040
+42,gsm8k-0042,26,26,26,True,True,True,True,153,165,False,True,both_correct,9,40,completed,completed,exact_match,exact_match,batch_09_start_040
+43,gsm8k-0043,48,480,5,True,True,False,False,197,257,False,False,both_incorrect,9,40,completed,completed,incorrect,incorrect,batch_09_start_040
+44,gsm8k-0044,20,30,30,True,True,False,False,194,195,False,True,both_incorrect,9,40,completed,completed,incorrect,incorrect,batch_09_start_040
+45,gsm8k-0045,104,44,44,True,True,False,False,131,131,True,True,both_incorrect,10,45,completed,completed,incorrect,incorrect,batch_10_start_045
+46,gsm8k-0046,163,277,277,True,True,False,False,91,91,True,True,both_incorrect,10,45,completed,completed,incorrect,incorrect,batch_10_start_045
+47,gsm8k-0047,800,600,200,True,True,False,False,282,217,False,False,both_incorrect,10,45,completed,completed,incorrect,incorrect,batch_10_start_045
+48,gsm8k-0048,8,8,8,True,True,True,True,121,121,True,True,both_correct,10,45,completed,completed,exact_match,exact_match,batch_10_start_045
+49,gsm8k-0049,30,30,30,True,True,True,True,110,165,False,True,both_correct,10,45,completed,completed,exact_match,exact_match,batch_10_start_045
+50,gsm8k-0050,294,294,294,True,True,True,True,174,174,True,True,both_correct,11,50,completed,completed,exact_match,exact_match,batch_11_start_050
+51,gsm8k-0051,5,5,9,True,True,True,False,185,104,False,False,only_all_hot_correct,11,50,completed,completed,exact_match,incorrect,batch_11_start_050
+52,gsm8k-0052,15,15,15,True,True,True,True,262,266,False,True,both_correct,11,50,completed,completed,exact_match,exact_match,batch_11_start_050
+53,gsm8k-0053,40,40,40,True,True,True,True,214,216,False,True,both_correct,11,50,completed,completed,exact_match,exact_match,batch_11_start_050
+54,gsm8k-0054,40,48,48,True,True,False,False,110,110,True,True,both_incorrect,11,50,completed,completed,incorrect,incorrect,batch_11_start_050
+55,gsm8k-0055,14,14,14,True,True,True,True,64,84,False,True,both_correct,12,55,completed,completed,exact_match,exact_match,batch_12_start_055
+56,gsm8k-0056,3,6,6,True,True,False,False,79,78,False,True,both_incorrect,12,55,completed,completed,incorrect,incorrect,batch_12_start_055
+57,gsm8k-0057,83,249,83,True,True,False,True,216,195,False,False,only_mixed_correct,12,55,completed,completed,incorrect,exact_match,batch_12_start_055
+58,gsm8k-0058,57,0,33,True,True,False,False,153,98,False,False,both_incorrect,12,55,completed,completed,incorrect,incorrect,batch_12_start_055
+59,gsm8k-0059,187,187,187,True,True,True,True,98,98,False,True,both_correct,12,55,completed,completed,exact_match,exact_match,batch_12_start_055
+60,gsm8k-0060,17,18,18,True,True,False,False,101,101,True,True,both_incorrect,13,60,completed,completed,incorrect,incorrect,batch_13_start_060
+61,gsm8k-0061,1430,2600,2600,True,True,False,False,99,99,True,True,both_incorrect,13,60,completed,completed,incorrect,incorrect,batch_13_start_060
+62,gsm8k-0062,25000,2500,2500,True,True,False,False,249,217,False,True,both_incorrect,13,60,completed,completed,incorrect,incorrect,batch_13_start_060
+63,gsm8k-0063,1596,266,266,True,True,False,False,125,125,True,True,both_incorrect,13,60,completed,completed,incorrect,incorrect,batch_13_start_060
+64,gsm8k-0064,300,8,200,True,True,False,False,130,215,False,False,both_incorrect,13,60,completed,completed,incorrect,incorrect,batch_13_start_060
+65,gsm8k-0065,36,14,14,True,True,False,False,159,159,True,True,both_incorrect,14,65,completed,completed,incorrect,incorrect,batch_14_start_065
+66,gsm8k-0066,48,88,88,True,True,False,False,138,138,True,True,both_incorrect,14,65,completed,completed,incorrect,incorrect,batch_14_start_065
+67,gsm8k-0067,595,595,595,True,True,True,True,193,193,True,True,both_correct,14,65,completed,completed,exact_match,exact_match,batch_14_start_065
+68,gsm8k-0068,36,24,36,True,True,False,True,69,202,False,False,only_mixed_correct,14,65,completed,completed,incorrect,exact_match,batch_14_start_065
+69,gsm8k-0069,60,60,60,True,True,True,True,34,34,True,True,both_correct,14,65,completed,completed,exact_match,exact_match,batch_14_start_065
+70,gsm8k-0070,7425,7425,20475,True,True,True,False,170,243,False,False,only_all_hot_correct,15,70,completed,completed,exact_match,incorrect,batch_15_start_070
+71,gsm8k-0071,60,60,60,True,True,True,True,79,79,False,True,both_correct,15,70,completed,completed,exact_match,exact_match,batch_15_start_070
+72,gsm8k-0072,221,221,221,True,True,True,True,98,98,True,True,both_correct,15,70,completed,completed,exact_match,exact_match,batch_15_start_070
+73,gsm8k-0073,255,33,33,True,True,False,False,227,232,False,True,both_incorrect,15,70,completed,completed,incorrect,incorrect,batch_15_start_070
+74,gsm8k-0074,88,55,624,True,True,False,False,168,98,False,False,both_incorrect,15,70,completed,completed,incorrect,incorrect,batch_15_start_070
+75,gsm8k-0075,60,16,32,True,True,False,False,190,185,False,False,both_incorrect,16,75,completed,completed,incorrect,incorrect,batch_16_start_075
+76,gsm8k-0076,5,10,10,True,True,False,False,165,165,True,True,both_incorrect,16,75,completed,completed,incorrect,incorrect,batch_16_start_075
+77,gsm8k-0077,100,100,100,True,True,True,True,136,136,True,True,both_correct,16,75,completed,completed,exact_match,exact_match,batch_16_start_075
+78,gsm8k-0078,6,6,6,True,True,True,True,161,111,False,True,both_correct,16,75,completed,completed,exact_match,exact_match,batch_16_start_075
+79,gsm8k-0079,70,70,70,True,True,True,True,89,89,True,True,both_correct,16,75,completed,completed,exact_match,exact_match,batch_16_start_075
+80,gsm8k-0080,10,10,14,True,True,True,False,188,166,False,False,only_all_hot_correct,17,80,completed,completed,exact_match,incorrect,batch_17_start_080
+81,gsm8k-0081,17,17,17,True,True,True,True,147,147,True,True,both_correct,17,80,completed,completed,exact_match,exact_match,batch_17_start_080
+82,gsm8k-0082,623,623,623,True,True,True,True,93,111,False,True,both_correct,17,80,completed,completed,exact_match,exact_match,batch_17_start_080
+83,gsm8k-0083,600,600,600,True,True,True,True,66,78,False,True,both_correct,17,80,completed,completed,exact_match,exact_match,batch_17_start_080
+84,gsm8k-0084,15,15,15,True,True,True,True,156,177,False,True,both_correct,17,80,completed,completed,exact_match,exact_match,batch_17_start_080
+85,gsm8k-0085,44,128,128,True,True,False,False,10,10,True,True,both_incorrect,18,85,completed,completed,incorrect,incorrect,batch_18_start_085
+86,gsm8k-0086,22,22,22,True,True,True,True,262,262,True,True,both_correct,18,85,completed,completed,exact_match,exact_match,batch_18_start_085
+87,gsm8k-0087,9360,968,1068,True,True,False,False,258,293,False,False,both_incorrect,18,85,completed,completed,incorrect,incorrect,batch_18_start_085
+88,gsm8k-0088,8000,8800,8000,True,True,False,True,115,163,False,False,only_mixed_correct,18,85,completed,completed,incorrect,exact_match,batch_18_start_085
+89,gsm8k-0089,24,24,24,True,True,True,True,63,63,True,True,both_correct,18,85,completed,completed,exact_match,exact_match,batch_18_start_085
+90,gsm8k-0090,225,225,225,True,True,True,True,235,235,True,True,both_correct,19,90,completed,completed,exact_match,exact_match,batch_19_start_090
+91,gsm8k-0091,28,28,28,True,True,True,True,145,84,False,True,both_correct,19,90,completed,completed,exact_match,exact_match,batch_19_start_090
+92,gsm8k-0092,4,4,4,True,True,True,True,230,230,True,True,both_correct,19,90,completed,completed,exact_match,exact_match,batch_19_start_090
+93,gsm8k-0093,36,44,44,True,True,False,False,194,194,True,True,both_incorrect,19,90,completed,completed,incorrect,incorrect,batch_19_start_090
+94,gsm8k-0094,348,168,168,True,True,False,False,176,176,False,True,both_incorrect,19,90,completed,completed,incorrect,incorrect,batch_19_start_090
+95,gsm8k-0095,40,40,40,True,True,True,True,173,173,True,True,both_correct,20,95,completed,completed,exact_match,exact_match,batch_20_start_095
+96,gsm8k-0096,3,3,3,True,True,True,True,75,75,True,True,both_correct,20,95,completed,completed,exact_match,exact_match,batch_20_start_095
+97,gsm8k-0097,12,4,12,True,True,False,True,133,171,False,False,only_mixed_correct,20,95,completed,completed,incorrect,exact_match,batch_20_start_095
+98,gsm8k-0098,5,25,25,True,True,False,False,244,176,False,True,both_incorrect,20,95,completed,completed,incorrect,incorrect,batch_20_start_095
+99,gsm8k-0099,58,40,40,True,True,False,False,127,126,False,True,both_incorrect,20,95,completed,completed,incorrect,incorrect,batch_20_start_095
