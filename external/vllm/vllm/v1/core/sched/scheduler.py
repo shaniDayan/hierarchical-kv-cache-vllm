@@ -51,7 +51,12 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    FinishReason,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_cache_state import (
     KVBlockState,
@@ -107,6 +112,10 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_demotion_stop_utilization = (
             self.scheduler_config.kv_cache_demotion_stop_utilization
         )
+        self.kv_cache_idle_session_eviction_batch = (
+            self.scheduler_config.kv_cache_idle_session_eviction_batch
+        )
+        self._idle_eviction_outputs: list[tuple[int, str]] = []
         self._next_kv_transition_id: int = 0
         self._pending_kv_transitions: dict[str, KVCacheStateTransition] = {}
         self._pending_finish_requests: dict[str, RequestStatus] = {}
@@ -920,20 +929,42 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
-                    reserved_blocks=reserved_blocks,
-                    has_scheduled_reqs=bool(self.running),
-                )
+                def allocate_for_waiting_request() -> KVCacheBlocks | None:
+                    return self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        num_encoder_tokens=num_encoder_tokens,
+                        full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                        reserved_blocks=reserved_blocks,
+                        has_scheduled_reqs=bool(self.running),
+                    )
 
+                new_blocks = allocate_for_waiting_request()
+
+                if new_blocks is None:
+                    shortfall = self._waiting_admission_shortfall(
+                        request,
+                        num_new_tokens=num_new_tokens,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        num_encoder_tokens=num_encoder_tokens,
+                        full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                        reserved_blocks=reserved_blocks,
+                        has_scheduled_reqs=bool(self.running),
+                    )
+                    if self._evict_idle_sessions_for_admission(
+                        request,
+                        step_skipped_waiting,
+                        shortfall,
+                    ):
+                        new_blocks = allocate_for_waiting_request()
                 if new_blocks is None:
                     # The request cannot be scheduled.
 
@@ -1871,6 +1902,16 @@ class Scheduler(SchedulerInterface):
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+        if self._idle_eviction_outputs:
+            for client_index, request_id in self._idle_eviction_outputs:
+                outputs[client_index].append(
+                    EngineCoreOutput(
+                        request_id=request_id,
+                        new_token_ids=[],
+                        finish_reason=FinishReason.ABORT,
+                    )
+                )
+            self._idle_eviction_outputs.clear()
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids = None
@@ -2374,6 +2415,172 @@ class Scheduler(SchedulerInterface):
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+
+    def _releasable_hot_blocks(self, request_id: str) -> int:
+        """HOT blocks this request uniquely holds and finish() will return."""
+        count = 0
+        for group in self.kv_cache_manager.coordinator.get_blocks(request_id):
+            for block in group:
+                if not block.is_null and block.ref_cnt == 1:
+                    count += 1
+        return count
+
+    def _hot_to_warm_demotion_in_flight(self) -> bool:
+        """True when pressure demotion still has to commit before eviction."""
+        if self.kv_cache_demotion_start_utilization is None:
+            return False
+        return any(
+            transition.previous_state is KVBlockState.HOT
+            and transition.new_state is KVBlockState.WARM
+            for transition in self._pending_kv_transitions.values()
+        )
+
+    def _waiting_admission_shortfall(
+        self,
+        request: Request,
+        *,
+        num_new_tokens: int,
+        num_new_computed_tokens: int,
+        new_computed_blocks: KVCacheBlocks,
+        num_lookahead_tokens: int,
+        num_external_computed_tokens: int,
+        num_encoder_tokens: int,
+        full_sequence_must_fit: bool,
+        reserved_blocks: int,
+        has_scheduled_reqs: bool,
+    ) -> int:
+        """Extra free HOT blocks required after allocate_slots returned None.
+
+        Mirrors the two capacity checks in KVCacheManager.allocate_slots.
+        Call this only after that failed call, so a passed full-sequence gate
+        has already dropped skipped blocks.
+        """
+        manager = self.kv_cache_manager
+        new_computed_block_list = new_computed_blocks.blocks
+        num_local_computed_tokens = (
+            request.num_computed_tokens + num_new_computed_tokens
+        )
+        total_computed_tokens = min(
+            num_local_computed_tokens + num_external_computed_tokens,
+            manager.max_model_len,
+        )
+        watermark_blocks = 0
+        if has_scheduled_reqs and request.status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        ):
+            watermark_blocks = manager.watermark_blocks
+        free_blocks = manager.block_pool.get_num_free_blocks()
+
+        if full_sequence_must_fit:
+            full_num_tokens = min(request.num_tokens, manager.max_model_len)
+            full_blocks = manager.coordinator.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=full_num_tokens,
+                new_computed_blocks=new_computed_block_list,
+                num_encoder_tokens=num_encoder_tokens,
+                total_computed_tokens=total_computed_tokens,
+                num_tokens_main_model=full_num_tokens,
+                apply_admission_cap=True,
+            )
+            full_shortfall = full_blocks + watermark_blocks - free_blocks
+            if full_shortfall > 0:
+                return full_shortfall
+
+        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        num_tokens_need_slot = min(
+            num_tokens_main_model + num_lookahead_tokens,
+            manager.max_model_len,
+        )
+        chunk_blocks = manager.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=num_tokens_need_slot,
+            new_computed_blocks=new_computed_block_list,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=(
+                num_local_computed_tokens + num_external_computed_tokens
+            ),
+            num_tokens_main_model=num_tokens_main_model,
+        )
+        available_blocks = free_blocks - reserved_blocks
+        return max(0, chunk_blocks + watermark_blocks - available_blocks)
+
+    def _evict_idle_sessions_for_admission(
+        self,
+        waiting_request: Request,
+        step_skipped_waiting: RequestQueue,
+        shortfall: int,
+    ) -> bool:
+        """Abort the oldest idle sessions until ``shortfall`` HOT blocks are free.
+
+        Demotion remains the first response: a pending HOT→WARM transition
+        keeps its session, and eviction waits while any such transition is
+        still in flight. Running requests are not candidates. Returns True
+        when at least one session was finished.
+        """
+        batch_limit = self.kv_cache_idle_session_eviction_batch
+        if batch_limit <= 0 or shortfall <= 0:
+            return False
+        if self._hot_to_warm_demotion_in_flight():
+            return False
+
+        candidates = [
+            request
+            for request in self.requests.values()
+            if request.resumable
+            and request.status is RequestStatus.WAITING_FOR_STREAMING_REQ
+            and request.request_id != waiting_request.request_id
+            and request.request_id not in self._pending_kv_transitions
+            and request.request_id not in self._pending_finish_requests
+        ]
+        candidates.sort(
+            key=lambda request: (
+                request.last_activity_time,
+                request.arrival_time,
+                request.request_id,
+            )
+        )
+
+        ranked: list[tuple[Request, int]] = []
+        total_releasable = 0
+        for request in candidates:
+            hot_blocks = self._releasable_hot_blocks(request.request_id)
+            if hot_blocks <= 0:
+                continue
+            ranked.append((request, hot_blocks))
+            total_releasable += hot_blocks
+        # Aborting every idle session still cannot admit this request.
+        if total_releasable < shortfall:
+            return False
+
+        chosen: list[Request] = []
+        releasable = 0
+        for request, hot_blocks in ranked:
+            chosen.append(request)
+            releasable += hot_blocks
+            if len(chosen) >= batch_limit or releasable >= shortfall:
+                break
+        # Idle sessions moved aside earlier in this step are not in
+        # waiting/skipped_waiting, so finish_requests would not see them.
+        step_skipped_waiting.remove_requests(chosen)
+        finished = self.finish_requests(
+            [request.request_id for request in chosen],
+            RequestStatus.FINISHED_ABORTED,
+        )
+        self._idle_eviction_outputs.extend(
+            (client_index, request_id) for request_id, client_index in finished
+        )
+        finished_ids = {request_id for request_id, _ in finished}
+        for request in chosen:
+            if request.request_id not in finished_ids:
+                continue
+            logger.info(
+                "Evicted idle session %s: insufficient free HOT blocks "
+                "for waiting request %s",
+                request.request_id,
+                waiting_request.request_id,
+            )
+        return bool(finished_ids)
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus

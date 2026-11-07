@@ -620,6 +620,9 @@ class EngineArgs:
     kv_cache_demotion_stop_utilization: float | None = (
         SchedulerConfig.kv_cache_demotion_stop_utilization
     )
+    kv_cache_idle_session_eviction_batch: int = get_field(
+        SchedulerConfig, "kv_cache_idle_session_eviction_batch"
+    )
 
     disable_hybrid_kv_cache_manager: bool | None = (
         SchedulerConfig.disable_hybrid_kv_cache_manager
@@ -1467,6 +1470,10 @@ class EngineArgs:
             **scheduler_kwargs["kv_cache_demotion_stop_utilization"],
         )
         scheduler_group.add_argument(
+            "--kv-cache-idle-session-eviction-batch",
+            **scheduler_kwargs["kv_cache_idle_session_eviction_batch"],
+        )
+        scheduler_group.add_argument(
             "--prefill-schedule-interval",
             **scheduler_kwargs["prefill_schedule_interval"],
         )
@@ -2170,6 +2177,9 @@ class EngineArgs:
             ),
             kv_cache_demotion_stop_utilization=(
                 self.kv_cache_demotion_stop_utilization
+            ),
+            kv_cache_idle_session_eviction_batch=(
+                self.kv_cache_idle_session_eviction_batch
             ),
             prefill_schedule_interval=self.prefill_schedule_interval,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,

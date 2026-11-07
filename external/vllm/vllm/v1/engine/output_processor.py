@@ -648,6 +648,12 @@ class OutputProcessor:
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
             # 4) Create and handle RequestOutput objects.
+            # A normal streaming turn boundary stays open for the next chunk.
+            # ABORT means the scheduler dropped the session (client cancel or
+            # idle eviction); the stream must end and history is not resumed.
+            streaming_turn_boundary = (
+                req_state.streaming_input and finish_reason != FinishReason.ABORT
+            )
             if request_output := req_state.make_request_output(
                 new_token_ids,
                 pooling_output,
@@ -655,7 +661,7 @@ class OutputProcessor:
                 stop_reason,
                 kv_transfer_params,
             ):
-                if req_state.streaming_input:
+                if streaming_turn_boundary:
                     request_output.finished = False
 
                 if req_state.queue is not None:
@@ -667,7 +673,7 @@ class OutputProcessor:
 
             # Free completed requests.
             if finish_reason is not None:
-                if req_state.streaming_input:
+                if streaming_turn_boundary:
                     if req_state.input_chunk_queue:
                         update = req_state.input_chunk_queue.popleft()
                         req_state.apply_streaming_update(update)

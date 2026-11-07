@@ -356,6 +356,7 @@ class SessionResult:
     generated_token_sha256: str = ""
     generated_token_sample: list[int] = field(default_factory=list)
     turn_results: list[TurnResult] = field(default_factory=list)
+    evicted: bool = False
 
 
 def select_sessions(
@@ -986,7 +987,13 @@ async def run_session(
         max_tokens_per_turn=max_tokens_per_turn,
         effective_max_tokens=effective_max_tokens,
     )
+    if not cancelled and any(
+        reason == "abort" for reason in turn_finish_reasons
+    ):
+        result.evicted = True
     if cancelled:
+        return result, lateness_values
+    if result.evicted:
         return result, lateness_values
     if result.completed_turns != result.turns:
         raise RuntimeError(
@@ -1061,20 +1068,22 @@ def compute_run_metrics(
 def validate_timing_and_turns(sessions: list[SessionResult]) -> list[str]:
     errors: list[str] = []
     for session in sessions:
-        if session.completed_turns != session.turns:
-            errors.append(
-                f"session {session.root_chat_id} completed "
-                f"{session.completed_turns}/{session.turns} turns"
-            )
-        if len(session.turn_results) != session.turns:
-            errors.append(
-                f"session {session.root_chat_id} recorded "
-                f"{len(session.turn_results)}/{session.turns} turn results"
-            )
-        if session.turns > 1 and not session.turn_results:
-            errors.append(
-                f"resumed session {session.root_chat_id} is missing per-turn metrics"
-            )
+        if not session.evicted:
+            if session.completed_turns != session.turns:
+                errors.append(
+                    f"session {session.root_chat_id} completed "
+                    f"{session.completed_turns}/{session.turns} turns"
+                )
+            if len(session.turn_results) != session.turns:
+                errors.append(
+                    f"session {session.root_chat_id} recorded "
+                    f"{len(session.turn_results)}/{session.turns} turn results"
+                )
+            if session.turns > 1 and not session.turn_results:
+                errors.append(
+                    f"resumed session {session.root_chat_id} is missing "
+                    "per-turn metrics"
+                )
 
         for field_name in (
             "scheduled_first_seconds",
@@ -1714,6 +1723,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "generation_policy": generation_parameters(args)["generation_policy"],
         "selected_sessions": selection["selected_session_count"],
         "selected_requests": selection["selected_request_count"],
+        "evicted_sessions": sum(
+            1 for session in session_results if session.evicted
+        ),
         "selection": selection,
         "scheduled_duration_seconds": scheduled_duration,
         "timing": timing_metadata,

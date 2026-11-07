@@ -180,6 +180,16 @@ class SchedulerConfig:
     kv_cache_demotion_stop_utilization: float | None = None
     """Projected HOT utilization at which pressure-driven demotion stops."""
 
+    kv_cache_idle_session_eviction_batch: int = Field(default=8, ge=0)
+    """Max idle resumable sessions finished per waiting-admission failure.
+
+    Used only when a waiting request cannot allocate HOT blocks. The oldest
+    ``WAITING_FOR_STREAMING_REQ`` sessions with no pending HOT→WARM transition
+    are aborted, stopping once their HOT blocks cover the shortfall or this
+    many sessions have been finished. ``0`` disables eviction. Demotion, when
+    configured, still runs first.
+    """
+
     @staticmethod
     def default_factory(**kwargs):
         """
