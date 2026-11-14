@@ -306,6 +306,8 @@ class SchedulerConfig:
                         f"{env_name} must be '1'; got {env_value!r}"
                     )
 
+            # HKV_WARM_POOL_BLOCKS is the on-demand maximum. The worker
+            # does not reserve those blocks until the first demotion.
             warm_pool_blocks_value = os.getenv("HKV_WARM_POOL_BLOCKS")
             try:
                 warm_pool_blocks = int(warm_pool_blocks_value or "")

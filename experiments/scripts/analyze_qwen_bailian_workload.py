@@ -945,8 +945,9 @@ def mixed_hot_start_threshold_blocks(
 ) -> int:
     """Smallest HOT occupancy with occupancy / hot_blocks >= start_utilization.
 
-    Mixed WARM-1024 has 1,812 HOT blocks. 1,449 / 1,812 < 0.80, while
-    1,450 / 1,812 >= 0.80, so demotion begins at 1,450 HOT blocks.
+    Mixed startup HOT matches all-hot. A 4 GiB budget is 2,340 HOT blocks.
+    1,871 / 2,340 < 0.80, while 1,872 / 2,340 >= 0.80, so demotion begins
+    at 1,872 HOT blocks.
     """
     if hot_blocks <= 0:
         return 0

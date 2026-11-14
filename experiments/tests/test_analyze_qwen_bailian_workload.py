@@ -395,21 +395,21 @@ def test_capacity_formulas_all_hot_and_mixed():
     assert all_hot["logical_token_capacity"] == 37_440
     assert all_hot["hot_blocks"] == replay_all_hot["derived_num_gpu_blocks"]
 
-    assert mixed_1024["hot_blocks"] == 1812
-    assert mixed_1024["total_logical_blocks"] == 2836
-    assert mixed_1024["logical_token_capacity"] == 45_376
+    assert mixed_1024["hot_blocks"] == all_hot["hot_blocks"]
+    assert mixed_1024["total_logical_blocks"] == 2340 + 1024
+    assert mixed_1024["logical_token_capacity"] == (2340 + 1024) * 16
     assert mixed_1024["capacity_gain_over_all_hot_percent"] == pytest.approx(
-        21.196581196581197
+        100.0 * 1024 / 2340
+    )
+    assert mixed_1024["warm_storage_bytes"] == 0
+    assert mixed_1024["budget"]["warm_pool_allocation"] == "on_demand"
+    assert mixed_1024["budget"]["on_demand_warm_kv_storage_bytes"] == (
+        1024 * 946_176
     )
 
-    slot_table = 128 * 128 * 4
-    warm_512 = 512 * 946_176
-    expected_512_hot = (total - warm_512 - slot_table) // (1_835_008 + 28 * 4)
-    assert mixed_512["hot_blocks"] == expected_512_hot
-    assert mixed_512["total_logical_blocks"] == expected_512_hot + 512
-    assert mixed_512["logical_token_capacity"] == (
-        expected_512_hot + 512
-    ) * BLOCK_SIZE
+    assert mixed_512["hot_blocks"] == all_hot["hot_blocks"]
+    assert mixed_512["total_logical_blocks"] == 2340 + 512
+    assert mixed_512["logical_token_capacity"] == (2340 + 512) * BLOCK_SIZE
 
     for config in table["configurations"].values():
         assert config["within_total_budget"]
@@ -496,7 +496,7 @@ def test_json_output_schema_and_stable_selection_hash(tmp_path):
     ]
     assert first["recommendation"]["primary_demotion_policy"][
         "mixed_hot_start_threshold_blocks"
-    ] == 1450
+    ] == 1872
     assert first["trace_schema_interpretation"]["input_length_semantics"] == (
         "cumulative_context_tokens"
     )

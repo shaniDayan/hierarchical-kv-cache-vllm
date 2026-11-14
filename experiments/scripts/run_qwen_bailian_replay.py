@@ -24,11 +24,14 @@ from experiments.scripts.qwen_bailian_trace import (
 )
 
 RESULT_SCHEMA_VERSION = "3.0"
+# Same turn aborted this many times without completing fails the run
+# instead of resubmitting forever.
+MAX_CONSECUTIVE_TURN_RECOMPUTES = 8
 ATTENTION_BACKEND = "TRITON_ATTN"
 MODEL_DTYPE = "float16"
 BLOCK_SIZE = 16
 DEFAULT_MAX_NUM_SEQS = 128
-KV_MEMORY_FORMULA_VERSION = "qwen3-0.6b-hkv-persistent-v1"
+KV_MEMORY_FORMULA_VERSION = "qwen3-0.6b-hkv-persistent-v2"
 SUPPORTED_BUDGET_MODEL = "Qwen/Qwen3-0.6B"
 QWEN_ATTENTION_LAYERS = 28
 QWEN_KV_HEADS = 8
@@ -151,6 +154,11 @@ def derive_persistent_kv_budget(args: argparse.Namespace) -> dict[str, Any]:
             "derived_actual_persistent_kv_bytes": None,
             "derived_budget_slack_bytes": None,
             "block_rounding_tolerance_bytes": None,
+            "warm_pool_allocation": "none",
+            "on_demand_warm_pool_blocks": 0,
+            "on_demand_warm_kv_storage_bytes": 0,
+            "on_demand_hot_to_warm_map_storage_bytes": 0,
+            "on_demand_warm_slot_table_storage_bytes": 0,
         }
 
     _validate_explicit_budget_layout(args)
@@ -161,6 +169,40 @@ def derive_persistent_kv_budget(args: argparse.Namespace) -> dict[str, Any]:
     if args.max_num_seqs <= 0:
         raise ValueError("--max-num-seqs must be positive")
 
+    if args.kv_mode == "uniform-int8":
+        bytes_per_budgeted_block = warm_slot_bytes
+        num_gpu_blocks = total_budget // bytes_per_budgeted_block
+        if num_gpu_blocks <= 0:
+            raise ValueError(
+                "configured total KV budget derives no usable INT8 blocks: "
+                f"total={total_budget}, "
+                f"bytes_per_block={bytes_per_budgeted_block}"
+            )
+        int8_bytes = num_gpu_blocks * bytes_per_budgeted_block
+        return {
+            **common,
+            "layout": {
+                **layout,
+                "kv_cache_dtype": "int8_per_token_head",
+                "uniform_int8_baseline": True,
+            },
+            "derived_num_gpu_blocks": num_gpu_blocks,
+            # The single INT8 cache is the runner's only KV tensor, so the
+            # existing hot-storage accounting fields carry its byte count.
+            "derived_hot_kv_budget_bytes": int8_bytes,
+            "derived_warm_kv_storage_bytes": 0,
+            "derived_hot_to_warm_map_storage_bytes": 0,
+            "derived_warm_slot_table_storage_bytes": 0,
+            "derived_actual_persistent_kv_bytes": int8_bytes,
+            "derived_budget_slack_bytes": total_budget - int8_bytes,
+            "block_rounding_tolerance_bytes": bytes_per_budgeted_block - 1,
+            "warm_pool_allocation": "none",
+            "on_demand_warm_pool_blocks": 0,
+            "on_demand_warm_kv_storage_bytes": 0,
+            "on_demand_hot_to_warm_map_storage_bytes": 0,
+            "on_demand_warm_slot_table_storage_bytes": 0,
+        }
+
     mixed = args.kv_mode == "mixed"
     if mixed and (
         args.warm_pool_blocks is None or args.warm_pool_blocks <= 0
@@ -168,49 +210,52 @@ def derive_persistent_kv_budget(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(
             "mixed explicit budgeting requires positive --warm-pool-blocks"
         )
-    warm_bytes = (
-        warm_pool_storage_bytes(args.warm_pool_blocks) if mixed else 0
+    # --warm-pool-blocks is the maximum WARM size to allocate on demand.
+    # Startup HOT capacity matches all-hot: the pool, slot table, and
+    # HOT→WARM maps are not subtracted until demotion actually runs.
+    on_demand_warm_blocks = args.warm_pool_blocks if mixed else 0
+    on_demand_warm_bytes = (
+        warm_pool_storage_bytes(on_demand_warm_blocks) if mixed else 0
     )
-    slot_table_bytes = (
+    on_demand_slot_table_bytes = (
         warm_slot_table_storage_bytes(args.max_model_len, args.max_num_seqs)
         if mixed
         else 0
     )
-    fixed_mixed_bytes = warm_bytes + slot_table_bytes
-    if mixed and fixed_mixed_bytes >= total_budget:
+    on_demand_fixed_bytes = on_demand_warm_bytes + on_demand_slot_table_bytes
+    if mixed and on_demand_fixed_bytes >= total_budget:
         raise ValueError(
-            "mixed WARM pool and slot table require "
-            f"{fixed_mixed_bytes} bytes, which must be less than the "
+            "mixed on-demand WARM pool and slot table require "
+            f"{on_demand_fixed_bytes} bytes, which must be less than the "
             f"configured total KV budget {total_budget}"
         )
 
-    map_bytes_per_hot_block = (
-        QWEN_ATTENTION_LAYERS * INT32_BYTES if mixed else 0
-    )
-    bytes_per_budgeted_block = hot_block_bytes + map_bytes_per_hot_block
-    num_gpu_blocks = (
-        total_budget - fixed_mixed_bytes
-    ) // bytes_per_budgeted_block
+    num_gpu_blocks = total_budget // hot_block_bytes
     if num_gpu_blocks <= 0:
         raise ValueError(
             "configured total KV budget derives no usable HOT blocks: "
-            f"total={total_budget}, fixed_mixed={fixed_mixed_bytes}, "
-            f"bytes_per_budgeted_block={bytes_per_budgeted_block}"
+            f"total={total_budget}, bytes_per_block={hot_block_bytes}"
         )
 
     hot_budget_bytes = num_gpu_blocks * hot_block_bytes
-    map_bytes = num_gpu_blocks * map_bytes_per_hot_block
-    actual_total = hot_budget_bytes + map_bytes + fixed_mixed_bytes
+    on_demand_map_bytes = (
+        num_gpu_blocks * QWEN_ATTENTION_LAYERS * INT32_BYTES if mixed else 0
+    )
     return {
         **common,
         "derived_num_gpu_blocks": num_gpu_blocks,
         "derived_hot_kv_budget_bytes": hot_budget_bytes,
-        "derived_warm_kv_storage_bytes": warm_bytes,
-        "derived_hot_to_warm_map_storage_bytes": map_bytes,
-        "derived_warm_slot_table_storage_bytes": slot_table_bytes,
-        "derived_actual_persistent_kv_bytes": actual_total,
-        "derived_budget_slack_bytes": total_budget - actual_total,
-        "block_rounding_tolerance_bytes": bytes_per_budgeted_block - 1,
+        "derived_warm_kv_storage_bytes": 0,
+        "derived_hot_to_warm_map_storage_bytes": 0,
+        "derived_warm_slot_table_storage_bytes": 0,
+        "derived_actual_persistent_kv_bytes": hot_budget_bytes,
+        "derived_budget_slack_bytes": total_budget - hot_budget_bytes,
+        "block_rounding_tolerance_bytes": hot_block_bytes - 1,
+        "warm_pool_allocation": "on_demand" if mixed else "none",
+        "on_demand_warm_pool_blocks": on_demand_warm_blocks,
+        "on_demand_warm_kv_storage_bytes": on_demand_warm_bytes,
+        "on_demand_hot_to_warm_map_storage_bytes": on_demand_map_bytes,
+        "on_demand_warm_slot_table_storage_bytes": on_demand_slot_table_bytes,
     }
 
 
@@ -357,6 +402,7 @@ class SessionResult:
     generated_token_sample: list[int] = field(default_factory=list)
     turn_results: list[TurnResult] = field(default_factory=list)
     evicted: bool = False
+    recomputed: bool = False
 
 
 def select_sessions(
@@ -810,6 +856,35 @@ def validate_runtime_memory_accounting(
         ],
         "budget_slack_bytes": budget["derived_budget_slack_bytes"],
     }
+    # A mixed run that never demotes matches the startup budget (WARM bytes
+    # stay 0). After the demotion threshold is crossed, the on-demand pool
+    # is extra persistent memory and is allowed to exceed the HOT budget.
+    warm_allocated = (
+        budget.get("warm_pool_allocation") == "on_demand"
+        and runtime["warm_kv_storage_bytes"]
+        == budget.get("on_demand_warm_kv_storage_bytes")
+        and budget.get("on_demand_warm_kv_storage_bytes", 0) > 0
+    )
+    allow_over_budget = False
+    if warm_allocated:
+        map_bytes = budget["on_demand_hot_to_warm_map_storage_bytes"]
+        slot_bytes = budget["on_demand_warm_slot_table_storage_bytes"]
+        actual = (
+            budget["derived_hot_kv_budget_bytes"]
+            + budget["on_demand_warm_kv_storage_bytes"]
+            + map_bytes
+            + slot_bytes
+        )
+        expected["warm_kv_storage_bytes"] = budget[
+            "on_demand_warm_kv_storage_bytes"
+        ]
+        expected["hot_to_warm_map_storage_bytes"] = map_bytes
+        expected["warm_slot_table_storage_bytes"] = slot_bytes
+        expected["actual_persistent_kv_bytes"] = actual
+        expected["budget_slack_bytes"] = (
+            budget["total_kv_budget_bytes"] - actual
+        )
+        allow_over_budget = True
     differences = {
         field_name: {
             "expected": expected_value,
@@ -819,7 +894,10 @@ def validate_runtime_memory_accounting(
         if runtime[field_name] != expected_value
     }
     total_budget = budget["total_kv_budget_bytes"]
-    if runtime["actual_persistent_kv_bytes"] > total_budget:
+    if (
+        not allow_over_budget
+        and runtime["actual_persistent_kv_bytes"] > total_budget
+    ):
         differences["configured_total_kv_budget_bytes"] = {
             "expected_maximum": total_budget,
             "actual": runtime["actual_persistent_kv_bytes"],
@@ -851,6 +929,30 @@ async def observe_hkv(
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:
             pass
+
+
+def recompute_prompt_token_ids(
+    turns: list[ReplayTurn],
+    generated_token_ids: list[list[int]],
+    aborted_turn_index: int,
+) -> list[int]:
+    """Full prompt a client resubmits after the engine aborts the session.
+
+    Each completed turn contributes its delta plus the tokens this run
+    actually generated. The aborted turn contributes only its delta; the
+    new request generates that turn again.
+    """
+    if aborted_turn_index < 0 or aborted_turn_index >= len(turns):
+        raise IndexError(
+            f"aborted turn index {aborted_turn_index} is outside "
+            f"session length {len(turns)}"
+        )
+    tokens: list[int] = []
+    for index in range(aborted_turn_index):
+        tokens.extend(turns[index].delta_token_ids)
+        tokens.extend(generated_token_ids[index])
+    tokens.extend(turns[aborted_turn_index].delta_token_ids)
+    return tokens
 
 
 def load_vllm_sampling_types() -> tuple[Any, Any, Any]:
@@ -909,38 +1011,90 @@ async def run_session(
     turn_generated_token_ids: list[list[int]] = [[] for _ in turns]
     turn_finish_reasons: list[str | None] = [None] * len(turns)
 
-    async def inputs():
-        for i, turn in enumerate(turns):
-            target = replay_started + turn.send_at_seconds
-            delay = target - time.perf_counter()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            now = time.perf_counter() - replay_started
-            actual_send = max(0.0, now)
-            actual_send_times[i] = actual_send
-            if run_timing is not None and run_timing["first_request_sent"] is None:
-                run_timing["first_request_sent"] = utc_now()
-                run_timing["first_request_sent_seconds"] = actual_send
-            lateness = max(0.0, actual_send - turn.send_at_seconds)
-            lateness_values.append(lateness)
-            result.max_send_lateness_seconds = max(
-                result.max_send_lateness_seconds, lateness
-            )
-            yield StreamingInput(
-                {"prompt_token_ids": list(turn.delta_token_ids)},
-                SamplingParams(max_tokens=effective_max_tokens[i], **common),
-            )
-        # Do not send vLLM's stream-finished sentinel before the last output.
-        await turn_finished[-1].wait()
+    def sync_generated_summary() -> None:
+        digest = hashlib.sha256()
+        sample: list[int] = []
+        total = 0
+        for ids in turn_generated_token_ids:
+            for token_id in ids:
+                token_id = int(token_id)
+                total += 1
+                digest.update(token_id.to_bytes(8, "little"))
+                if len(sample) < 16:
+                    sample.append(token_id)
+        result.generated_tokens = total
+        result.generated_token_sample = sample
+        result.generated_token_sha256 = digest.hexdigest()
 
-    digest = hashlib.sha256()
-    finish_index = 0
-    cancelled = False
-    try:
+    def discard_open_turn(index: int) -> None:
+        """Drop a turn that aborted before it finished.
+
+        Closed turns (indexes below finish_index) keep the send, first-output,
+        and finish times already recorded for them.
+        """
+        if index < finish_index:
+            return
+        actual_send_times[index] = None
+        turn_generated_tokens[index] = 0
+        turn_generated_token_ids[index] = []
+        turn_first_output_times[index] = None
+        turn_finished_times[index] = None
+        turn_finish_reasons[index] = None
+        turn_finished[index].clear()
+        if index == 0:
+            result.first_output_seconds = None
+        sync_generated_summary()
+
+    async def drive_request(
+        start_index: int,
+        first_prompt: list[int] | None,
+    ) -> int | None:
+        """Run one generate() call. Return the aborted turn index, if any."""
+        nonlocal finish_index
+
+        async def inputs():
+            for i in range(start_index, len(turns)):
+                turn = turns[i]
+                target = replay_started + turn.send_at_seconds
+                delay = target - time.perf_counter()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                now = time.perf_counter() - replay_started
+                actual_send = max(0.0, now)
+                # A duplicate boundary may already have stamped this turn.
+                # Keep the earlier send so TTFT cannot go negative.
+                if actual_send_times[i] is None:
+                    actual_send_times[i] = actual_send
+                if (
+                    run_timing is not None
+                    and run_timing["first_request_sent"] is None
+                ):
+                    run_timing["first_request_sent"] = utc_now()
+                    run_timing["first_request_sent_seconds"] = actual_send
+                lateness = max(0.0, actual_send - turn.send_at_seconds)
+                lateness_values.append(lateness)
+                result.max_send_lateness_seconds = max(
+                    result.max_send_lateness_seconds, lateness
+                )
+                if i == start_index and first_prompt is not None:
+                    prompt_token_ids = first_prompt
+                else:
+                    prompt_token_ids = list(turn.delta_token_ids)
+                yield StreamingInput(
+                    {"prompt_token_ids": prompt_token_ids},
+                    SamplingParams(
+                        max_tokens=effective_max_tokens[i], **common
+                    ),
+                )
+            # Do not send vLLM's stream-finished sentinel before the last
+            # output. A normal completion ends the generator after this wait.
+            await turn_finished[-1].wait()
+
+        aborted_at: int | None = None
         async for output in engine.generate(
             inputs(), base_params, result.session_id
         ):
-            if not output.outputs:
+            if aborted_at is not None or not output.outputs:
                 continue
             completion = output.outputs[0]
             token_ids = list(completion.token_ids)
@@ -948,21 +1102,43 @@ async def run_session(
             if run_timing is not None:
                 run_timing["last_output_received"] = utc_now()
                 run_timing["last_output_received_seconds"] = now
-            if token_ids and result.first_output_seconds is None:
+            # Idle eviction aborts the session while it is waiting for the
+            # next turn, which has not been submitted yet. A duplicate
+            # turn-boundary signal can also arrive before that submit;
+            # closing the unsent turn would leave it without a send time.
+            if (
+                finish_index < len(turns)
+                and actual_send_times[finish_index] is None
+            ):
+                if completion.finish_reason == "abort":
+                    discard_open_turn(finish_index)
+                    aborted_at = finish_index
+                continue
+            if (
+                token_ids
+                and finish_index < len(turns)
+                and result.first_output_seconds is None
+            ):
                 result.first_output_seconds = now
             if token_ids and finish_index < len(turns):
                 if turn_first_output_times[finish_index] is None:
                     turn_first_output_times[finish_index] = now
                 turn_generated_tokens[finish_index] += len(token_ids)
                 turn_generated_token_ids[finish_index].extend(token_ids)
-            for token_id in token_ids:
-                digest.update(int(token_id).to_bytes(8, "little"))
-            room = 16 - len(result.generated_token_sample)
-            if room > 0:
-                result.generated_token_sample.extend(token_ids[:room])
-            result.generated_tokens += len(token_ids)
+                sync_generated_summary()
+            # The stream-finished sentinel can also report abort after every
+            # turn has already completed; that one is not a recompute.
+            if (
+                completion.finish_reason == "abort"
+                and finish_index < len(turns)
+            ):
+                discard_open_turn(finish_index)
+                aborted_at = finish_index
+                continue
             if completion.finish_reason and finish_index < len(turn_finished):
                 finished_now = time.perf_counter() - replay_started
+                if actual_send_times[finish_index] is None:
+                    actual_send_times[finish_index] = finished_now
                 turn_finished_times[finish_index] = finished_now
                 turn_finish_reasons[finish_index] = completion.finish_reason
                 if turn_first_output_times[finish_index] is None:
@@ -970,11 +1146,42 @@ async def run_session(
                 turn_finished[finish_index].set()
                 finish_index += 1
                 result.completed_turns = finish_index
+        return aborted_at
+
+    finish_index = 0
+    cancelled = False
+    start_index = 0
+    first_prompt: list[int] | None = None
+    aborts_by_turn = [0] * len(turns)
+    try:
+        while not cancelled and start_index < len(turns):
+            aborted_at = await drive_request(start_index, first_prompt)
+            if aborted_at is None:
+                break
+            result.evicted = True
+            result.recomputed = True
+            aborts_by_turn[aborted_at] += 1
+            if aborts_by_turn[aborted_at] > MAX_CONSECUTIVE_TURN_RECOMPUTES:
+                raise RuntimeError(
+                    f"session {result.root_chat_id} turn "
+                    f"{turns[aborted_at].turn} was aborted "
+                    f"{aborts_by_turn[aborted_at]} times without completing"
+                )
+            first_prompt = recompute_prompt_token_ids(
+                turns,
+                turn_generated_token_ids,
+                aborted_at,
+            )
+            start_index = aborted_at
+            # Let the engine cancel the aborted input task before reusing
+            # the same request id.
+            await asyncio.sleep(0)
     except asyncio.CancelledError:
         cancelled = True
 
+    if result.generated_token_sha256 == "":
+        sync_generated_summary()
     result.finished_seconds = time.perf_counter() - replay_started
-    result.generated_token_sha256 = digest.hexdigest()
     record_available_turn_results(
         result,
         turns,
@@ -987,13 +1194,7 @@ async def run_session(
         max_tokens_per_turn=max_tokens_per_turn,
         effective_max_tokens=effective_max_tokens,
     )
-    if not cancelled and any(
-        reason == "abort" for reason in turn_finish_reasons
-    ):
-        result.evicted = True
     if cancelled:
-        return result, lateness_values
-    if result.evicted:
         return result, lateness_values
     if result.completed_turns != result.turns:
         raise RuntimeError(
@@ -1001,9 +1202,18 @@ async def run_session(
             f"{result.completed_turns}/{result.turns} turns"
         )
     if len(result.turn_results) != result.turns:
+        missing = [
+            f"turn {turns[i].turn} (chat_id={turns[i].chat_id})"
+            for i in range(len(turns))
+            if (
+                actual_send_times[i] is None
+                or turn_first_output_times[i] is None
+                or turn_finished_times[i] is None
+            )
+        ]
+        detail = ", ".join(missing) if missing else "unknown turn"
         raise RuntimeError(
-            f"session {result.root_chat_id} turn {turns[0].turn} "
-            f"(chat_id={turns[0].chat_id}) has incomplete timing"
+            f"session {result.root_chat_id} has incomplete timing: {detail}"
         )
 
     return result, lateness_values
@@ -1068,22 +1278,21 @@ def compute_run_metrics(
 def validate_timing_and_turns(sessions: list[SessionResult]) -> list[str]:
     errors: list[str] = []
     for session in sessions:
-        if not session.evicted:
-            if session.completed_turns != session.turns:
-                errors.append(
-                    f"session {session.root_chat_id} completed "
-                    f"{session.completed_turns}/{session.turns} turns"
-                )
-            if len(session.turn_results) != session.turns:
-                errors.append(
-                    f"session {session.root_chat_id} recorded "
-                    f"{len(session.turn_results)}/{session.turns} turn results"
-                )
-            if session.turns > 1 and not session.turn_results:
-                errors.append(
-                    f"resumed session {session.root_chat_id} is missing "
-                    "per-turn metrics"
-                )
+        if session.completed_turns != session.turns:
+            errors.append(
+                f"session {session.root_chat_id} completed "
+                f"{session.completed_turns}/{session.turns} turns"
+            )
+        if len(session.turn_results) != session.turns:
+            errors.append(
+                f"session {session.root_chat_id} recorded "
+                f"{len(session.turn_results)}/{session.turns} turn results"
+            )
+        if session.turns > 1 and not session.turn_results:
+            errors.append(
+                f"resumed session {session.root_chat_id} is missing "
+                "per-turn metrics"
+            )
 
         for field_name in (
             "scheduled_first_seconds",
@@ -1170,7 +1379,16 @@ def validate_final_turn_generation_limits(
 
 def build_experiment_config(args: argparse.Namespace) -> dict[str, Any]:
     mixed = args.kv_mode == "mixed"
+    uniform_int8 = args.kv_mode == "uniform-int8"
     memory_budget = derive_persistent_kv_budget(args)
+    hkv_settings = {
+        "physical_tiers": mixed,
+        "multi_block_warm_migration": mixed,
+        "mixed_attention_read": mixed,
+    }
+    if uniform_int8:
+        hkv_settings["uniform_int8_baseline"] = True
+        hkv_settings["kv_cache_dtype"] = "int8_per_token_head"
     return {
         "experiment_mode": args.experiment_mode,
         "kv_mode": args.kv_mode,
@@ -1191,11 +1409,7 @@ def build_experiment_config(args: argparse.Namespace) -> dict[str, Any]:
             "cold_idle_threshold_seconds": None,
         },
         "warm_pool_blocks": args.warm_pool_blocks if mixed else 0,
-        "hkv_settings": {
-            "physical_tiers": mixed,
-            "multi_block_warm_migration": mixed,
-            "mixed_attention_read": mixed,
-        },
+        "hkv_settings": hkv_settings,
         "max_sessions": args.max_sessions,
         "min_turns": args.min_turns,
         "max_input_length": args.max_input_length,
@@ -1248,7 +1462,7 @@ def build_experiment_fingerprint(
 def build_engine_args_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     mixed = args.kv_mode == "mixed"
     memory_budget = derive_persistent_kv_budget(args)
-    return {
+    kwargs = {
         "model": args.model,
         "dtype": MODEL_DTYPE,
         "enforce_eager": True,
@@ -1275,6 +1489,9 @@ def build_engine_args_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             args.demotion_stop_utilization if mixed else None
         ),
     }
+    if args.kv_mode == "uniform-int8":
+        kwargs["kv_cache_dtype"] = "int8_per_token_head"
+    return kwargs
 
 
 def build_reproducibility_metadata(
@@ -1726,6 +1943,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "evicted_sessions": sum(
             1 for session in session_results if session.evicted
         ),
+        "recomputed_sessions": sum(
+            1 for session in session_results if session.recomputed
+        ),
         "selection": selection,
         "scheduled_duration_seconds": scheduled_duration,
         "timing": timing_metadata,
@@ -1793,11 +2013,17 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         return result
 
-    if mixed and not observation["warm_observed"]:
-        validation_errors.append("mixed mode never observed WARM residency")
-    if not mixed and observation["warm_observed"]:
+    if (
+        mixed
+        and not observation["warm_observed"]
+        and runtime_memory["warm_kv_storage_bytes"] != 0
+    ):
+        validation_errors.append(
+            "mixed mode allocated a WARM pool but never observed WARM residency"
+        )
+    if args.kv_mode == "all-hot" and observation["warm_observed"]:
         validation_errors.append("all-hot mode unexpectedly observed WARM residency")
-    if not mixed:
+    if args.kv_mode == "all-hot":
         unexpected_mixed_storage = {
             field_name: runtime_memory[field_name]
             for field_name in (
@@ -1811,6 +2037,25 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             validation_errors.append(
                 "all-hot mode allocated mixed-only persistent storage: "
                 f"{unexpected_mixed_storage}"
+            )
+    if args.kv_mode == "uniform-int8":
+        if observation["warm_observed"]:
+            validation_errors.append(
+                "uniform-int8 mode unexpectedly observed WARM residency"
+            )
+        unexpected_tier_storage = {
+            field_name: runtime_memory[field_name]
+            for field_name in (
+                "warm_kv_storage_bytes",
+                "hot_to_warm_map_storage_bytes",
+                "warm_slot_table_storage_bytes",
+            )
+            if runtime_memory[field_name] != 0
+        }
+        if unexpected_tier_storage:
+            validation_errors.append(
+                "uniform-int8 mode allocated tiered persistent storage: "
+                f"{unexpected_tier_storage}"
             )
     if not observation["allocator_consistent"]:
         validation_errors.append("WARM allocator ownership became inconsistent")
@@ -1854,7 +2099,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--kv-mode",
-        choices=("all-hot", "mixed"),
+        choices=("all-hot", "mixed", "uniform-int8"),
         required=True,
     )
     parser.add_argument(
@@ -1880,7 +2125,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-tokens-per-turn", type=int)
     parser.add_argument("--demotion-start-utilization", type=float)
     parser.add_argument("--demotion-stop-utilization", type=float)
-    parser.add_argument("--warm-pool-blocks", type=int)
+    parser.add_argument(
+        "--warm-pool-blocks",
+        type=int,
+        help=(
+            "Maximum WARM blocks to allocate on demand after HOT utilization "
+            "crosses the demotion-start threshold. Not reserved at startup."
+        ),
+    )
     parser.add_argument("--metrics-interval", type=float, default=0.05)
     parser.add_argument("--cleanup-timeout", type=float, default=2.0)
     parser.add_argument("--timeout", type=float, default=300.0)
@@ -1956,6 +2208,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def apply_hkv_environment(args: argparse.Namespace) -> None:
     """Apply the replay process environment before the engine starts."""
     mixed = args.kv_mode == "mixed"
+    uniform_int8 = args.kv_mode == "uniform-int8"
     os.environ.update({
         "VLLM_USE_V2_MODEL_RUNNER": "1",
         "VLLM_DISABLE_REQUEST_ID_RANDOMIZATION": "1",
@@ -1966,6 +2219,7 @@ def apply_hkv_environment(args: argparse.Namespace) -> None:
         "HKV_DEBUG_RESUME_PROGRESS": "0",
         "HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION": "1" if mixed else "0",
         "HKV_DEBUG_MIXED_READ": "1" if mixed else "0",
+        "HKV_UNIFORM_INT8_BASELINE": "1" if uniform_int8 else "0",
     })
 
 

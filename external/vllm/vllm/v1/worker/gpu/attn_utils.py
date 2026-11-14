@@ -436,6 +436,111 @@ def bind_hkv_attention_state(
         layer._hkv_hot_to_warm_map = hot_to_warm_maps[layer_name]
 
 
+def prepare_deferred_hkv_warm_pool(
+    *,
+    kv_cache_config: KVCacheConfig,
+    attn_groups: list[list[AttentionGroup]],
+    vllm_config: VllmConfig,
+    hot_kv_dtype: torch.dtype | None,
+    blocks_per_kv_block: list[int] | None,
+) -> int:
+    """Check the physical HOT/WARM config and leave the WARM pool unallocated.
+
+    ``HKV_WARM_POOL_BLOCKS`` is the maximum size to allocate later, when HOT
+    utilization first crosses the demotion-start threshold.
+    """
+    warm_pool_blocks = validate_hkv_physical_configuration(
+        kv_cache_config=kv_cache_config,
+        attn_groups=attn_groups,
+        vllm_config=vllm_config,
+        hot_kv_dtype=hot_kv_dtype,
+        blocks_per_kv_block=blocks_per_kv_block,
+    )
+    if warm_pool_blocks is None or warm_pool_blocks <= 0:
+        raise ValueError(
+            "Deferred WARM allocation requires a positive HKV_WARM_POOL_BLOCKS"
+        )
+    logger.info(
+        "HKV WARM pool left unallocated at worker startup "
+        "(on-demand maximum %d blocks); it is reserved when HOT demotion "
+        "first runs",
+        warm_pool_blocks,
+    )
+    return warm_pool_blocks
+
+
+def allocate_hkv_warm_pool(runner: Any) -> None:
+    """Allocate the physical WARM pool once, then keep it for the run.
+
+    Called from the worker when the scheduler has already decided to demote.
+    A second call is a no-op.
+    """
+    if getattr(runner, "hkv_warm_migration_manager", None) is not None:
+        return
+    if not is_hkv_physical_tiers_enabled():
+        raise ValueError(
+            "WARM demotion requires physical HOT/WARM tiers to be enabled"
+        )
+    from vllm.v1.worker.gpu.hkv_migration import HKVWarmMigrationManager
+
+    warm_kv_caches = initialize_hkv_warm_kv_caches(
+        kv_cache_config=runner.kv_cache_config,
+        attn_groups=runner.attn_groups,
+        kernel_block_sizes=runner.kernel_block_sizes,
+        device=runner.device,
+        vllm_config=runner.vllm_config,
+        hot_kv_dtype=runner.kv_cache_dtype,
+        blocks_per_kv_block=runner.block_tables.blocks_per_kv_block,
+    )
+    if not warm_kv_caches:
+        raise ValueError(
+            "On-demand WARM allocation did not create a physical WARM pool"
+        )
+    hot_to_warm_maps = initialize_hkv_hot_to_warm_maps(
+        hot_kv_caches=runner.hkv_hot_kv_caches,
+        warm_kv_caches=warm_kv_caches,
+        device=runner.device,
+    )
+    bind_hkv_attention_state(
+        warm_kv_caches=warm_kv_caches,
+        hot_to_warm_maps=hot_to_warm_maps,
+        forward_context=(
+            runner.vllm_config.compilation_config.static_forward_context
+        ),
+    )
+    if len(runner.kv_cache_config.kv_cache_groups) != 1:
+        raise ValueError(
+            "Experimental multi-block WARM migration currently supports "
+            "exactly one KV-cache group"
+        )
+    if runner.block_tables.blocks_per_kv_block != [1]:
+        raise ValueError(
+            "Experimental multi-block WARM migration requires "
+            "blocks_per_kv_block == 1"
+        )
+    warm_slot_table = torch.full_like(
+        runner.block_tables.input_block_tables[0], -1
+    )
+    for layer_name in warm_kv_caches:
+        runner.compilation_config.static_forward_context[
+            layer_name
+        ]._hkv_warm_slot_table = warm_slot_table
+    warm_capacity = next(iter(warm_kv_caches.values())).shape[0]
+    runner.hkv_warm_kv_caches = warm_kv_caches
+    runner.hkv_hot_to_warm_maps = hot_to_warm_maps
+    runner.hkv_warm_slot_table = warm_slot_table
+    runner.hkv_warm_migration_manager = HKVWarmMigrationManager(
+        warm_capacity=warm_capacity,
+        hot_kv_caches=runner.hkv_hot_kv_caches,
+        warm_kv_caches=warm_kv_caches,
+        device=runner.device,
+    )
+    logger.info(
+        "Allocated on-demand HKV WARM pool with %d blocks",
+        warm_capacity,
+    )
+
+
 def _get_hkv_per_token_head_scale_views(
     kv_cache: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
@@ -1028,6 +1133,16 @@ def init_kv_cache(
         kv_cache_config=kv_cache_config,
     )
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
+    if (
+        os.getenv("HKV_UNIFORM_INT8_BASELINE", "").strip().lower()
+        in _HKV_TRUE_VALUES
+    ):
+        if cache_dtype != "int8_per_token_head":
+            raise ValueError(
+                "uniform-int8 baseline requires cache_dtype "
+                "'int8_per_token_head'"
+            )
+        logger.info("Running uniform-int8 baseline (full KV cache in INT8)")
     return kv_caches
 
 

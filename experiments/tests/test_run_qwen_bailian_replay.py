@@ -31,6 +31,7 @@ from experiments.scripts.run_qwen_bailian_replay import (
     main,
     parse_args,
     percentile,
+    recompute_prompt_token_ids,
     run,
     run_session,
     selection_metadata,
@@ -380,7 +381,7 @@ def test_all_hot_explicit_budget_derivation():
     assert budget["derived_actual_persistent_kv_bytes"] <= total
 
 
-def test_mixed_explicit_budget_derivation_and_rounding():
+def test_mixed_explicit_budget_matches_all_hot_until_demotion():
     total = 4 * 1024**3
     args = make_replay_args(
         kv_mode="mixed",
@@ -390,30 +391,134 @@ def test_mixed_explicit_budget_derivation_and_rounding():
         total_kv_budget_bytes=total,
     )
     budget = derive_persistent_kv_budget(args)
-    fixed_bytes = 121_110_528 + 65_536
-    expected_blocks = (total - fixed_bytes) // (1_835_008 + 28 * 4)
-    expected_maps = expected_blocks * 28 * 4
-    expected_total = (
-        expected_blocks * 1_835_008
-        + expected_maps
-        + fixed_bytes
+    all_hot = derive_persistent_kv_budget(
+        make_replay_args(total_kv_budget_bytes=total)
     )
 
+    assert budget["derived_num_gpu_blocks"] == all_hot["derived_num_gpu_blocks"]
+    assert (
+        budget["derived_hot_kv_budget_bytes"]
+        == all_hot["derived_hot_kv_budget_bytes"]
+    )
+    assert budget["derived_warm_kv_storage_bytes"] == 0
+    assert budget["derived_hot_to_warm_map_storage_bytes"] == 0
+    assert budget["derived_warm_slot_table_storage_bytes"] == 0
+    assert (
+        budget["derived_actual_persistent_kv_bytes"]
+        == all_hot["derived_actual_persistent_kv_bytes"]
+    )
+    assert budget["derived_actual_persistent_kv_bytes"] <= total
+    assert budget["warm_pool_allocation"] == "on_demand"
+    assert budget["on_demand_warm_pool_blocks"] == 128
+    assert budget["on_demand_warm_kv_storage_bytes"] == 121_110_528
+    assert budget["on_demand_warm_slot_table_storage_bytes"] == 65_536
+    assert budget["on_demand_hot_to_warm_map_storage_bytes"] == (
+        budget["derived_num_gpu_blocks"] * 28 * 4
+    )
+    assert all_hot["warm_pool_allocation"] == "none"
+    assert all_hot["on_demand_warm_kv_storage_bytes"] == 0
+
+
+def test_uniform_int8_budget_uses_warm_slot_bytes_under_the_same_total():
+    total = 3758096384
+    args = make_replay_args(
+        experiment_mode="performance",
+        kv_mode="uniform-int8",
+        max_tokens_per_turn=32,
+        total_kv_budget_bytes=total,
+        max_model_len=9216,
+        max_num_seqs=2048,
+    )
+    budget = derive_persistent_kv_budget(args)
+    slot_bytes = warm_bytes_per_slot()
+    expected_blocks = total // slot_bytes
+
+    assert budget["total_kv_budget_bytes"] == total
     assert budget["derived_num_gpu_blocks"] == expected_blocks
-    assert budget["derived_hot_to_warm_map_storage_bytes"] == expected_maps
-    assert budget["derived_actual_persistent_kv_bytes"] == expected_total
-    assert expected_total <= total
+    assert budget["derived_hot_kv_budget_bytes"] == expected_blocks * slot_bytes
+    assert budget["derived_warm_kv_storage_bytes"] == 0
+    assert budget["derived_hot_to_warm_map_storage_bytes"] == 0
+    assert budget["derived_warm_slot_table_storage_bytes"] == 0
+    assert (
+        budget["derived_actual_persistent_kv_bytes"]
+        == expected_blocks * slot_bytes
+    )
+    assert budget["derived_actual_persistent_kv_bytes"] <= total
+    assert budget["layout"]["kv_cache_dtype"] == "int8_per_token_head"
+    assert budget["layout"]["uniform_int8_baseline"] is True
 
     all_hot = derive_persistent_kv_budget(
         make_replay_args(total_kv_budget_bytes=total)
     )
-    difference = abs(
-        all_hot["derived_actual_persistent_kv_bytes"] - expected_total
+    assert all_hot["layout"].get("uniform_int8_baseline") is None
+    assert all_hot["derived_warm_kv_storage_bytes"] == 0
+
+    kwargs = build_engine_args_kwargs(args)
+    assert kwargs["kv_cache_dtype"] == "int8_per_token_head"
+    assert kwargs["kv_cache_memory_bytes"] == expected_blocks * slot_bytes
+    assert kwargs["kv_cache_demotion_start_utilization"] is None
+    assert kwargs["kv_cache_demotion_stop_utilization"] is None
+    assert "kv_cache_dtype" not in build_engine_args_kwargs(
+        make_replay_args(total_kv_budget_bytes=total)
     )
-    assert difference <= max(
-        all_hot["block_rounding_tolerance_bytes"],
-        budget["block_rounding_tolerance_bytes"],
+
+    config = build_experiment_config(args)
+    assert config["kv_mode"] == "uniform-int8"
+    assert config["warm_pool_blocks"] == 0
+    assert config["thresholds"]["demotion_start_utilization"] is None
+    assert config["hkv_settings"]["physical_tiers"] is False
+    assert config["hkv_settings"]["multi_block_warm_migration"] is False
+    assert config["hkv_settings"]["mixed_attention_read"] is False
+    assert config["hkv_settings"]["uniform_int8_baseline"] is True
+    assert config["hkv_settings"]["kv_cache_dtype"] == "int8_per_token_head"
+    assert "uniform_int8_baseline" not in build_experiment_config(
+        make_replay_args()
+    )["hkv_settings"]
+
+
+def test_uniform_int8_environment_disables_tiering(monkeypatch):
+    monkeypatch.setenv("HKV_ENABLE_PHYSICAL_TIERS", "1")
+    monkeypatch.setenv("HKV_DEBUG_MIXED_READ", "1")
+    monkeypatch.setenv("HKV_UNIFORM_INT8_BASELINE", "0")
+    apply_hkv_environment(
+        make_replay_args(
+            experiment_mode="performance",
+            kv_mode="uniform-int8",
+            max_tokens_per_turn=32,
+            total_kv_budget_bytes=3758096384,
+        )
     )
+    assert os.environ["HKV_ENABLE_PHYSICAL_TIERS"] == "0"
+    assert os.environ["HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION"] == "0"
+    assert os.environ["HKV_DEBUG_MIXED_READ"] == "0"
+    assert os.environ["HKV_WARM_POOL_BLOCKS"] == "0"
+    assert os.environ["HKV_UNIFORM_INT8_BASELINE"] == "1"
+
+    apply_hkv_environment(make_replay_args())
+    assert os.environ["HKV_UNIFORM_INT8_BASELINE"] == "0"
+    assert os.environ["HKV_ENABLE_PHYSICAL_TIERS"] == "0"
+
+
+def test_uniform_int8_rejects_demotion_and_warm_pool():
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--experiment-mode",
+                "performance",
+                "--kv-mode",
+                "uniform-int8",
+                "--result-json",
+                "uniform.json",
+                "--max-tokens-per-turn",
+                "32",
+                "--total-kv-budget-bytes",
+                "3758096384",
+                "--demotion-start-utilization",
+                "0.8",
+                "--demotion-stop-utilization",
+                "0.65",
+            ]
+        )
 
 
 def test_explicit_budget_engine_args_use_only_derived_hot_bytes():
@@ -765,6 +870,52 @@ def test_runtime_memory_validation_reports_exact_components():
     assert "hot_kv_storage_bytes" in errors[0]
     assert "'expected':" in errors[0]
     assert "'actual':" in errors[0]
+
+
+def test_runtime_memory_validation_accepts_on_demand_warm_pool():
+    total = 4 * 1024**3
+    budget = derive_persistent_kv_budget(
+        make_replay_args(
+            kv_mode="mixed",
+            warm_pool_blocks=128,
+            demotion_start_utilization=0.8,
+            demotion_stop_utilization=0.65,
+            total_kv_budget_bytes=total,
+        )
+    )
+    startup = {
+        "num_gpu_blocks": budget["derived_num_gpu_blocks"],
+        "hot_kv_storage_bytes": budget["derived_hot_kv_budget_bytes"],
+        "warm_kv_storage_bytes": 0,
+        "hot_to_warm_map_storage_bytes": 0,
+        "warm_slot_table_storage_bytes": 0,
+        "actual_persistent_kv_bytes": budget["derived_actual_persistent_kv_bytes"],
+        "configured_total_kv_budget_bytes": total,
+        "derived_hot_kv_budget_bytes": budget["derived_hot_kv_budget_bytes"],
+        "budget_slack_bytes": budget["derived_budget_slack_bytes"],
+    }
+    assert validate_runtime_memory_accounting(budget, startup) == []
+
+    actual = (
+        budget["derived_hot_kv_budget_bytes"]
+        + budget["on_demand_warm_kv_storage_bytes"]
+        + budget["on_demand_hot_to_warm_map_storage_bytes"]
+        + budget["on_demand_warm_slot_table_storage_bytes"]
+    )
+    allocated = {
+        **startup,
+        "warm_kv_storage_bytes": budget["on_demand_warm_kv_storage_bytes"],
+        "hot_to_warm_map_storage_bytes": budget[
+            "on_demand_hot_to_warm_map_storage_bytes"
+        ],
+        "warm_slot_table_storage_bytes": budget[
+            "on_demand_warm_slot_table_storage_bytes"
+        ],
+        "actual_persistent_kv_bytes": actual,
+        "budget_slack_bytes": total - actual,
+    }
+    assert actual > total
+    assert validate_runtime_memory_accounting(budget, allocated) == []
 
 
 def test_turn_result_serialization():
@@ -1290,6 +1441,8 @@ def test_run_session_with_fake_engine():
         assert engine.received_inputs[1].sampling_params.max_tokens == 2
         assert session_result.completed_turns == 2
         assert session_result.generated_tokens == 3
+        assert session_result.evicted is False
+        assert session_result.recomputed is False
         assert len(session_result.turn_results) == 2
 
         # FIFO turn 1 mapping
@@ -1321,6 +1474,301 @@ def test_run_session_with_fake_engine():
         assert t2.finish_reason == "length"
 
         # Validate overall session timing
+        assert validate_timing_and_turns([session_result]) == []
+
+    asyncio.run(_test())
+
+
+def test_recompute_prompt_keeps_generated_tokens_and_aborted_delta():
+    turns = [
+        ReplayTurn(
+            session_id="bailian-1",
+            root_chat_id=1,
+            chat_id=1,
+            parent_chat_id=-1,
+            turn=1,
+            send_at_seconds=0.0,
+            input_length=2,
+            trace_output_length=1,
+            delta_token_ids=(1, 2),
+        ),
+        ReplayTurn(
+            session_id="bailian-1",
+            root_chat_id=1,
+            chat_id=2,
+            parent_chat_id=1,
+            turn=2,
+            send_at_seconds=1.0,
+            input_length=4,
+            trace_output_length=1,
+            delta_token_ids=(3, 4),
+        ),
+        ReplayTurn(
+            session_id="bailian-1",
+            root_chat_id=1,
+            chat_id=3,
+            parent_chat_id=2,
+            turn=3,
+            send_at_seconds=2.0,
+            input_length=6,
+            trace_output_length=1,
+            delta_token_ids=(5, 6),
+        ),
+    ]
+    prompt = recompute_prompt_token_ids(
+        turns,
+        [[10], [20], []],
+        aborted_turn_index=2,
+    )
+    assert prompt == [1, 2, 10, 3, 4, 20, 5, 6]
+
+
+def test_run_session_resumes_evicted_session_with_full_history():
+    async def _test():
+        class FakeEngine:
+            def __init__(self):
+                self.prompts: list[list[int]] = []
+                self.session_ids: list[str] = []
+
+            async def generate(self, input_gen, base_params, session_id):
+                self.session_ids.append(session_id)
+                streaming_input = await anext(input_gen)
+                prompt = list(streaming_input.prompt["prompt_token_ids"])
+                self.prompts.append(prompt)
+                call = len(self.prompts)
+                if call == 1:
+                    yield SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(token_ids=[10], finish_reason=None)
+                        ]
+                    )
+                    yield SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(token_ids=[], finish_reason="length")
+                        ]
+                    )
+                    yield SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(token_ids=[], finish_reason="abort")
+                        ]
+                    )
+                    return
+                if call == 2:
+                    yield SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(token_ids=[20], finish_reason=None)
+                        ]
+                    )
+                    yield SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(token_ids=[], finish_reason="length")
+                        ]
+                    )
+                    yield SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(token_ids=[], finish_reason="abort")
+                        ]
+                    )
+                    return
+                yield SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(
+                            token_ids=[30, 31], finish_reason="length"
+                        )
+                    ]
+                )
+
+        turns = [
+            ReplayTurn(
+                session_id="bailian-7",
+                root_chat_id=7,
+                chat_id=7,
+                parent_chat_id=-1,
+                turn=1,
+                send_at_seconds=0.0,
+                input_length=2,
+                trace_output_length=1,
+                delta_token_ids=(1, 2),
+            ),
+            ReplayTurn(
+                session_id="bailian-7",
+                root_chat_id=7,
+                chat_id=8,
+                parent_chat_id=7,
+                turn=2,
+                send_at_seconds=0.0,
+                input_length=4,
+                trace_output_length=1,
+                delta_token_ids=(3, 4),
+            ),
+            ReplayTurn(
+                session_id="bailian-7",
+                root_chat_id=7,
+                chat_id=9,
+                parent_chat_id=8,
+                turn=3,
+                send_at_seconds=0.0,
+                input_length=6,
+                trace_output_length=2,
+                delta_token_ids=(5, 6),
+            ),
+        ]
+        engine = FakeEngine()
+        session_result, _ = await run_session(
+            engine,
+            turns,
+            time.perf_counter(),
+            seed=1,
+            max_tokens_per_turn=2,
+        )
+
+        assert engine.session_ids == ["bailian-7", "bailian-7", "bailian-7"]
+        assert engine.prompts == [
+            [1, 2],
+            [1, 2, 10, 3, 4],
+            [1, 2, 10, 3, 4, 20, 5, 6],
+        ]
+        assert session_result.evicted is True
+        assert session_result.recomputed is True
+        assert session_result.completed_turns == 3
+        assert session_result.generated_tokens == 4
+        assert [turn.generated_token_ids for turn in session_result.turn_results] == [
+            [10],
+            [20],
+            [30, 31],
+        ]
+        assert [turn.finish_reason for turn in session_result.turn_results] == [
+            "length",
+            "length",
+            "length",
+        ]
+        assert validate_timing_and_turns([session_result]) == []
+
+    asyncio.run(_test())
+
+
+def test_recompute_after_duplicate_boundary_has_complete_timing():
+    """A turn-boundary signal before the next submit must not close that turn.
+
+    Closing it would count the turn finished with no send time, and the
+    recompute would start after it. The resumed request has to submit that
+    turn and leave send, first-output, and finish times set.
+    """
+
+    async def _test():
+        class FakeEngine:
+            def __init__(self):
+                self.prompts: list[list[int]] = []
+
+            async def generate(self, input_gen, base_params, session_id):
+                first = await anext(input_gen)
+                self.prompts.append(
+                    list(first.prompt["prompt_token_ids"])
+                )
+                if len(self.prompts) == 1:
+                    yield SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(
+                                token_ids=[10], finish_reason="length"
+                            )
+                        ]
+                    )
+                    # Duplicate boundary while the next turn is still unsent.
+                    yield SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(token_ids=[], finish_reason="stop")
+                        ]
+                    )
+                    yield SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(token_ids=[], finish_reason="abort")
+                        ]
+                    )
+                    return
+
+                pending = [first]
+                while True:
+                    try:
+                        nxt = await asyncio.wait_for(anext(input_gen), 0.05)
+                    except (StopAsyncIteration, TimeoutError):
+                        break
+                    pending.append(nxt)
+                    self.prompts.append(list(nxt.prompt["prompt_token_ids"]))
+                next_id = 20
+                for streaming_input in pending:
+                    count = streaming_input.sampling_params.max_tokens
+                    token_ids = list(range(next_id, next_id + count))
+                    next_id += 10
+                    yield SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(
+                                token_ids=token_ids, finish_reason="length"
+                            )
+                        ]
+                    )
+
+        turns = [
+            ReplayTurn(
+                session_id="bailian-8",
+                root_chat_id=8,
+                chat_id=8,
+                parent_chat_id=-1,
+                turn=1,
+                send_at_seconds=0.0,
+                input_length=2,
+                trace_output_length=1,
+                delta_token_ids=(1, 2),
+            ),
+            ReplayTurn(
+                session_id="bailian-8",
+                root_chat_id=8,
+                chat_id=9,
+                parent_chat_id=8,
+                turn=2,
+                send_at_seconds=0.0,
+                input_length=4,
+                trace_output_length=1,
+                delta_token_ids=(3, 4),
+            ),
+            ReplayTurn(
+                session_id="bailian-8",
+                root_chat_id=8,
+                chat_id=10,
+                parent_chat_id=9,
+                turn=3,
+                send_at_seconds=0.0,
+                input_length=6,
+                trace_output_length=2,
+                delta_token_ids=(5, 6),
+            ),
+        ]
+        engine = FakeEngine()
+        session_result, _ = await run_session(
+            engine,
+            turns,
+            time.perf_counter(),
+            seed=1,
+            max_tokens_per_turn=2,
+        )
+
+        assert engine.prompts == [
+            [1, 2],
+            [1, 2, 10, 3, 4],
+            [5, 6],
+        ]
+        assert session_result.recomputed is True
+        assert session_result.completed_turns == 3
+        assert len(session_result.turn_results) == 3
+        assert [turn.finish_reason for turn in session_result.turn_results] == [
+            "length",
+            "length",
+            "length",
+        ]
+        assert [turn.generated_token_ids for turn in session_result.turn_results] == [
+            [10],
+            [20],
+            [30, 31],
+        ]
         assert validate_timing_and_turns([session_result]) == []
 
     asyncio.run(_test())
@@ -1788,6 +2236,8 @@ def test_successful_run_writes_completed_termination(tmp_path, monkeypatch):
     assert result["experiment_fingerprint"]
     assert result["selected_sessions"] == 2
     assert result["selected_requests"] == 4
+    assert result["evicted_sessions"] == 0
+    assert result["recomputed_sessions"] == 0
     assert result["total_generated_tokens"] == 6
     assert engine.shutdown_calls == 1
     payload = json.loads(args.result_json.read_text(encoding="utf-8"))

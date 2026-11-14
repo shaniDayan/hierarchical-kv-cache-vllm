@@ -63,6 +63,7 @@ from vllm.v1.outputs import (
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
+    allocate_hkv_warm_pool,
     bind_hkv_attention_state,
     build_slot_mappings_by_layer,
     debug_demote_one_hkv_block,
@@ -71,6 +72,8 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_kv_cache,
     initialize_hkv_hot_to_warm_maps,
     initialize_hkv_warm_kv_caches,
+    is_hkv_physical_tiers_enabled,
+    prepare_deferred_hkv_warm_pool,
     record_hkv_mixed_read_stats,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -524,28 +527,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
         )
         self.hkv_hot_kv_caches = kv_caches_dict
-        self.hkv_warm_kv_caches = initialize_hkv_warm_kv_caches(
-            kv_cache_config=self.kv_cache_config,
-            attn_groups=self.attn_groups,
-            kernel_block_sizes=self.kernel_block_sizes,
-            device=self.device,
-            vllm_config=self.vllm_config,
-            hot_kv_dtype=self.kv_cache_dtype,
-            blocks_per_kv_block=self.block_tables.blocks_per_kv_block,
-        )
-        self.hkv_hot_to_warm_maps = initialize_hkv_hot_to_warm_maps(
-            hot_kv_caches=self.hkv_hot_kv_caches,
-            warm_kv_caches=self.hkv_warm_kv_caches,
-            device=self.device,
-        )
-        bind_hkv_attention_state(
-            warm_kv_caches=self.hkv_warm_kv_caches,
-            hot_to_warm_maps=self.hkv_hot_to_warm_maps,
-            forward_context=(
-                self.vllm_config.compilation_config.static_forward_context
-            ),
-        )
-        if is_hkv_multi_block_warm_migration_enabled():
+        if is_hkv_physical_tiers_enabled():
+            prepare_deferred_hkv_warm_pool(
+                kv_cache_config=self.kv_cache_config,
+                attn_groups=self.attn_groups,
+                vllm_config=self.vllm_config,
+                hot_kv_dtype=self.kv_cache_dtype,
+                blocks_per_kv_block=self.block_tables.blocks_per_kv_block,
+            )
+        else:
+            self.hkv_warm_kv_caches = initialize_hkv_warm_kv_caches(
+                kv_cache_config=self.kv_cache_config,
+                attn_groups=self.attn_groups,
+                kernel_block_sizes=self.kernel_block_sizes,
+                device=self.device,
+                vllm_config=self.vllm_config,
+                hot_kv_dtype=self.kv_cache_dtype,
+                blocks_per_kv_block=self.block_tables.blocks_per_kv_block,
+            )
+            self.hkv_hot_to_warm_maps = initialize_hkv_hot_to_warm_maps(
+                hot_kv_caches=self.hkv_hot_kv_caches,
+                warm_kv_caches=self.hkv_warm_kv_caches,
+                device=self.device,
+            )
+            bind_hkv_attention_state(
+                warm_kv_caches=self.hkv_warm_kv_caches,
+                hot_to_warm_maps=self.hkv_hot_to_warm_maps,
+                forward_context=(
+                    self.vllm_config.compilation_config.static_forward_context
+                ),
+            )
+        if (
+            not is_hkv_physical_tiers_enabled()
+            and is_hkv_multi_block_warm_migration_enabled()
+        ):
             if not self.hkv_warm_kv_caches:
                 raise ValueError(
                     "Multi-block WARM migration requires an allocated physical "
@@ -613,6 +628,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "supported only in single-rank (TP=1, PP=1, DP=1) configuration."
             )
 
+        if any(
+            transition.previous_state is KVBlockState.HOT
+            and transition.new_state is KVBlockState.WARM
+            for transition in transitions
+        ):
+            allocate_hkv_warm_pool(self)
         if self.hkv_warm_migration_manager is None:
             raise ValueError(
                 "Multi-block WARM migration manager is not initialized"

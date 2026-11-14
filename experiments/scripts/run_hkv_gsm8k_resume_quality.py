@@ -169,6 +169,7 @@ class EvaluatedSessionState:
 
 def apply_hkv_environment(args: argparse.Namespace) -> None:
     mixed = args.kv_mode == "mixed"
+    uniform_int8 = args.kv_mode == "uniform-int8"
     os.environ.update(
         {
             "VLLM_USE_V2_MODEL_RUNNER": "1",
@@ -181,6 +182,7 @@ def apply_hkv_environment(args: argparse.Namespace) -> None:
             RESUME_PROGRESS_DEBUG_ENV: "0",
             "HKV_ENABLE_MULTI_BLOCK_WARM_MIGRATION": "1" if mixed else "0",
             "HKV_DEBUG_MIXED_READ": "1" if mixed else "0",
+            "HKV_UNIFORM_INT8_BASELINE": "1" if uniform_int8 else "0",
             MIXED_READ_STATS_ENV: "1",
         }
     )
@@ -367,7 +369,7 @@ def record_pre_resume_inspect(
         )
     ):
         validation_errors.append(
-            f"{state.plan.session_id} unexpectedly used WARM in all-hot"
+            f"{state.plan.session_id} unexpectedly used WARM in {kv_mode}"
         )
     return snapshot
 
@@ -856,7 +858,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--kv-mode",
-        choices=("all-hot", "mixed"),
+        choices=("all-hot", "mixed", "uniform-int8"),
         required=True,
     )
     parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)

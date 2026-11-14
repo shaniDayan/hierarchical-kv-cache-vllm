@@ -123,6 +123,7 @@ class Scheduler(SchedulerInterface):
         self._kv_demotion_capacity_cooldown_steps_remaining = 0
         self._kv_demotion_capacity_probe_required = False
         self._kv_demotion_capacity_probe_transition_id: int | None = None
+        self._hkv_on_demand_warm_pool_requested = False
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.kv_cache_config = kv_cache_config
@@ -1446,7 +1447,24 @@ class Scheduler(SchedulerInterface):
             if projected_used_blocks / usable_hot_blocks <= stop:
                 break
 
+        if transitions:
+            self._request_on_demand_warm_pool()
         return transitions
+
+    def _request_on_demand_warm_pool(self) -> None:
+        """Record the first demotion-start crossing that needs a WARM pool.
+
+        The scheduler cannot allocate GPU memory. The worker allocates the
+        configured ``HKV_WARM_POOL_BLOCKS`` pool when it applies the HOT→WARM
+        transitions returned by this step, and keeps that pool for the run.
+        """
+        if self._hkv_on_demand_warm_pool_requested:
+            return
+        self._hkv_on_demand_warm_pool_requested = True
+        logger.info(
+            "HOT utilization crossed kv_cache_demotion_start_utilization; "
+            "WARM pool allocation is requested before demotion begins"
+        )
 
     def _plan_kv_state_transition(
         self,
