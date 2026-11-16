@@ -20,6 +20,15 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Hierarchical KV cache settings on SchedulerConfig:
+# kv_cache_hot_idle_threshold_seconds: idle time before a session becomes WARM.
+# kv_cache_cold_idle_threshold_seconds: idle time before a session becomes COLD.
+# kv_cache_demotion_start_utilization: HOT usage where pressure demotion starts.
+# kv_cache_demotion_stop_utilization: projected HOT usage where demotion stops.
+# kv_cache_idle_session_eviction_batch: idle sessions aborted per admission miss.
+# __post_init__: require both idle thresholds or both demotion bounds, and when
+#     either is set, require the HOT/WARM flags and HKV_WARM_POOL_BLOCKS > 0.
+
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority"]
 
@@ -202,11 +211,11 @@ class SchedulerConfig:
         return SchedulerConfig(**kwargs)
 
     def get_scheduler_cls(self) -> type["SchedulerInterface"]:
-        if self.scheduler_cls is None:
-            if self.async_scheduling:
-                from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+        if self.scheduler_cls is None and self.async_scheduling:
+            from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 
-                return AsyncScheduler
+            return AsyncScheduler
+        if self.scheduler_cls is None:
             from vllm.v1.core.sched.scheduler import Scheduler
 
             return Scheduler
@@ -268,28 +277,45 @@ class SchedulerConfig:
                 "KV cache HOT and COLD idle thresholds must both be set or both "
                 "be omitted"
             )
-        if hot_threshold is not None and cold_threshold is not None:
-            if not math.isfinite(hot_threshold) or not math.isfinite(cold_threshold):
-                raise ValueError("KV cache idle thresholds must be finite")
-            if hot_threshold < 0 or cold_threshold < 0:
-                raise ValueError("KV cache idle thresholds must be non-negative")
-            if cold_threshold <= hot_threshold:
-                raise ValueError(
-                    "KV cache COLD idle threshold must be greater than the HOT "
-                    "idle threshold"
-                )
+        if (
+            hot_threshold is not None
+            and cold_threshold is not None
+            and (
+                not math.isfinite(hot_threshold)
+                or not math.isfinite(cold_threshold)
+            )
+        ):
+            raise ValueError("KV cache idle thresholds must be finite")
+        if (
+            hot_threshold is not None
+            and cold_threshold is not None
+            and (hot_threshold < 0 or cold_threshold < 0)
+        ):
+            raise ValueError("KV cache idle thresholds must be non-negative")
+        if (
+            hot_threshold is not None
+            and cold_threshold is not None
+            and cold_threshold <= hot_threshold
+        ):
+            raise ValueError(
+                "KV cache COLD idle threshold must be greater than the HOT "
+                "idle threshold"
+            )
 
         if (demotion_start is None) != (demotion_stop is None):
             raise ValueError(
                 "KV cache demotion start and stop utilizations must both be set "
                 "or both be omitted"
             )
-        if demotion_start is not None and demotion_stop is not None:
-            if not 0.0 <= demotion_stop < demotion_start <= 1.0:
-                raise ValueError(
-                    "KV cache demotion utilizations must satisfy "
-                    "0.0 <= stop < start <= 1.0"
-                )
+        if (
+            demotion_start is not None
+            and demotion_stop is not None
+            and not 0.0 <= demotion_stop < demotion_start <= 1.0
+        ):
+            raise ValueError(
+                "KV cache demotion utilizations must satisfy "
+                "0.0 <= stop < start <= 1.0"
+            )
 
         if hot_threshold is not None or demotion_start is not None:
             required_true_envs = (
@@ -343,10 +369,13 @@ class SchedulerConfig:
                 self.max_num_batched_tokens,
             )
 
-        if self.max_num_partial_prefills > 1:
-            if self.long_prefill_token_threshold == 0:
-                self.long_prefill_token_threshold = int(max_model_len * 0.04)
+        if (
+            self.max_num_partial_prefills > 1
+            and self.long_prefill_token_threshold == 0
+        ):
+            self.long_prefill_token_threshold = int(max_model_len * 0.04)
 
+        if self.max_num_partial_prefills > 1:
             logger.info(
                 "Concurrent partial prefills enabled with "
                 "max_num_partial_prefills=%d, max_long_partial_prefills=%d, "
@@ -387,19 +416,21 @@ class SchedulerConfig:
                 self.max_num_seqs * max_model_len,
             )
 
-        if self.max_num_partial_prefills > 1:
-            if not self.enable_chunked_prefill:
-                raise ValueError(
-                    "Chunked prefill must be enabled to set "
-                    "max_num_partial_prefills > 1."
-                )
+        if self.max_num_partial_prefills > 1 and not self.enable_chunked_prefill:
+            raise ValueError(
+                "Chunked prefill must be enabled to set "
+                "max_num_partial_prefills > 1."
+            )
 
-            if self.long_prefill_token_threshold > max_model_len:
-                raise ValueError(
-                    "long_prefill_token_threshold "
-                    f"({self.long_prefill_token_threshold}) cannot be greater "
-                    f"than the max_model_len ({max_model_len})."
-                )
+        if (
+            self.max_num_partial_prefills > 1
+            and self.long_prefill_token_threshold > max_model_len
+        ):
+            raise ValueError(
+                "long_prefill_token_threshold "
+                f"({self.long_prefill_token_threshold}) cannot be greater "
+                f"than the max_model_len ({max_model_len})."
+            )
 
         if self.max_long_partial_prefills > self.max_num_partial_prefills:
             raise ValueError(

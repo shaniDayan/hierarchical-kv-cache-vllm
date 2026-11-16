@@ -1,5 +1,13 @@
 """Replay Qwen-Bailian chat sessions through vLLM streaming input."""
 
+# parse_args: modes, session filters, trace path, and budget checks.
+# derive_persistent_kv_budget: HOT block count and on-demand WARM bytes.
+# build_engine_args_kwargs: engine settings for the selected KV mode.
+# create_engine: build the AsyncLLM engine for one Bailian replay.
+# run_session: replay one session and resubmit after an idle eviction.
+# recompute_prompt_token_ids: rebuild the prompt for an aborted turn.
+# run: launch the sessions, validate the run, and write result JSON.
+
 from __future__ import annotations
 
 import argparse
@@ -682,11 +690,14 @@ def session_results_from_outcomes(
     sessions: list[SessionResult] = []
     lateness: list[float] = []
     for outcome in outcomes:
-        if isinstance(outcome, tuple) and len(outcome) == 2:
+        if (
+            isinstance(outcome, tuple)
+            and len(outcome) == 2
+            and isinstance(outcome[0], SessionResult)
+        ):
             session, values = outcome
-            if isinstance(session, SessionResult):
-                sessions.append(session)
-                lateness.extend(values)
+            sessions.append(session)
+            lateness.extend(values)
     return sessions, lateness
 
 
@@ -1106,23 +1117,24 @@ async def run_session(
             # next turn, which has not been submitted yet. A duplicate
             # turn-boundary signal can also arrive before that submit;
             # closing the unsent turn would leave it without a send time.
-            if (
+            waiting_to_send = (
                 finish_index < len(turns)
                 and actual_send_times[finish_index] is None
-            ):
-                if completion.finish_reason == "abort":
-                    discard_open_turn(finish_index)
-                    aborted_at = finish_index
+            )
+            if waiting_to_send and completion.finish_reason == "abort":
+                discard_open_turn(finish_index)
+                aborted_at = finish_index
+            if waiting_to_send:
                 continue
-            if (
-                token_ids
-                and finish_index < len(turns)
-                and result.first_output_seconds is None
-            ):
+            recording_turn = bool(token_ids) and finish_index < len(turns)
+            if recording_turn and result.first_output_seconds is None:
                 result.first_output_seconds = now
-            if token_ids and finish_index < len(turns):
-                if turn_first_output_times[finish_index] is None:
-                    turn_first_output_times[finish_index] = now
+            if (
+                recording_turn
+                and turn_first_output_times[finish_index] is None
+            ):
+                turn_first_output_times[finish_index] = now
+            if recording_turn:
                 turn_generated_tokens[finish_index] += len(token_ids)
                 turn_generated_token_ids[finish_index].extend(token_ids)
                 sync_generated_summary()
@@ -1539,10 +1551,10 @@ def _fingerprint_differences(
             path = f"{prefix}.{key}" if prefix else key
             if key not in current or key not in baseline:
                 differences.append(path)
-            else:
-                differences.extend(
-                    _fingerprint_differences(current[key], baseline[key], path)
-                )
+                continue
+            differences.extend(
+                _fingerprint_differences(current[key], baseline[key], path)
+            )
         return differences
     return [] if current == baseline else [prefix]
 
@@ -1562,10 +1574,11 @@ def validate_baseline_schema(
             .get("persistent_kv_memory_budget", {})
             .get("total_kv_budget_bytes")
         )
-        if (
-            baseline.get("schema_version") != RESULT_SCHEMA_VERSION
-            or baseline_budget is None
-        ):
+        schema_ready = (
+            baseline.get("schema_version") == RESULT_SCHEMA_VERSION
+            and baseline_budget is not None
+        )
+        if not schema_ready:
             raise ValueError(
                 "legacy baseline unsupported for performance comparison: "
                 f"schema {RESULT_SCHEMA_VERSION} with an explicit persistent "
@@ -1862,9 +1875,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             "requests_per_second": None,
             "output_tokens_per_second_service_window": None,
         }
+    elif last_output_received_seconds is None:
+        raise RuntimeError("no model output was received during the workload")
     else:
-        if last_output_received_seconds is None:
-            raise RuntimeError("no model output was received during the workload")
         last_output_received_perf = (
             workload_started + last_output_received_seconds
         )
@@ -2038,11 +2051,11 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 "all-hot mode allocated mixed-only persistent storage: "
                 f"{unexpected_mixed_storage}"
             )
+    if args.kv_mode == "uniform-int8" and observation["warm_observed"]:
+        validation_errors.append(
+            "uniform-int8 mode unexpectedly observed WARM residency"
+        )
     if args.kv_mode == "uniform-int8":
-        if observation["warm_observed"]:
-            validation_errors.append(
-                "uniform-int8 mode unexpectedly observed WARM residency"
-            )
         unexpected_tier_storage = {
             field_name: runtime_memory[field_name]
             for field_name in (
@@ -2140,12 +2153,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.experiment_mode == "correctness":
         if args.max_tokens_per_turn is None:
             args.max_tokens_per_turn = 1
-        elif args.max_tokens_per_turn <= 0:
+        if args.max_tokens_per_turn <= 0:
             parser.error("--max-tokens-per-turn must be positive")
-    elif (
-        args.max_tokens_per_turn is None
-        or args.max_tokens_per_turn <= 1
-    ):
+    elif args.max_tokens_per_turn is None or args.max_tokens_per_turn <= 1:
         parser.error(
             "performance mode requires --max-tokens-per-turn greater than 1"
         )
@@ -2182,11 +2192,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(
                 "pressure thresholds must satisfy 0 <= stop < start <= 1"
             )
-        if args.warm_pool_blocks is None or args.warm_pool_blocks <= 0:
-            parser.error("mixed mode requires positive --warm-pool-blocks")
-    elif args.warm_pool_blocks is not None:
+    if mixed and (
+        args.warm_pool_blocks is None or args.warm_pool_blocks <= 0
+    ):
+        parser.error("mixed mode requires positive --warm-pool-blocks")
+    if not mixed and args.warm_pool_blocks is not None:
         parser.error("--warm-pool-blocks is valid only in mixed mode")
-    else:
+    if not mixed and args.warm_pool_blocks is None:
         args.warm_pool_blocks = 0
 
     if args.time_scale <= 0 or args.min_turns <= 0:

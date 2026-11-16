@@ -6,9 +6,10 @@ through ``experiments/scripts/run_qwen_bailian_replay.py``. After that run
 finishes, the suite measures GSM8K exact-match accuracy with the ballast
 method in ``experiments/scripts/hkv_gsm8k.py`` (via
 ``run_hkv_gsm8k_resume_quality.py``). The default dataset is the full
-GSM8K split under ``datasets/gsm8k/openai_grade_school_math/``, and every
-question in its test split is scored. ``--gsm8k-trace`` overrides that
-directory. A timed GSM8K trace passed with ``--gsm8k-trace`` is preferred
+GSM8K split under ``datasets/gsm8k/openai_grade_school_math/``. A normal
+run scores 200 questions from its test split. ``--accuracy-questions``
+overrides that count, and ``--gsm8k-trace`` overrides the directory.
+A timed GSM8K trace passed with ``--gsm8k-trace`` is preferred
 when a runner for it exists; otherwise the suite falls back to ballast.
 Replay and accuracy JSON files are written
 under ``experiments/results/correctness_suite/``.
@@ -17,6 +18,14 @@ Run from the repository root:
 
     PYTHONPATH=$PWD python experiments/scripts/run_correctness_suite.py --dry-run
 """
+
+# parse_args: modes, session counts, Bailian trace, and GSM8K dataset.
+# replay_argv: capacity-replay command for one mode and session count.
+# build_ballast_command: GSM8K ballast accuracy command for that cell.
+# build_timed_gsm8k_command: timed-trace accuracy command, when a runner exists.
+# write_summary: write summary.json for the fresh rows and cached baseline.
+# load_cached_uniform_int8_rows: load previous uniform-int8 results from disk.
+# run_suite: launch capacity then accuracy, then print and save the summary.
 
 from __future__ import annotations
 
@@ -51,9 +60,9 @@ DEFAULT_TRACE = (
 # runner: a mode it rejects as an invalid --kv-mode choice is reported and
 # skipped. uniform-int16 is listed so that gap stays visible.
 SUITE_MODES = ("all-hot", "mixed", "uniform-int8", "uniform-int16")
-# uniform-int8 is stable and is loaded from cache unless explicitly requested
-# via --modes. Previous result JSONs in the results directory are not deleted.
-DEFAULT_MODES = ("all-hot", "mixed")
+# A normal run executes all three supported modes. If --modes omits
+# uniform-int8, previous result JSONs are still shown and are not deleted.
+DEFAULT_MODES = ("all-hot", "mixed", "uniform-int8")
 CACHED_BASELINE_MODE = "uniform-int8"
 # Full GSM8K split (train.jsonl and test.jsonl). --gsm8k-trace replaces this.
 DEFAULT_GSM8K_DATASET = (
@@ -64,6 +73,12 @@ ACCURACY_METHOD_TIMED = "timed_gsm8k_trace"
 DEFAULT_SESSION_COUNTS = (125, 150, 200)
 # Published capacity configuration (README / 3.5 GiB Qwen3-0.6B runs).
 DEFAULT_TOTAL_KV_BUDGET_BYTES = 3758096384
+# Accuracy uses its own KV budget. 12 GB is the default for that step,
+# separate from the 3.5 GiB capacity budget.
+DEFAULT_ACCURACY_KV_BUDGET_BYTES = 12000000000
+# Questions scored from the GSM8K test split unless --accuracy-questions
+# overrides it. The count is capped at the size of test.jsonl.
+DEFAULT_ACCURACY_QUESTIONS = 200
 DEFAULT_TIME_SCALE = 0.05
 DEFAULT_TIMEOUT_SECONDS = 600.0
 DEFAULT_MAX_TOKENS_PER_TURN = 32
@@ -140,8 +155,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Capacity replay plus GSM8K exact-match accuracy for each "
-            "hierarchical KV mode and session count. Accuracy scores every "
-            "question in the chosen dataset's test split."
+            "hierarchical KV mode and session count. Accuracy scores 200 "
+            "questions from the chosen dataset's test split unless "
+            "--accuracy-questions is set."
         )
     )
     parser.add_argument(
@@ -149,11 +165,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=parse_modes,
         default=parse_modes(",".join(DEFAULT_MODES)),
         help=(
-            "Comma-separated modes: "
+            "Comma-separated modes to execute: "
             + ", ".join(SUITE_MODES)
-            + ". Default: all-hot,mixed. uniform-int8 is stable and is "
-            "loaded from previous results unless requested here. all-hot "
-            "runs before mixed so mixed can use its result as --baseline-json."
+            + ". Default: all-hot,mixed,uniform-int8. all-hot runs before "
+            "mixed so mixed can use its result as --baseline-json. "
+            "uniform-int16 is listed but skipped until the replay engine "
+            "accepts it."
         ),
     )
     parser.add_argument(
@@ -170,6 +187,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--total-kv-budget-bytes",
         type=int,
         default=DEFAULT_TOTAL_KV_BUDGET_BYTES,
+        help=(
+            "KV budget in bytes for capacity replays. "
+            "Default: 3758096384 (3.5 GiB). The GSM8K accuracy step uses "
+            "--accuracy-kv-budget-bytes instead."
+        ),
+    )
+    parser.add_argument(
+        "--accuracy-kv-budget-bytes",
+        type=int,
+        default=DEFAULT_ACCURACY_KV_BUDGET_BYTES,
+        help=(
+            "KV budget in bytes for the GSM8K accuracy step. Passed as "
+            "--total-kv-budget-bytes to the ballast and timed accuracy "
+            "commands. Capacity replays keep --total-kv-budget-bytes. "
+            "Default: 12000000000 (12 GB). A larger --accuracy-questions "
+            "value can still score the full GSM8K test split."
+        ),
     )
     parser.add_argument("--time-scale", type=float, default=DEFAULT_TIME_SCALE)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
@@ -222,10 +256,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--accuracy-questions",
         type=int,
-        default=None,
+        default=DEFAULT_ACCURACY_QUESTIONS,
         help=(
             "Questions to score from the chosen dataset's test split. "
-            "The default scores every question in test.jsonl."
+            "Default: 200. The count is capped at the number of questions "
+            "in test.jsonl."
         ),
     )
     parser.add_argument(
@@ -238,6 +273,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--time-scale and --timeout must be positive")
     if args.total_kv_budget_bytes <= 0:
         parser.error("--total-kv-budget-bytes must be positive")
+    if args.accuracy_kv_budget_bytes <= 0:
+        parser.error("--accuracy-kv-budget-bytes must be positive")
     if args.max_tokens_per_turn <= 1:
         parser.error(
             "capacity replay requires --max-tokens-per-turn greater than 1"
@@ -248,7 +285,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-model-len and --max-num-seqs must be positive")
     if args.warm_pool_blocks <= 0:
         parser.error("--warm-pool-blocks must be positive")
-    if args.accuracy_questions is not None and args.accuracy_questions <= 0:
+    if args.accuracy_questions <= 0:
         parser.error("--accuracy-questions must be positive")
     args.trace = _from_cwd(args.trace)
     args.results_dir = _from_cwd(args.results_dir)
@@ -316,9 +353,9 @@ def replay_argv(
         "--seed",
         str(args.seed),
     ]
+    if mode == "mixed" and baseline_json is None:
+        raise ValueError("mixed replay requires an all-hot baseline JSON")
     if mode == "mixed":
-        if baseline_json is None:
-            raise ValueError("mixed replay requires an all-hot baseline JSON")
         argv.extend(
             [
                 "--baseline-json",
@@ -403,15 +440,15 @@ def gsm8k_dataset_dir(candidate: Path | None) -> Path | None:
 def ballast_dataset(args: argparse.Namespace) -> Path:
     """Dataset directory for the ballast accuracy check."""
     candidate = args.gsm8k_trace
-    if candidate is not None and candidate.is_dir():
-        dataset = gsm8k_dataset_dir(candidate)
-        if dataset is None:
-            raise SystemExit(
-                f"{candidate} is not a GSM8K dataset directory "
-                "(expected train.jsonl and test.jsonl)"
-            )
-        return dataset
-    return DEFAULT_GSM8K_DATASET
+    if candidate is None or not candidate.is_dir():
+        return DEFAULT_GSM8K_DATASET
+    dataset = gsm8k_dataset_dir(candidate)
+    if dataset is None:
+        raise SystemExit(
+            f"{candidate} is not a GSM8K dataset directory "
+            "(expected train.jsonl and test.jsonl)"
+        )
+    return dataset
 
 
 def dataset_test_question_count(dataset: Path) -> int:
@@ -430,12 +467,11 @@ def dataset_test_question_count(dataset: Path) -> int:
 def accuracy_question_count(args: argparse.Namespace, dataset: Path) -> int:
     """How many test questions this accuracy run should score.
 
-    An explicit --accuracy-questions value is a cap. Otherwise the run
-    scores every question in the chosen dataset.
+    The default is 200. ``--accuracy-questions`` overrides that count.
+    The result is capped at the number of questions in the dataset.
     """
-    if args.accuracy_questions is not None:
-        return args.accuracy_questions
-    return dataset_test_question_count(dataset)
+    available = dataset_test_question_count(dataset)
+    return min(args.accuracy_questions, available)
 
 
 def build_timed_gsm8k_command(
@@ -455,9 +491,19 @@ def build_timed_gsm8k_command(
     candidate = args.gsm8k_trace
     if candidate is None or not candidate.is_file():
         return None
-    # The timed runner is not implemented yet. Build its argv from mode,
-    # result_json, and baseline_json when the trace format is ready.
+    # The timed runner is not implemented yet. When it is, build its argv
+    # from mode, result_json, and baseline_json, and pass the accuracy
+    # budget rather than the capacity budget:
+    #   *accuracy_kv_budget_argv(args)
     return None
+
+
+def accuracy_kv_budget_argv(args: argparse.Namespace) -> list[str]:
+    """--total-kv-budget-bytes for an accuracy command, not a capacity replay."""
+    return [
+        "--total-kv-budget-bytes",
+        str(args.accuracy_kv_budget_bytes),
+    ]
 
 
 def build_ballast_command(
@@ -484,16 +530,15 @@ def build_ballast_command(
         str(result_json),
         "--num-questions",
         str(accuracy_question_count(args, dataset)),
-        "--total-kv-budget-bytes",
-        str(args.total_kv_budget_bytes),
+        *accuracy_kv_budget_argv(args),
         "--seed",
         str(args.seed),
         "--gpu-memory-utilization",
         str(args.gpu_memory_utilization),
     ]
+    if mode == "mixed" and baseline_json is None:
+        raise ValueError("mixed accuracy check requires an all-hot baseline")
     if mode == "mixed":
-        if baseline_json is None:
-            raise ValueError("mixed accuracy check requires an all-hot baseline")
         command.extend(
             [
                 "--baseline-json",
@@ -713,10 +758,9 @@ def display_cell(column: str, row: dict[str, Any]) -> str:
     if column == "sessions":
         return str(row["sessions"])
     if column == "completed":
-        if row["status"] == "skipped":
-            return "skipped"
-        if row["status"] == "failed":
-            return "failed"
+        status = row["status"]
+        if status in {"skipped", "failed"}:
+            return status
         if row["completed"] is None:
             return "n/a"
         return str(row["completed"])
@@ -856,17 +900,22 @@ def load_cached_uniform_int8_rows(
     results_dir: Path,
     session_counts: list[int],
 ) -> list[dict[str, Any]]:
-    """Read previous uniform-int8 results without launching a new run.
+    """Read previous uniform-int8 results when that mode was not selected.
 
-    uniform-int8 is stable and is loaded from cache unless explicitly
-    requested. The JSON files themselves are left in place.
+    A default run executes uniform-int8. This loader is used only when
+    --modes omits it. The JSON files themselves are left in place.
     """
     found: dict[int, Path] = {}
-    if results_dir.is_dir():
-        for path in results_dir.glob(f"{CACHED_BASELINE_MODE}_sessions*.json"):
-            sessions = _cached_session_count(path)
-            if sessions is not None:
-                found[sessions] = path
+    cached_results = (
+        results_dir.glob(f"{CACHED_BASELINE_MODE}_sessions*.json")
+        if results_dir.is_dir()
+        else ()
+    )
+    for path in cached_results:
+        sessions = _cached_session_count(path)
+        if sessions is None:
+            continue
+        found[sessions] = path
     ordered = [count for count in session_counts if count in found]
     ordered.extend(sorted(count for count in found if count not in session_counts))
     rows: list[dict[str, Any]] = []
@@ -1047,8 +1096,8 @@ def run_suite(args: argparse.Namespace) -> int:
     if args.dry_run:
         return 0
 
-    # uniform-int8 is stable and is loaded from cache unless explicitly
-    # requested. Existing result files are not deleted or rewritten.
+    # A default run executes uniform-int8. Show cached rows only when
+    # --modes omits that mode. Existing result files are not rewritten.
     baseline_uniform_int8: list[dict[str, Any]] = []
     if CACHED_BASELINE_MODE not in args.modes:
         baseline_uniform_int8 = load_cached_uniform_int8_rows(

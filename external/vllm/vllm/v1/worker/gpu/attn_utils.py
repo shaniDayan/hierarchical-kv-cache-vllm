@@ -47,6 +47,14 @@ logger = init_logger(__name__)
 _HKV_TRUE_VALUES = {"1", "true", "yes", "on"}
 _HKV_TRITON_BACKEND_NAME = "TRITON_ATTN"
 
+# Hierarchical KV / mixed-attention helpers for the GPU attention path.
+# is_hkv_mixed_read_enabled: whether mixed HOT/WARM reads are requested.
+# validate_hkv_physical_configuration: physical tiers require mixed reads.
+# initialize_hkv_warm_kv_caches: allocate the per-layer INT8 WARM pool.
+# prepare_deferred_hkv_warm_pool: validate the pool and leave it empty.
+# allocate_hkv_warm_pool: allocate and bind WARM state on first demotion.
+# bind_hkv_attention_state: attach the WARM cache and HOT-to-WARM map.
+#     Attention stays pure HOT until mixed read and those tensors are set.
 
 def is_hkv_physical_tiers_enabled() -> bool:
     return (
@@ -456,7 +464,8 @@ def prepare_deferred_hkv_warm_pool(
         hot_kv_dtype=hot_kv_dtype,
         blocks_per_kv_block=blocks_per_kv_block,
     )
-    if warm_pool_blocks is None or warm_pool_blocks <= 0:
+    # validate_hkv_physical_configuration already rejects a non-positive size.
+    if warm_pool_blocks is None:
         raise ValueError(
             "Deferred WARM allocation requires a positive HKV_WARM_POOL_BLOCKS"
         )
@@ -691,7 +700,7 @@ def debug_demote_one_hkv_block(
 ) -> bool:
     """Quantize and validate one complete HOT block without changing HOT state."""
     enabled = os.getenv("HKV_DEBUG_DEMOTE_ONE_BLOCK", "").strip().lower()
-    if enabled not in {"1", "true", "yes", "on"}:
+    if enabled not in _HKV_TRUE_VALUES:
         return False
     if (
         not hot_kv_caches
@@ -841,9 +850,8 @@ def init_attn_backend(
             if attn_backend_workspace is None:
                 if hasattr(builder, "_get_workspace_buffer"):
                     attn_backend_workspace = builder._get_workspace_buffer()
-            else:
-                if hasattr(builder, "set_workspace_buffer"):
-                    builder.set_workspace_buffer(attn_backend_workspace)
+            elif hasattr(builder, "set_workspace_buffer"):
+                builder.set_workspace_buffer(attn_backend_workspace)
             # Check cudagraph support for the attention backend
             cg_support = builder.get_cudagraph_support(
                 vllm_config,
@@ -1094,19 +1102,20 @@ def _update_hybrid_attention_layout(
                 continue
 
             kv_cache = kv_caches[layer_name]
-            if kv_cache.shape[0] == 2:
-                assert kv_cache.shape[1] != 2, (
-                    f"Cannot determine layout for tensor of shape {kv_cache.shape}"
-                )
-                hidden_size = kv_cache.shape[2:].numel()
-                kv_cache.as_strided_(
-                    size=kv_cache.shape,
-                    stride=(
-                        hidden_size,
-                        2 * hidden_size,
-                        *kv_cache.stride()[2:],
-                    ),
-                )
+            if kv_cache.shape[0] != 2:
+                continue
+            assert kv_cache.shape[1] != 2, (
+                f"Cannot determine layout for tensor of shape {kv_cache.shape}"
+            )
+            hidden_size = kv_cache.shape[2:].numel()
+            kv_cache.as_strided_(
+                size=kv_cache.shape,
+                stride=(
+                    hidden_size,
+                    2 * hidden_size,
+                    *kv_cache.stride()[2:],
+                ),
+            )
 
 
 def init_kv_cache(
@@ -1133,15 +1142,15 @@ def init_kv_cache(
         kv_cache_config=kv_cache_config,
     )
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
-    if (
+    uniform_int8_baseline = (
         os.getenv("HKV_UNIFORM_INT8_BASELINE", "").strip().lower()
         in _HKV_TRUE_VALUES
-    ):
-        if cache_dtype != "int8_per_token_head":
-            raise ValueError(
-                "uniform-int8 baseline requires cache_dtype "
-                "'int8_per_token_head'"
-            )
+    )
+    if uniform_int8_baseline and cache_dtype != "int8_per_token_head":
+        raise ValueError(
+            "uniform-int8 baseline requires cache_dtype 'int8_per_token_head'"
+        )
+    if uniform_int8_baseline:
         logger.info("Running uniform-int8 baseline (full KV cache in INT8)")
     return kv_caches
 

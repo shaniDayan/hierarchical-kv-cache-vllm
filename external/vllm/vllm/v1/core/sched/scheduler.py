@@ -85,6 +85,14 @@ _KV_STATE_COLDNESS = {
 _KV_DEMOTION_CAPACITY_INITIAL_COOLDOWN_STEPS = 1
 _KV_DEMOTION_CAPACITY_MAX_COOLDOWN_STEPS = 16
 
+# schedule: admit, preempt, and maintain idle KV sessions for one step.
+# _classify_idle_kv_sessions: time-based idle tiers, or pressure demotion.
+# _demote_kv_sessions_under_pressure: HOT->WARM when HOT utilization is high.
+# _plan_kv_state_transition: record a pending tier move and its blocks.
+# _validate_kv_cache_transition_results: commit a move or back off on failure.
+# _evict_idle_sessions_for_admission: abort oldest idle sessions to free HOT.
+# _free_request, _free_blocks, _free_request_blocks, _drain_deferred_frees:
+#     return KV blocks now, or defer while a GPU write may still be in flight.
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -415,9 +423,7 @@ class Scheduler(SchedulerInterface):
             ):
                 # force to cache the last chunk
                 num_new_tokens = last_cache_position - num_computed_tokens
-            else:
-                # prefill the last few tokens
-                pass
+            # else: prefill the last few tokens unchanged.
 
             # Marconi cache admission optimization:
             # cache common prefixes by scheduling num_new_tokens = common prefix length
@@ -870,23 +876,23 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
-                    # Schedule encoder inputs.
-                    if request.has_encoder_inputs:
-                        (
-                            encoder_inputs_to_schedule,
-                            num_new_tokens,
-                            new_encoder_compute_budget,
-                            external_load_encoder_input,
-                        ) = self._try_schedule_encoder_inputs(
-                            request,
-                            num_computed_tokens,
-                            num_new_tokens,
-                            encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
-                        )
-                        if num_new_tokens == 0:
-                            # The request cannot be scheduled.
-                            break
+                # Schedule encoder inputs. Async KV loads allocate no new work.
+                if not load_kv_async and request.has_encoder_inputs:
+                    (
+                        encoder_inputs_to_schedule,
+                        num_new_tokens,
+                        new_encoder_compute_budget,
+                        external_load_encoder_input,
+                    ) = self._try_schedule_encoder_inputs(
+                        request,
+                        num_computed_tokens,
+                        num_new_tokens,
+                        encoder_compute_budget,
+                        shift_computed_tokens=1 if self.use_eagle else 0,
+                    )
+                    if num_new_tokens == 0:
+                        # The request cannot be scheduled.
+                        break
 
                 # Skip block alignment when setting up async receive (no local work).
                 if self.need_mamba_block_aligned_split and not load_kv_async:
@@ -1343,12 +1349,11 @@ class Scheduler(SchedulerInterface):
 
         transitions = []
         for request in self.requests.values():
-            if not request.resumable or (
-                request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+            if (
+                not request.resumable
+                or request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+                or request.request_id in self._pending_kv_transitions
             ):
-                continue
-
-            if request.request_id in self._pending_kv_transitions:
                 continue
 
             previous_state = request.kv_cache_state
@@ -1357,11 +1362,11 @@ class Scheduler(SchedulerInterface):
                 hot_threshold,
                 cold_threshold,
             )
-            # COLD migration is not implemented on the worker yet; prevent scheduling
-            # unsupported WARM -> COLD transitions while allowing HOT -> WARM.
+            # COLD migration is not implemented on the worker yet. Skip
+            # WARM -> COLD, and schedule any other COLD target as WARM.
+            if new_state is KVBlockState.COLD and previous_state is KVBlockState.WARM:
+                continue
             if new_state is KVBlockState.COLD:
-                if previous_state is KVBlockState.WARM:
-                    continue
                 new_state = KVBlockState.WARM
 
             if _KV_STATE_COLDNESS[new_state] <= _KV_STATE_COLDNESS[previous_state]:
@@ -1528,9 +1533,11 @@ class Scheduler(SchedulerInterface):
                 new_token_ids.append(token_ids)
             if idx >= num_running_reqs:
                 resumed_req_ids.add(req_id)
-            if not self.use_v2_model_runner:  # noqa: SIM102
-                if req_id not in self.prev_step_scheduled_req_ids:
-                    all_token_ids[req_id] = req.all_token_ids.copy()
+            if (
+                not self.use_v2_model_runner
+                and req_id not in self.prev_step_scheduled_req_ids
+            ):
+                all_token_ids[req_id] = req.all_token_ids.copy()
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
             )
@@ -1623,18 +1630,14 @@ class Scheduler(SchedulerInterface):
                 # already calculated encoder inputs and can skip here.
                 continue
 
-            if not self.is_encoder_decoder:
-                # We are not using the encoder cache for encoder-decoder models,
-                # yet.
-                if item_identifier in mm_hashes_to_schedule:
-                    # The same encoder input has already been scheduled in the
-                    # current step.
-                    continue
-
-                if self.encoder_cache_manager.check_and_update_cache(request, i):
-                    # The encoder input is already computed and cached from a
-                    # previous step.
-                    continue
+            # Encoder-decoder models do not consult the encoder cache yet.
+            # Skip an input already scheduled this step, or already cached.
+            # check_and_update_cache runs only when the hash is new.
+            if not self.is_encoder_decoder and (
+                item_identifier in mm_hashes_to_schedule
+                or self.encoder_cache_manager.check_and_update_cache(request, i)
+            ):
+                continue
 
             # If no encoder input chunking is allowed, we do not want to
             # partially schedule a multimodal item. If the scheduled range would
@@ -1792,20 +1795,14 @@ class Scheduler(SchedulerInterface):
                     f"{expected.request_id} and transition_id={expected.transition_id}"
                 )
 
+            probe_transition_id = self._kv_demotion_capacity_probe_transition_id
             if actual.status is KVCacheTransitionStatus.SUCCESS:
                 self.kv_cache_manager.commit_request_kv_transition(expected)
                 request = self.requests.get(expected.request_id)
                 if request is not None:
                     request.kv_cache_state = expected.new_state
                 del self._pending_kv_transitions[expected.request_id]
-                if (
-                    expected.transition_id
-                    == getattr(
-                        self,
-                        "_kv_demotion_capacity_probe_transition_id",
-                        None,
-                    )
-                ):
+                if expected.transition_id == probe_transition_id:
                     self._kv_demotion_capacity_failure_count = 0
                     self._kv_demotion_capacity_cooldown_steps_remaining = 0
                     self._kv_demotion_capacity_probe_required = False
@@ -1825,50 +1822,45 @@ class Scheduler(SchedulerInterface):
                 )
                 del self._pending_kv_transitions[expected.request_id]
                 is_pressure_demotion = (
-                    getattr(
-                        self,
-                        "kv_cache_demotion_start_utilization",
-                        None,
-                    )
-                    is not None
+                    self.kv_cache_demotion_start_utilization is not None
                     and expected.previous_state is KVBlockState.HOT
                     and expected.new_state is KVBlockState.WARM
                 )
-                if (
+                capacity_retry = (
                     actual.status is KVCacheTransitionStatus.RETRYABLE_CAPACITY
                     and is_pressure_demotion
-                ):
-                    pressure_capacity_failure = True
-                elif (
+                )
+                stale_probe = (
                     actual.status is KVCacheTransitionStatus.STALE_VALIDATION
-                    and expected.transition_id
-                    == getattr(
-                        self,
-                        "_kv_demotion_capacity_probe_transition_id",
-                        None,
-                    )
-                ):
+                    and expected.transition_id == probe_transition_id
+                )
+                if capacity_retry:
+                    pressure_capacity_failure = True
+                elif stale_probe:
                     self._kv_demotion_capacity_probe_required = True
                     self._kv_demotion_capacity_probe_transition_id = None
             else:
-                raise ValueError(
-                    f"Unexpected KV transition status: {actual.status}"
-                )
+                raise ValueError(f"Unexpected KV transition status: {actual.status}")
 
             # Process deferred finish/abort if requested while pending
-            deferred_status = getattr(
-                self, "_pending_finish_requests", {}
-            ).pop(expected.request_id, None)
+            deferred_status = self._pending_finish_requests.pop(
+                expected.request_id, None
+            )
             request = self.requests.get(expected.request_id)
+            if (
+                deferred_status is not None
+                and request is not None
+                and not request.is_finished()
+            ):
+                self.finish_requests([expected.request_id], deferred_status)
             if deferred_status is not None:
-                if request is not None and not request.is_finished():
-                    self.finish_requests(
-                        [expected.request_id], deferred_status
-                    )
                 continue
 
-            # Process queued streaming update if one arrived while pending
-            streaming_queue = getattr(request, "streaming_queue", None)
+            # Process queued streaming update if one arrived while pending.
+            # A missing request is treated like an empty queue.
+            streaming_queue = (
+                request.streaming_queue if request is not None else None
+            )
             if streaming_queue:
                 update = streaming_queue.popleft()
                 if update is not None:
@@ -2070,32 +2062,28 @@ class Scheduler(SchedulerInterface):
                     # Prefill completed: read full prompt routing from
                     # slot buffer using the block-ID snapshot taken at
                     # schedule time (immune to async preemption).
+                    sampling_params = request.sampling_params
+                    prompt_start = 0
                     if (
-                        request.sampling_params is not None
-                        and request.sampling_params.routed_experts_prompt_start
-                        is not None
+                        sampling_params is not None
+                        and sampling_params.routed_experts_prompt_start is not None
                     ):
-                        prompt_start = (
-                            request.sampling_params.routed_experts_prompt_start
-                        )
+                        prompt_start = sampling_params.routed_experts_prompt_start
                         assert prompt_start < request.num_prompt_tokens
-                    else:
-                        prompt_start = 0
                     routed_experts = self.routed_experts_mgr.get(
                         block_ids,
                         request.num_prompt_tokens,
                         token_start=prompt_start,
                     )
+                elif scheduled_spec_token_ids:
+                    # Spec decode: accepted tokens at the START of
+                    # the scheduled range, rejected at the end.
+                    routed_experts = routing_data[
+                        req_offset : req_offset + len(new_token_ids)
+                    ]
                 else:
-                    if scheduled_spec_token_ids:
-                        # Spec decode: accepted tokens at the START of
-                        # the scheduled range, rejected at the end.
-                        routed_experts = routing_data[
-                            req_offset : req_offset + len(new_token_ids)
-                        ]
-                    else:
-                        # Normal decode / re-prefill: token(s) at the END.
-                        routed_experts = routing_data[end - len(new_token_ids) : end]
+                    # Normal decode / re-prefill: token(s) at the END.
+                    routed_experts = routing_data[end - len(new_token_ids) : end]
 
             finish_reason = None
             if stopped:
@@ -2202,9 +2190,8 @@ class Scheduler(SchedulerInterface):
             connector_events = self.connector.take_events()
             if connector_events:
                 if events is None:
-                    events = list(connector_events)
-                else:
-                    events.extend(connector_events)
+                    events = []
+                events.extend(connector_events)
 
         # publish collected KV cache events
         if events:
@@ -2590,14 +2577,13 @@ class Scheduler(SchedulerInterface):
         )
         finished_ids = {request_id for request_id, _ in finished}
         for request in chosen:
-            if request.request_id not in finished_ids:
-                continue
-            logger.info(
-                "Evicted idle session %s: insufficient free HOT blocks "
-                "for waiting request %s",
-                request.request_id,
-                waiting_request.request_id,
-            )
+            if request.request_id in finished_ids:
+                logger.info(
+                    "Evicted idle session %s: insufficient free HOT blocks "
+                    "for waiting request %s",
+                    request.request_id,
+                    waiting_request.request_id,
+                )
         return bool(finished_ids)
 
     def finish_requests(
@@ -2638,11 +2624,11 @@ class Scheduler(SchedulerInterface):
                 self._pending_finish_requests[req_id] = finished_status
                 continue
 
+            if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                self.num_waiting_for_streaming_input -= 1
             if request.status == RequestStatus.RUNNING:
                 running_requests_to_remove.add(request)
             else:
-                if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-                    self.num_waiting_for_streaming_input -= 1
                 waiting_requests_to_remove.append(request)
 
         # Remove all requests from queues at once for better efficiency

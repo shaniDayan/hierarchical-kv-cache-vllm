@@ -139,6 +139,14 @@ from vllm.v1.worker.utils import KVBlockZeroer
 
 logger = init_logger(__name__)
 
+# Hierarchical KV cache on this runner:
+# initialize_kv_cache: build HOT storage; defer the WARM pool or allocate it.
+# handle_kv_cache_state_transitions: allocate that pool on the first HOT->WARM
+#     demotion, migrate the blocks, and record each transition result.
+# prepare_attn: refresh the WARM slot table for mixed HOT/WARM attention.
+# _attach_kv_transition_results: attach migration results to the model output.
+# finish_requests: release WARM residency for finished and preempted requests.
+# shutdown: drop WARM caches, maps, the slot table, and the migration manager.
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -527,6 +535,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
         )
         self.hkv_hot_kv_caches = kv_caches_dict
+        # Read the tier mode once. Deferred allocation leaves the WARM pool
+        # empty until the first HOT->WARM demotion asks for it.
         if is_hkv_physical_tiers_enabled():
             prepare_deferred_hkv_warm_pool(
                 kv_cache_config=self.kv_cache_config,
@@ -557,39 +567,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.vllm_config.compilation_config.static_forward_context
                 ),
             )
-        if (
-            not is_hkv_physical_tiers_enabled()
-            and is_hkv_multi_block_warm_migration_enabled()
-        ):
-            if not self.hkv_warm_kv_caches:
-                raise ValueError(
-                    "Multi-block WARM migration requires an allocated physical "
-                    "WARM pool"
+            if is_hkv_multi_block_warm_migration_enabled():
+                if not self.hkv_warm_kv_caches:
+                    raise ValueError(
+                        "Multi-block WARM migration requires an allocated physical "
+                        "WARM pool"
+                    )
+                if len(self.kv_cache_config.kv_cache_groups) != 1:
+                    raise ValueError(
+                        "Experimental multi-block WARM migration currently supports "
+                        "exactly one KV-cache group"
+                    )
+                if self.block_tables.blocks_per_kv_block != [1]:
+                    raise ValueError(
+                        "Experimental multi-block WARM migration requires "
+                        "blocks_per_kv_block == 1"
+                    )
+                self.hkv_warm_slot_table = torch.full_like(
+                    self.block_tables.input_block_tables[0], -1
                 )
-            if len(self.kv_cache_config.kv_cache_groups) != 1:
-                raise ValueError(
-                    "Experimental multi-block WARM migration currently supports "
-                    "exactly one KV-cache group"
+                for layer_name in self.hkv_warm_kv_caches:
+                    self.compilation_config.static_forward_context[
+                        layer_name
+                    ]._hkv_warm_slot_table = self.hkv_warm_slot_table
+                warm_capacity = next(iter(self.hkv_warm_kv_caches.values())).shape[0]
+                self.hkv_warm_migration_manager = HKVWarmMigrationManager(
+                    warm_capacity=warm_capacity,
+                    hot_kv_caches=self.hkv_hot_kv_caches,
+                    warm_kv_caches=self.hkv_warm_kv_caches,
+                    device=self.device,
                 )
-            if self.block_tables.blocks_per_kv_block != [1]:
-                raise ValueError(
-                    "Experimental multi-block WARM migration requires "
-                    "blocks_per_kv_block == 1"
-                )
-            self.hkv_warm_slot_table = torch.full_like(
-                self.block_tables.input_block_tables[0], -1
-            )
-            for layer_name in self.hkv_warm_kv_caches:
-                self.compilation_config.static_forward_context[
-                    layer_name
-                ]._hkv_warm_slot_table = self.hkv_warm_slot_table
-            warm_capacity = next(iter(self.hkv_warm_kv_caches.values())).shape[0]
-            self.hkv_warm_migration_manager = HKVWarmMigrationManager(
-                warm_capacity=warm_capacity,
-                hot_kv_caches=self.hkv_hot_kv_caches,
-                warm_kv_caches=self.hkv_warm_kv_caches,
-                device=self.device,
-            )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     def _take_kv_transition_results(self) -> list[KVCacheTransitionResult]:
